@@ -20,7 +20,7 @@ class ChannelRecord:
 def _timestamp(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamp must be timezone-aware")
-    return value.isoformat()
+    return value.astimezone(UTC).isoformat()
 
 
 def _current_timestamp() -> str:

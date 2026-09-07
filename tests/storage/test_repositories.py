@@ -72,6 +72,30 @@ def test_history_excludes_noncompleted_batches_and_sorts_newest_first(
     ]
 
 
+def test_history_sorts_mixed_offsets_by_real_instant(database: Database) -> None:
+    repository = BatchRepository(database)
+    created_at = datetime(2026, 9, 7, 1, 0, tzinfo=UTC)
+    older_instant = datetime(
+        2026,
+        9,
+        7,
+        10,
+        0,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+    newer_instant = datetime(2026, 9, 7, 9, 0, tzinfo=UTC)
+    create_batch(repository, "older", created_at)
+    create_batch(repository, "newer", created_at)
+
+    repository.set_state("older", BatchState.COMPLETED, older_instant)
+    repository.set_state("newer", BatchState.COMPLETED, newer_instant)
+
+    assert repository.list_history() == [
+        BatchRecord("newer", BatchState.COMPLETED),
+        BatchRecord("older", BatchState.COMPLETED),
+    ]
+
+
 def test_create_persists_standard_template_state_and_source_metadata(
     database: Database,
 ) -> None:
@@ -104,10 +128,22 @@ def test_create_persists_standard_template_state_and_source_metadata(
         "v1",
         "parsing",
         "batches/batch-1/source.xlsx",
-        now.isoformat(),
-        now.isoformat(),
+        now.astimezone(UTC).isoformat(),
+        now.astimezone(UTC).isoformat(),
         None,
     )
+
+
+def test_batch_repository_rejects_naive_datetimes(database: Database) -> None:
+    repository = BatchRepository(database)
+    naive = datetime(2026, 9, 7, 9, 0)  # noqa: DTZ001 - deliberately invalid input
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        create_batch(repository, "batch-1", naive)
+
+    create_batch(repository, "batch-1", naive.replace(tzinfo=UTC))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        repository.set_state("batch-1", BatchState.COMPLETED, naive)
 
 
 def test_set_state_updates_errors_timestamps_and_completed_timestamp(
@@ -115,8 +151,9 @@ def test_set_state_updates_errors_timestamps_and_completed_timestamp(
 ) -> None:
     repository = BatchRepository(database)
     created_at = datetime(2026, 9, 7, 9, 0, tzinfo=UTC)
-    failed_at = created_at + timedelta(minutes=1)
-    completed_at = created_at + timedelta(minutes=2)
+    china_time = timezone(timedelta(hours=8))
+    failed_at = datetime(2026, 9, 7, 17, 1, tzinfo=china_time)
+    completed_at = datetime(2026, 9, 7, 17, 2, tzinfo=china_time)
     create_batch(repository, "batch-1", created_at)
 
     repository.set_state(
@@ -137,7 +174,7 @@ def test_set_state_updates_errors_timestamps_and_completed_timestamp(
     assert failed is not None
     assert tuple(failed) == (
         "incomplete",
-        failed_at.isoformat(),
+        failed_at.astimezone(UTC).isoformat(),
         None,
         "INVALID_FILE",
         "Missing shipment ID",
@@ -156,8 +193,8 @@ def test_set_state_updates_errors_timestamps_and_completed_timestamp(
     assert completed is not None
     assert tuple(completed) == (
         "completed",
-        completed_at.isoformat(),
-        completed_at.isoformat(),
+        completed_at.astimezone(UTC).isoformat(),
+        completed_at.astimezone(UTC).isoformat(),
         None,
         None,
     )
