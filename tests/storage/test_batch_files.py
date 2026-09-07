@@ -150,6 +150,7 @@ def test_cleanup_rejects_data_root_replaced_with_symlink(tmp_path: Path) -> None
     assert keep.read_text() == "keep"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd traversal test")
 def test_cleanup_uses_opened_ancestor_when_parent_is_replaced_during_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -193,6 +194,7 @@ def test_cleanup_uses_opened_ancestor_when_parent_is_replaced_during_open(
     assert keep.read_text() == "keep"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd fallback test")
 def test_cleanup_fails_closed_without_secure_directory_handles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -208,6 +210,7 @@ def test_cleanup_fails_closed_without_secure_directory_handles(
     assert (work / "keep.txt").read_text() == "keep"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd fallback test")
 def test_publish_fails_closed_without_secure_directory_handles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -224,6 +227,7 @@ def test_publish_fails_closed_without_secure_directory_handles(
     assert not files.output_path("batch-1").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd fallback test")
 def test_delete_fails_closed_without_secure_directory_handles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
