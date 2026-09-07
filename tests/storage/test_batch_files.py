@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import fis.storage.batch_files as batch_files_module
 from fis.storage.batch_files import BatchFiles
 
 VALID_UUID = "123e4567-e89b-12d3-a456-426614174000"
@@ -147,6 +148,95 @@ def test_cleanup_rejects_data_root_replaced_with_symlink(tmp_path: Path) -> None
         files.clear_work("batch-1")
 
     assert keep.read_text() == "keep"
+
+
+def test_cleanup_uses_opened_ancestor_when_parent_is_replaced_during_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    data_root = parent / "data"
+    files = BatchFiles(data_root)
+    work = files.create("batch-1")
+    (work / "old.txt").write_text("old")
+
+    outside = tmp_path / "outside"
+    external_work = outside / "data" / "batches" / "batch-1" / "work"
+    external_work.mkdir(parents=True)
+    keep = external_work / "keep.txt"
+    keep.write_text("keep")
+
+    original_open = os.open
+    injected = False
+
+    def replace_parent_before_data_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal injected
+        path_name = os.fspath(path)
+        if not injected and (path_name == "data" or path_name == os.fspath(data_root)):
+            retained_parent = tmp_path / "retained-parent"
+            parent.rename(retained_parent)
+            parent.symlink_to(outside, target_is_directory=True)
+            injected = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(batch_files_module.os, "open", replace_parent_before_data_open)
+
+    files.clear_work("batch-1")
+
+    assert injected
+    assert keep.read_text() == "keep"
+
+
+def test_cleanup_fails_closed_without_secure_directory_handles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = BatchFiles(tmp_path / "data")
+    work = files.create("batch-1")
+    (work / "keep.txt").write_text("keep")
+    monkeypatch.setattr(batch_files_module, "_USE_DIRECTORY_FDS", False)
+
+    with pytest.raises(RuntimeError, match="secure directory handles"):
+        files.clear_work("batch-1")
+
+    assert (work / "keep.txt").read_text() == "keep"
+
+
+def test_publish_fails_closed_without_secure_directory_handles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = BatchFiles(tmp_path / "data")
+    work = files.create("batch-1")
+    (work / "keep.txt").write_text("keep")
+    monkeypatch.setattr(batch_files_module, "_USE_DIRECTORY_FDS", False)
+
+    with pytest.raises(RuntimeError, match="secure directory handles"):
+        files.publish("batch-1")
+
+    assert work.is_dir()
+    assert not files.output_path("batch-1").exists()
+
+
+def test_delete_fails_closed_without_secure_directory_handles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = BatchFiles(tmp_path / "data")
+    work = files.create("batch-1")
+    (work / "keep.txt").write_text("keep")
+    monkeypatch.setattr(batch_files_module, "_USE_DIRECTORY_FDS", False)
+
+    with pytest.raises(RuntimeError, match="secure directory handles"):
+        files.delete_batch("batch-1")
+
+    assert (work / "keep.txt").read_text() == "keep"
 
 
 def test_cleanup_rejects_batches_root_replaced_with_symlink(tmp_path: Path) -> None:

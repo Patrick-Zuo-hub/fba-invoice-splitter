@@ -51,18 +51,25 @@ class BatchFiles:
             raise
 
     @contextmanager
-    def _trusted_batch_parent(self) -> Iterator[int]:
-        data_fd = self._open_directory(self.data_root)
+    def _trusted_data_root(self) -> Iterator[int]:
+        current_fd = self._open_directory(os.sep)
         try:
-            batches_fd = self._open_directory("batches", dir_fd=data_fd)
-        except Exception:
-            os.close(data_fd)
-            raise
-        try:
-            yield batches_fd
+            for component in self.data_root.parts[1:]:
+                next_fd = self._open_directory(component, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            yield current_fd
         finally:
-            os.close(batches_fd)
-            os.close(data_fd)
+            os.close(current_fd)
+
+    @contextmanager
+    def _trusted_batch_parent(self) -> Iterator[int]:
+        with self._trusted_data_root() as data_fd:
+            batches_fd = self._open_directory("batches", dir_fd=data_fd)
+            try:
+                yield batches_fd
+            finally:
+                os.close(batches_fd)
 
     @contextmanager
     def _trusted_batch_directory(self, batch_id: str) -> Iterator[int]:
@@ -72,6 +79,11 @@ class BatchFiles:
                 yield batch_fd
             finally:
                 os.close(batch_fd)
+
+    @staticmethod
+    def _require_secure_directory_handles() -> None:
+        if not _USE_DIRECTORY_FDS:
+            raise RuntimeError("secure directory handles are unavailable")
 
     @staticmethod
     def _child_stat(parent_fd: int, name: str, label: str) -> os.stat_result | None:
@@ -147,7 +159,7 @@ class BatchFiles:
             except FileNotFoundError as error:
                 raise FileNotFoundError(work) from error
         else:
-            work.replace(output)
+            self._require_secure_directory_handles()
         return output
 
     def _clear_directory(self, path: Path, label: str) -> None:
@@ -163,7 +175,7 @@ class BatchFiles:
             except FileNotFoundError:
                 return
         else:
-            shutil.rmtree(path)
+            self._require_secure_directory_handles()
 
     def clear_work(self, batch_id: str) -> None:
         self._clear_directory(self.work_path(batch_id), "work")
@@ -184,7 +196,7 @@ class BatchFiles:
             except FileNotFoundError:
                 return
         else:
-            shutil.rmtree(batch)
+            self._require_secure_directory_handles()
 
 
 __all__ = ["BatchFiles"]
