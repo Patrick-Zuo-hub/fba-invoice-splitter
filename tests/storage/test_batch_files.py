@@ -293,6 +293,30 @@ def test_windows_batch_file_operations_remain_available(tmp_path: Path) -> None:
     assert not output.exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows junctions are only available on Windows")
+def test_windows_cleanup_rejects_nested_junction_without_touching_target(tmp_path: Path) -> None:
+    files = BatchFiles(tmp_path / "data")
+    work = files.create("batch-1")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    keep = outside / "keep.txt"
+    keep.write_text("keep")
+    nested = work / "nested"
+    nested.mkdir()
+    nested.rmdir()
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(nested), str(outside)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with pytest.raises(ValueError, match="[Ss]ymlink|[Jj]unction"):
+        files.clear_work("batch-1")
+
+    assert keep.read_text() == "keep"
+
+
 def test_cleanup_rejects_output_symlink_without_following_target(tmp_path: Path) -> None:
     files = BatchFiles(tmp_path / "data")
     files.create("batch-1")

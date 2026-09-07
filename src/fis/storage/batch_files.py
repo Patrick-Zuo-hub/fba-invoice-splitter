@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 _SAFE_BATCH_ID = re.compile(
     r"(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|batch-[a-z0-9-]+)"
@@ -23,6 +23,11 @@ _USE_DIRECTORY_FDS = (
 _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_ATTRIBUTE_TAG_INFO = 9
+_FILE_DISPOSITION_INFO = 4
+_FILE_DISPOSITION_INFO_EX = 21
+_FILE_DISPOSITION_FLAG_DELETE = 1
+_FILE_LIST_DIRECTORY = 0x1
+_DELETE = 0x10000
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _FILE_READ_ATTRIBUTES = 0x80
@@ -40,8 +45,16 @@ class _WindowsFileAttributeTagInfo(ctypes.Structure):
     ]
 
 
+class _WindowsFileDispositionInfo(ctypes.Structure):
+    _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+
+class _WindowsFileDispositionInfoEx(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_ulong)]
+
+
 @lru_cache(maxsize=1)
-def _windows_api() -> tuple[Any, Any, Any]:
+def _windows_api() -> tuple[Any, Any, Any, Any]:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
 
     create_file = kernel32.CreateFileW
@@ -64,19 +77,34 @@ def _windows_api() -> tuple[Any, Any, Any]:
     close_handle.argtypes = [ctypes.c_void_p]
     close_handle.restype = ctypes.c_int
 
-    return create_file, get_file_info, close_handle
+    set_file_info = kernel32.SetFileInformationByHandle
+    set_file_info.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
+    set_file_info.restype = ctypes.c_int
+
+    return create_file, get_file_info, close_handle, set_file_info
+
+
+def _windows_error(error_code: int, context: str) -> OSError:
+    error = cast(OSError, ctypes.WinError(error_code))  # type: ignore[attr-defined]
+    error.args = (error_code, f"{context}: {error.strerror}")
+    return error
 
 
 def _windows_close_handle(handle: int) -> None:
-    _, _, close_handle = _windows_api()
+    _, _, close_handle, _ = _windows_api()
     close_handle(handle)
 
 
-def _windows_open_directory(path: Path) -> int:
-    create_file, get_file_info, _ = _windows_api()
+def _windows_open_handle(path: Path, *, require_directory: bool, delete: bool = False) -> int:
+    create_file, get_file_info, _, _ = _windows_api()
+    desired_access = _FILE_READ_ATTRIBUTES
+    if require_directory:
+        desired_access |= _FILE_LIST_DIRECTORY
+    if delete:
+        desired_access |= _DELETE
     handle = create_file(
         str(path),
-        _FILE_READ_ATTRIBUTES,
+        desired_access,
         _FILE_SHARE_READ | _FILE_SHARE_WRITE,
         None,
         _OPEN_EXISTING,
@@ -86,7 +114,7 @@ def _windows_open_directory(path: Path) -> int:
     handle_value = getattr(handle, "value", handle)
     if handle_value is None or int(handle_value) in {-1, _INVALID_HANDLE_VALUE}:
         error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
-        raise OSError(error_code, f"CreateFileW failed for directory {path}")
+        raise _windows_error(error_code, f"CreateFileW failed for {path}")
 
     handle_int = int(handle_value)
     info = _WindowsFileAttributeTagInfo()
@@ -98,14 +126,54 @@ def _windows_open_directory(path: Path) -> int:
     ):
         error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
         _windows_close_handle(handle_int)
-        raise OSError(error_code, f"GetFileInformationByHandleEx failed for directory {path}")
+        raise _windows_error(error_code, f"GetFileInformationByHandleEx failed for {path}")
     if info.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
         _windows_close_handle(handle_int)
         raise ValueError(f"Symlinked or junction directory is not allowed: {path}")
-    if not info.file_attributes & _FILE_ATTRIBUTE_DIRECTORY:
+    if require_directory and not info.file_attributes & _FILE_ATTRIBUTE_DIRECTORY:
         _windows_close_handle(handle_int)
         raise NotADirectoryError(path)
     return handle_int
+
+
+def _windows_file_attributes(handle: int, path: Path) -> int:
+    _, get_file_info, _, _ = _windows_api()
+    info = _WindowsFileAttributeTagInfo()
+    if not get_file_info(
+        handle,
+        _FILE_ATTRIBUTE_TAG_INFO,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
+        raise _windows_error(error_code, f"GetFileInformationByHandleEx failed for {path}")
+    return int(info.file_attributes)
+
+
+def _windows_open_directory(path: Path) -> int:
+    return _windows_open_handle(path, require_directory=True)
+
+
+def _windows_mark_delete(handle: int, path: Path) -> None:
+    _, _, _, set_file_info = _windows_api()
+    disposition_ex = _WindowsFileDispositionInfoEx(flags=_FILE_DISPOSITION_FLAG_DELETE)
+    if set_file_info(
+        handle,
+        _FILE_DISPOSITION_INFO_EX,
+        ctypes.byref(disposition_ex),
+        ctypes.sizeof(disposition_ex),
+    ):
+        return
+    disposition = _WindowsFileDispositionInfo(delete_file=1)
+    if set_file_info(
+        handle,
+        _FILE_DISPOSITION_INFO,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        return
+    error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
+    raise _windows_error(error_code, f"SetFileInformationByHandle failed for {path}")
 
 
 def _windows_path_prefixes(path: Path) -> tuple[Path, ...]:
@@ -243,6 +311,28 @@ class BatchFiles:
         handle = _windows_open_directory(path)
         _windows_close_handle(handle)
 
+    @staticmethod
+    def _windows_delete_tree(path: Path, label: str) -> None:
+        handle = _windows_open_handle(path, require_directory=True, delete=True)
+        try:
+            BatchFiles._windows_delete_tree_from_handle(handle, path, label)
+            _windows_mark_delete(handle, path)
+        finally:
+            _windows_close_handle(handle)
+
+    @staticmethod
+    def _windows_delete_tree_from_handle(handle: int, path: Path, label: str) -> None:
+        for entry in os.scandir(path):
+            child_path = path / entry.name
+            child_handle = _windows_open_handle(child_path, require_directory=False, delete=True)
+            try:
+                attributes = _windows_file_attributes(child_handle, child_path)
+                if attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                    BatchFiles._windows_delete_tree_from_handle(child_handle, child_path, label)
+                _windows_mark_delete(child_handle, child_path)
+            finally:
+                _windows_close_handle(child_handle)
+
     def _windows_publish(self, batch_id: str, work: Path, output: Path) -> None:
         with self._windows_batch_handles(batch_id):
             self._windows_validate_directory(work, "batch work directory")
@@ -252,13 +342,11 @@ class BatchFiles:
 
     def _windows_clear_directory(self, batch_id: str, path: Path, label: str) -> None:
         with self._windows_batch_handles(batch_id):
-            self._windows_validate_directory(path, f"batch {label} directory")
-            shutil.rmtree(path)
+            self._windows_delete_tree(path, f"batch {label} directory")
 
     def _windows_delete_batch(self, batch_id: str, batch: Path) -> None:
         with self._windows_batch_parent_handles():
-            self._windows_validate_directory(batch, "batch directory")
-            shutil.rmtree(batch)
+            self._windows_delete_tree(batch, "batch directory")
 
     def _batch(self, batch_id: str) -> Path:
         if not isinstance(batch_id, str) or _SAFE_BATCH_ID.fullmatch(batch_id) is None:
