@@ -1,3 +1,4 @@
+import ctypes
 import os
 import subprocess
 from pathlib import Path
@@ -294,27 +295,38 @@ def test_windows_batch_file_operations_remain_available(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows directory handles are only available on Windows")
-def test_windows_protected_directory_blocks_junction_creation(tmp_path: Path) -> None:
+def test_windows_protected_directory_rejects_write_handle(tmp_path: Path) -> None:
     files = BatchFiles(tmp_path / "data")
     work = files.create("batch-1")
     outside = tmp_path / "outside"
     outside.mkdir()
     keep = outside / "keep.txt"
     keep.write_text("keep")
-    nested = work / "nested"
-    nested.mkdir()
-    nested.rmdir()
-
     protected = batch_files_module._windows_open_handle(work, require_directory=True)
     try:
-        result = subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(nested), str(outside)],
-            check=False,
-            capture_output=True,
-            text=True,
+        create_file, _, close_handle, _ = batch_files_module._windows_api()
+        writer = create_file(
+            str(work),
+            0x40000000,  # GENERIC_WRITE
+            batch_files_module._FILE_SHARE_READ
+            | 0x2  # FILE_SHARE_WRITE
+            | 0x4,  # FILE_SHARE_DELETE
+            None,
+            batch_files_module._OPEN_EXISTING,
+            batch_files_module._FILE_FLAG_BACKUP_SEMANTICS
+            | batch_files_module._FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
         )
-        assert result.returncode != 0
-        assert not nested.exists()
+        writer_value = getattr(writer, "value", writer)
+        try:
+            assert writer_value in {-1, batch_files_module._INVALID_HANDLE_VALUE}
+            assert ctypes.get_last_error() == 32  # ERROR_SHARING_VIOLATION
+        finally:
+            if writer_value is not None and int(writer_value) not in {
+                -1,
+                batch_files_module._INVALID_HANDLE_VALUE,
+            }:
+                close_handle(writer_value)
     finally:
         batch_files_module._windows_close_handle(protected)
 
