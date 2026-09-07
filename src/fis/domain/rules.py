@@ -9,17 +9,19 @@ def default_dates(today: date) -> tuple[date, date]:
 
 def parse_warehouse_mapping(text: str) -> dict[str, str]:
     result: dict[str, str] = {}
+    first_nonblank_row = True
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         if not raw_line.strip():
             continue
         columns = [part.strip() for part in raw_line.split("\t")]
         is_header = (
-            line_number == 1
+            first_nonblank_row
             and len(columns) == 2
             and all(columns)
             and columns[0].lower().replace(" ", "")
             in {"shipmentid", "货件编号"}
         )
+        first_nonblank_row = False
         if is_header:
             continue
         if len(columns) != 2 or not all(columns):

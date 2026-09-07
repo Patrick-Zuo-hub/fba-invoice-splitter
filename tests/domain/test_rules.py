@@ -41,6 +41,14 @@ def test_mapping_accepts_chinese_header() -> None:
     assert parse_warehouse_mapping("货件编号\t仓库\nS1\tONT8") == {"S1": "ONT8"}
 
 
+def test_mapping_accepts_english_header_after_leading_blank_lines() -> None:
+    assert parse_warehouse_mapping("\nShipment ID\tWarehouse\nS1\tONT8") == {"S1": "ONT8"}
+
+
+def test_mapping_accepts_chinese_header_after_leading_blank_lines() -> None:
+    assert parse_warehouse_mapping(" \n货件编号\t仓库\nS1\tONT8") == {"S1": "ONT8"}
+
+
 def test_mapping_rejects_malformed_recognized_header() -> None:
     with pytest.raises(ValueError, match="Invalid mapping row 1"):
         parse_warehouse_mapping("Shipment ID\tWarehouse\tExtra")
