@@ -76,17 +76,21 @@ def test_recovery_preserves_source_and_output(
     repository = BatchRepository(database)
     files = BatchFiles(tmp_path / "data")
     _create_batch(repository, "batch-1")
-    source = files.work_path("batch-1")
+    batch_dir = files.work_path("batch-1").parent
+    source = batch_dir / "source"
     source.mkdir(parents=True)
     (source / "source.xlsx").write_bytes(b"source")
-    output = files.publish("batch-1")
+    output = batch_dir / "output"
+    output.mkdir()
     (output / "result.xlsx").write_bytes(b"output")
-    files.create("batch-1")
+    work = files.create("batch-1")
+    (work / "partial.xlsx").write_bytes(b"partial")
 
     recover_interrupted(repository, files, FIXED_NOW)
 
+    assert (source / "source.xlsx").read_bytes() == b"source"
     assert (output / "result.xlsx").read_bytes() == b"output"
-    assert (output / "source.xlsx").read_bytes() == b"source"
+    assert not work.exists()
 
 
 def test_recovery_leaves_noninterrupted_states_unchanged(
