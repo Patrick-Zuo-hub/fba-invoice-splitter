@@ -274,6 +274,21 @@ def test_cleanup_rejects_windows_junction(tmp_path: Path) -> None:
     assert keep.read_text() == "keep"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory handles are only available on Windows")
+def test_windows_batch_file_operations_remain_available(tmp_path: Path) -> None:
+    files = BatchFiles(tmp_path / "data")
+    work = files.create("batch-1")
+    (work / "invoice.xlsx").write_bytes(b"xlsx")
+
+    output = files.publish("batch-1")
+    files.clear_output("batch-1")
+    files.create("batch-1")
+    files.delete_batch("batch-1")
+
+    assert output.name == "output"
+    assert not output.exists()
+
+
 def test_cleanup_rejects_output_symlink_without_following_target(tmp_path: Path) -> None:
     files = BatchFiles(tmp_path / "data")
     files.create("batch-1")

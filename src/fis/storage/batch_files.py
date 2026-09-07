@@ -1,3 +1,4 @@
+import ctypes
 import errno
 import os
 import re
@@ -5,7 +6,9 @@ import shutil
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 _SAFE_BATCH_ID = re.compile(
     r"(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|batch-[a-z0-9-]+)"
@@ -16,6 +19,103 @@ _USE_DIRECTORY_FDS = (
     and hasattr(os, "O_DIRECTORY")
     and hasattr(os, "O_NOFOLLOW")
 )
+
+_FILE_ATTRIBUTE_DIRECTORY = 0x10
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_FILE_ATTRIBUTE_TAG_INFO = 9
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_FILE_READ_ATTRIBUTES = 0x80
+_FILE_SHARE_DELETE = 0x4
+_FILE_SHARE_READ = 0x1
+_FILE_SHARE_WRITE = 0x2
+_OPEN_EXISTING = 3
+_INVALID_HANDLE_VALUE = int(ctypes.c_void_p(-1).value or -1)
+
+
+class _WindowsFileAttributeTagInfo(ctypes.Structure):
+    _fields_ = [
+        ("file_attributes", ctypes.c_ulong),
+        ("reparse_tag", ctypes.c_ulong),
+    ]
+
+
+@lru_cache(maxsize=1)
+def _windows_api() -> tuple[Any, Any, Any]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+
+    get_file_info = kernel32.GetFileInformationByHandleEx
+    get_file_info.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
+    get_file_info.restype = ctypes.c_int
+
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+
+    return create_file, get_file_info, close_handle
+
+
+def _windows_close_handle(handle: int) -> None:
+    _, _, close_handle = _windows_api()
+    close_handle(handle)
+
+
+def _windows_open_directory(path: Path) -> int:
+    create_file, get_file_info, _ = _windows_api()
+    handle = create_file(
+        str(path),
+        _FILE_READ_ATTRIBUTES,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        None,
+        _OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    handle_value = getattr(handle, "value", handle)
+    if handle_value is None or int(handle_value) in {-1, _INVALID_HANDLE_VALUE}:
+        error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
+        raise OSError(error_code, f"CreateFileW failed for directory {path}")
+
+    handle_int = int(handle_value)
+    info = _WindowsFileAttributeTagInfo()
+    if not get_file_info(
+        handle_int,
+        _FILE_ATTRIBUTE_TAG_INFO,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
+        _windows_close_handle(handle_int)
+        raise OSError(error_code, f"GetFileInformationByHandleEx failed for directory {path}")
+    if info.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+        _windows_close_handle(handle_int)
+        raise ValueError(f"Symlinked or junction directory is not allowed: {path}")
+    if not info.file_attributes & _FILE_ATTRIBUTE_DIRECTORY:
+        _windows_close_handle(handle_int)
+        raise NotADirectoryError(path)
+    return handle_int
+
+
+def _windows_path_prefixes(path: Path) -> tuple[Path, ...]:
+    parts = path.parts
+    current = Path(parts[0])
+    prefixes = [current]
+    for part in parts[1:]:
+        current /= part
+        prefixes.append(current)
+    return tuple(prefixes)
 
 
 class BatchFiles:
@@ -109,6 +209,57 @@ class BatchFiles:
                 raise ValueError(f"Symlinked {label} is not allowed") from error
             raise
 
+    @contextmanager
+    def _windows_data_handles(self) -> Iterator[list[int]]:
+        handles: list[int] = []
+        try:
+            for prefix in _windows_path_prefixes(self.data_root):
+                handles.append(_windows_open_directory(prefix))
+            yield handles
+        finally:
+            for handle in reversed(handles):
+                _windows_close_handle(handle)
+
+    @contextmanager
+    def _windows_batch_parent_handles(self) -> Iterator[int]:
+        with self._windows_data_handles():
+            batches_handle = _windows_open_directory(self.batches_root)
+            try:
+                yield batches_handle
+            finally:
+                _windows_close_handle(batches_handle)
+
+    @contextmanager
+    def _windows_batch_handles(self, batch_id: str) -> Iterator[int]:
+        with self._windows_batch_parent_handles():
+            batch_handle = _windows_open_directory(self.batches_root / batch_id)
+            try:
+                yield batch_handle
+            finally:
+                _windows_close_handle(batch_handle)
+
+    @staticmethod
+    def _windows_validate_directory(path: Path, label: str) -> None:
+        handle = _windows_open_directory(path)
+        _windows_close_handle(handle)
+
+    def _windows_publish(self, batch_id: str, work: Path, output: Path) -> None:
+        with self._windows_batch_handles(batch_id):
+            self._windows_validate_directory(work, "batch work directory")
+            if self._is_redirect(output) or output.exists():
+                raise FileExistsError("Batch output already exists")
+            os.replace(work, output)
+
+    def _windows_clear_directory(self, batch_id: str, path: Path, label: str) -> None:
+        with self._windows_batch_handles(batch_id):
+            self._windows_validate_directory(path, f"batch {label} directory")
+            shutil.rmtree(path)
+
+    def _windows_delete_batch(self, batch_id: str, batch: Path) -> None:
+        with self._windows_batch_parent_handles():
+            self._windows_validate_directory(batch, "batch directory")
+            shutil.rmtree(batch)
+
     def _batch(self, batch_id: str) -> Path:
         if not isinstance(batch_id, str) or _SAFE_BATCH_ID.fullmatch(batch_id) is None:
             raise ValueError("Invalid batch ID")
@@ -158,6 +309,8 @@ class BatchFiles:
                     os.rename("work", "output", src_dir_fd=batch_fd, dst_dir_fd=batch_fd)
             except FileNotFoundError as error:
                 raise FileNotFoundError(work) from error
+        elif os.name == "nt":
+            self._windows_publish(batch_id, work, output)
         else:
             self._require_secure_directory_handles()
         return output
@@ -174,6 +327,8 @@ class BatchFiles:
                     BatchFiles._remove_child(batch_fd, path.name, f"batch {label} directory")
             except FileNotFoundError:
                 return
+        elif os.name == "nt":
+            self._windows_clear_directory(path.parent.name, path, label)
         else:
             self._require_secure_directory_handles()
 
@@ -195,6 +350,8 @@ class BatchFiles:
                     self._remove_child(batches_fd, batch.name, "batch directory")
             except FileNotFoundError:
                 return
+        elif os.name == "nt":
+            self._windows_delete_batch(batch_id, batch)
         else:
             self._require_secure_directory_handles()
 

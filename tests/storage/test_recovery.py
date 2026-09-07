@@ -1,3 +1,4 @@
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -127,3 +128,20 @@ def test_recovery_rejects_naive_now_before_changing_batches(
 
     assert repository.get("batch-1").state is BatchState.PARSING
     assert files.work_path("batch-1").is_dir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory handles are only available on Windows")
+def test_windows_recovery_clears_work_and_marks_batch_incomplete(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    repository = BatchRepository(database)
+    files = BatchFiles(tmp_path / "data")
+    _create_batch(repository, "batch-1")
+    work = files.create("batch-1")
+    (work / "partial.xlsx").write_bytes(b"partial")
+
+    recover_interrupted(repository, files, FIXED_NOW)
+
+    assert repository.get("batch-1").state is BatchState.INCOMPLETE
+    assert not work.exists()
