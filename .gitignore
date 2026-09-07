@@ -13,3 +13,5 @@ coverage/
 outputs/
 uploads/
 generated/
+.worktrees/
+.superpowers/
