@@ -293,6 +293,34 @@ def test_windows_batch_file_operations_remain_available(tmp_path: Path) -> None:
     assert not output.exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory handles are only available on Windows")
+def test_windows_protected_directory_blocks_junction_creation(tmp_path: Path) -> None:
+    files = BatchFiles(tmp_path / "data")
+    work = files.create("batch-1")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    keep = outside / "keep.txt"
+    keep.write_text("keep")
+    nested = work / "nested"
+    nested.mkdir()
+    nested.rmdir()
+
+    protected = batch_files_module._windows_open_handle(work, require_directory=True)
+    try:
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(nested), str(outside)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert not nested.exists()
+    finally:
+        batch_files_module._windows_close_handle(protected)
+
+    assert keep.read_text() == "keep"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows junctions are only available on Windows")
 def test_windows_cleanup_rejects_nested_junction_without_touching_target(tmp_path: Path) -> None:
     files = BatchFiles(tmp_path / "data")
