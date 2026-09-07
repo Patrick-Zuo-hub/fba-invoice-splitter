@@ -1,3 +1,5 @@
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -125,6 +127,61 @@ def test_cleanup_rejects_work_symlink_without_following_target(tmp_path: Path) -
 
     assert (outside / "keep.txt").read_text() == "keep"
     assert files.work_path("batch-1").is_symlink()
+
+
+def test_cleanup_rejects_data_root_replaced_with_symlink(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    files = BatchFiles(data_root)
+    files.create("batch-1")
+    retained_data = tmp_path / "retained-data"
+    data_root.rename(retained_data)
+
+    external = tmp_path / "outside"
+    external_work = external / "batches" / "batch-1" / "work"
+    external_work.mkdir(parents=True)
+    keep = external_work / "keep.txt"
+    keep.write_text("keep")
+    data_root.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="[Ss]ymlink|[Jj]unction"):
+        files.clear_work("batch-1")
+
+    assert keep.read_text() == "keep"
+
+
+def test_cleanup_rejects_batches_root_replaced_with_symlink(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    files = BatchFiles(data_root)
+    files.create("batch-1")
+    retained_batches = tmp_path / "retained-batches"
+    files.batches_root.rename(retained_batches)
+    files.batches_root.symlink_to(retained_batches, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="[Ss]ymlink|[Jj]unction"):
+        files.clear_work("batch-1")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junctions are only available on Windows")
+def test_cleanup_rejects_windows_junction(tmp_path: Path) -> None:
+    files = BatchFiles(tmp_path / "data")
+    files.create("batch-1")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    keep = outside / "keep.txt"
+    keep.write_text("keep")
+    work = files.work_path("batch-1")
+    work.rmdir()
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(work), str(outside)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with pytest.raises(ValueError, match="[Ss]ymlink|[Jj]unction"):
+        files.clear_work("batch-1")
+
+    assert keep.read_text() == "keep"
 
 
 def test_cleanup_rejects_output_symlink_without_following_target(tmp_path: Path) -> None:
