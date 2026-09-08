@@ -179,22 +179,23 @@ class SafePackage:
         total_size = 0
         canonical_names: set[str] = set()
         for info in infos:
+            entry_name = self._validated_zip_entry_name(info)
             if info.compress_type not in {ZIP_STORED, ZIP_DEFLATED}:
                 raise WorkbookError(
-                    "UNSUPPORTED_COMPRESSION", "XLSX 包含不支持的压缩算法", info.filename
+                    "UNSUPPORTED_COMPRESSION", "XLSX 包含不支持的压缩算法", entry_name
                 )
-            canonical_name = self._canonical_part_name(info.filename)
+            canonical_name = self._canonical_part_name(entry_name)
             if canonical_name in canonical_names:
-                raise WorkbookError("DUPLICATE_ENTRY", "XLSX 包含重复的文件条目", info.filename)
+                raise WorkbookError("DUPLICATE_ENTRY", "XLSX 包含重复的文件条目", entry_name)
             canonical_names.add(canonical_name)
             if info.flag_bits & 0x1:
-                raise WorkbookError("ENCRYPTED_ENTRY", "XLSX 不支持加密文件条目", info.filename)
+                raise WorkbookError("ENCRYPTED_ENTRY", "XLSX 不支持加密文件条目", entry_name)
             if info.file_size > MAX_ENTRY:
-                raise WorkbookError("ENTRY_TOO_LARGE", "XLSX 包含超过大小限制的文件", info.filename)
+                raise WorkbookError("ENTRY_TOO_LARGE", "XLSX 包含超过大小限制的文件", entry_name)
             total_size += info.file_size
             if total_size > MAX_UNCOMPRESSED:
                 raise WorkbookError("PACKAGE_TOO_LARGE", "XLSX 解压后的总大小超过限制")
-            self._entries[info.filename] = info
+            self._entries[entry_name] = info
             self._canonical_entries[canonical_name] = info
 
         missing = _CANONICAL_CORE_PARTS.difference(self._canonical_entries)
@@ -205,6 +206,44 @@ class SafePackage:
             self._validate_unsupported_part(self._canonical_part_name(part), info.filename)
         self._validate_content_types()
         self._validate_relationships()
+
+    @staticmethod
+    def _validated_zip_entry_name(info: ZipInfo) -> str:
+        """Reject ZIP names that Python's ZipInfo may have silently normalized."""
+
+        filename = getattr(info, "filename", None)
+        if not isinstance(filename, str):
+            raise WorkbookError("UNSAFE_PATH", "XLSX 包含不安全的文件路径")
+
+        missing = object()
+        try:
+            original_name = getattr(info, "orig_filename", missing)
+        except Exception as exc:
+            raise WorkbookError("UNSAFE_PATH", "XLSX 包含不安全的文件路径", filename) from exc
+
+        names = [filename]
+        if original_name is not missing:
+            try:
+                original_text = (
+                    original_name
+                    if isinstance(original_name, str)
+                    else str(original_name)
+                )
+            except Exception as exc:
+                raise WorkbookError(
+                    "UNSAFE_PATH", "XLSX 包含不安全的文件路径", filename
+                ) from exc
+            if not isinstance(original_name, str) or original_text != filename:
+                raise WorkbookError("UNSAFE_PATH", "XLSX 包含不安全的文件路径", filename)
+            names.append(original_text)
+
+        if any(
+            ord(character) < 32 or 127 <= ord(character) <= 159
+            for name in names
+            for character in name
+        ):
+            raise WorkbookError("UNSAFE_PATH", "XLSX 包含不安全的文件路径", filename)
+        return filename
 
     @staticmethod
     def _decode_percent_uri(value: str, location: str, error_code: str) -> str:

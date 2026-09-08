@@ -69,6 +69,22 @@ def test_rejects_unsafe_zip_entry_names(tmp_path: Path, name: str) -> None:
     )
 
 
+def test_rejects_truncated_zip_entry_name_with_nul(tmp_path: Path) -> None:
+    path = write_package(
+        tmp_path / "truncated-entry.xlsx",
+        {**CORE_PARTS, "xl/fooXbad.xml": b"safe"},
+    )
+    payload = bytearray(path.read_bytes())
+    original_name = b"xl/fooXbad.xml"
+    truncated_name = b"xl/foo\x00bad.xml"
+    assert len(original_name) == len(truncated_name)
+    assert payload.count(original_name) == 2
+    payload[:] = payload.replace(original_name, truncated_name)
+    path.write_bytes(payload)
+
+    assert error_code(lambda: SafePackage.open(path)) == "UNSAFE_PATH"
+
+
 def test_rejects_duplicate_normalized_entry_names(tmp_path: Path) -> None:
     path = tmp_path / "duplicate.xlsx"
     with ZipFile(path, "w") as archive:
