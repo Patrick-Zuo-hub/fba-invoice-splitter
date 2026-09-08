@@ -10,6 +10,8 @@ from fis.xlsx.errors import WorkbookError
 from fis.xlsx.parser import ParsedBundle, ParsedItem, ParsedShipment, parse_invoice_bundle
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
+OFFICE_RELATIONSHIP = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
 
 def _rewrite_part(path: Path, part_name: str, rewrite: Callable[[bytes], bytes]) -> None:
     with ZipFile(path) as archive:
@@ -20,10 +22,30 @@ def _rewrite_part(path: Path, part_name: str, rewrite: Callable[[bytes], bytes])
             archive.writestr(name, content)
 
 
+def _add_shared_strings(
+    parts: dict[str, bytes], content: bytes, part_name: str = "xl/sharedStrings.xml"
+) -> None:
+    parts[part_name] = content
+    target = part_name.removeprefix("xl/")
+    relationship = (
+        f'<Relationship Id="rId9" Type="{OFFICE_RELATIONSHIP}/sharedStrings" Target="{target}"/>'
+    ).encode()
+    parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
+        b"</Relationships>", relationship + b"</Relationships>"
+    )
+
+
 def _template_error(path: Path) -> WorkbookError:
     with pytest.raises(WorkbookError) as captured:
         parse_invoice_bundle(path)
     assert captured.value.code == "TEMPLATE_VERSION_MISMATCH"
+    return captured.value
+
+
+def _workbook_error(path: Path, code: str) -> WorkbookError:
+    with pytest.raises(WorkbookError) as captured:
+        parse_invoice_bundle(path)
+    assert captured.value.code == code
     return captured.value
 
 
@@ -130,9 +152,10 @@ def test_reads_shared_rich_inline_and_formula_cells_without_using_cache(tmp_path
     )
     with ZipFile(path) as archive:
         parts = {name: archive.read(name) for name in archive.namelist()}
-    parts["xl/sharedStrings.xml"] = (
+    _add_shared_strings(
+        parts,
         b'<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        b"<si><r><t>shared </t></r><r><t>rich</t></r></si></sst>"
+        b"<si><r><t>shared </t></r><r><t>rich</t></r></si></sst>",
     )
     with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
         for name, content in parts.items():
@@ -143,6 +166,131 @@ def test_reads_shared_rich_inline_and_formula_cells_without_using_cache(tmp_path
     assert cells["D"] == "shared rich"
     assert cells["E"] == "Rich text"
     assert cells["F"] == "=SUM(2,3)"
+
+
+@pytest.mark.parametrize(
+    ("target", "part_name"),
+    [
+        ("custom/strings.xml", "xl/custom/strings.xml"),
+        ("/xl/custom/sharedstrings.xml", "xl/custom/SharedStrings.xml"),
+    ],
+)
+def test_reads_shared_strings_from_the_workbook_relationship_target(
+    tmp_path: Path, target: str, part_name: str
+) -> None:
+    path = tmp_path / "related-shared-strings.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(
+            b'<c r="D12" t="inlineStr"><is><t>1</t></is></c>',
+            b'<c r="D12" t="s"><v>0</v></c>',
+        ),
+    )
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts[part_name] = (
+        b'<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b"<si><t>related string</t></si></sst>"
+    )
+    relationship = (
+        f'<Relationship Id="rId9" Type="{OFFICE_RELATIONSHIP}/sharedStrings" Target="{target}"/>'
+    ).encode()
+    parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
+        b"</Relationships>", relationship + b"</Relationships>"
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    assert parse_invoice_bundle(path).shipments[0].items[0].cells["D"] == "related string"
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        b'<f t="shared" si="0">SUM(D12:E12)</f>',
+        b'<f t="shared" si="0"/>',
+        b'<f t="array" ref="F12:F13">SUM(D12:E12)</f>',
+        b'<f t="dataTable" ref="F12:G13">TABLE(D12,E12)</f>',
+    ],
+)
+def test_rejects_shared_formula_masters_and_followers(tmp_path: Path, formula: bytes) -> None:
+    path = tmp_path / "shared-formula.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(
+            b'<c r="F12" t="inlineStr"><is><t>1</t></is></c>',
+            b'<c r="F12">' + formula + b"<v>1</v></c>",
+        ),
+    )
+
+    assert _workbook_error(path, "UNSUPPORTED_FORMULA").location == "F12"
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        f'<Relationship Id="rId10" Type="{OFFICE_RELATIONSHIP}/sharedStrings" Target="other.xml"/>',
+        f'<Relationship Id="rId9" Type="{OFFICE_RELATIONSHIP}/styles" Target="styles.xml"/>',
+        f'<Relationship Id="rId10" Type="{OFFICE_RELATIONSHIP}/styles" Target="sharedStrings.xml"/>',
+        f'<Relationship Id="rId10" Type="{OFFICE_RELATIONSHIP}/styles" Target="SHAREDSTRINGS.xml"/>',
+    ],
+)
+def test_rejects_duplicate_shared_string_relationship_ids_and_targets(
+    tmp_path: Path, duplicate: str
+) -> None:
+    path = tmp_path / "duplicate-shared-relationship.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    _add_shared_strings(
+        parts,
+        b'<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>',
+    )
+    parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
+        b"</Relationships>", duplicate.encode() + b"</Relationships>"
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    assert _template_error(path).location == "xl/_rels/workbook.xml.rels"
+
+
+@pytest.mark.parametrize("column", ["AB", "BC", "XFD"])
+def test_ignores_duplicate_cells_outside_a_to_z(tmp_path: Path, column: str) -> None:
+    path = tmp_path / f"later-column-{column}.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    extra = (
+        f'<c r="{column}12" t="inlineStr"><is><t>ignored</t></is></c>'
+        f'<c r="{column}12" t="inlineStr"><is><t>ignored twice</t></is></c>'
+    ).encode()
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(b"</row><row r=\"13\"", extra + b'</row><row r="13"'),
+    )
+
+    assert column not in parse_invoice_bundle(path).shipments[0].items[0].cells
+
+
+def test_rejects_excel_column_beyond_xfd(tmp_path: Path) -> None:
+    path = tmp_path / "column-beyond-xfd.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(
+            b"</row><row r=\"13\"",
+            b'<c r="XYZ12" t="inlineStr"><is><t>invalid</t></is></c></row><row r="13"',
+        ),
+    )
+
+    assert _template_error(path).location == "XYZ12"
 
 
 def test_ignores_phonetic_text_in_shared_and_inline_rich_strings(tmp_path: Path) -> None:
@@ -161,9 +309,10 @@ def test_ignores_phonetic_text_in_shared_and_inline_rich_strings(tmp_path: Path)
     )
     with ZipFile(path) as archive:
         parts = {name: archive.read(name) for name in archive.namelist()}
-    parts["xl/sharedStrings.xml"] = (
+    _add_shared_strings(
+        parts,
         b'<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        b'<si><t xml:space="preserve">shared </t><rPh><t>phonetic</t></rPh><r><t>text</t></r></si></sst>'
+        b'<si><t xml:space="preserve">shared </t><rPh><t>phonetic</t></rPh><r><t>text</t></r></si></sst>',
     )
     with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
         for name, content in parts.items():

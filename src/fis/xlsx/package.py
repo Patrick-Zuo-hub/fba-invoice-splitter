@@ -147,6 +147,12 @@ class SafePackage:
             raise WorkbookError("UNSAFE_XML", "工作簿 XML 不允许 DTD 或实体定义", part)
         return root
 
+    def resolve_relationship_target(self, source_part: str, target: str) -> str:
+        """Resolve one internal OPC relationship target to its canonical part name."""
+
+        self._require_open()
+        return self._resolve_relationship_target(source_part, target)
+
     def close(self) -> None:
         """Close the underlying archive. Access after close is rejected."""
 
@@ -348,6 +354,31 @@ class SafePackage:
     def _validate_internal_relationship_target(cls, relationship_part: str, target: str) -> None:
         """Ensure an internal OPC relationship cannot resolve outside the package."""
 
+        cls._resolve_relationship_target(
+            cls._source_part_for_relationship_part(relationship_part), target
+        )
+
+    @classmethod
+    def _source_part_for_relationship_part(cls, relationship_part: str) -> str | None:
+        canonical_relationship_part = cls._canonical_part_name(relationship_part)
+        segments = canonical_relationship_part.split("/")
+        if canonical_relationship_part == "_rels/.rels":
+            return None
+        if len(segments) < 3 or segments[-2] != "_rels" or not segments[-1].endswith(".rels"):
+            raise WorkbookError(
+                "UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", relationship_part
+            )
+        source_name = segments[-1].removesuffix(".rels")
+        if not source_name:
+            raise WorkbookError(
+                "UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", relationship_part
+            )
+        return "/".join([*segments[:-2], source_name])
+
+    @classmethod
+    def _resolve_relationship_target(cls, source_part: str | None, target: str) -> str:
+        """Resolve a target with the same URI rules used for archive validation."""
+
         if not target:
             raise WorkbookError("UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", target)
         decoded = cls._decode_percent_uri(target, target, "UNSAFE_RELATIONSHIP")
@@ -369,10 +400,9 @@ class SafePackage:
         ):
             raise WorkbookError("UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", target)
 
-        relationship_segments = cls._canonical_part_name(relationship_part).split("/")
-        if len(relationship_segments) < 2 or relationship_segments[-2] != "_rels":
-            raise WorkbookError("UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", target)
-        resolved = [] if package_root_relative else relationship_segments[:-2]
+        resolved = [] if package_root_relative or source_part is None else cls._canonical_part_name(
+            source_part
+        ).split("/")[:-1]
         if package_root_relative:
             decoded = decoded[1:]
         for segment in decoded.split("/"):
@@ -388,3 +418,4 @@ class SafePackage:
             if any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in segment):
                 raise WorkbookError("UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", target)
             resolved.append(segment)
+        return cls._canonical_part_name("/".join(resolved))

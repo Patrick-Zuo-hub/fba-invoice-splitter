@@ -41,6 +41,38 @@ def test_opens_anonymous_standard_v1_fixture(tmp_path: Path) -> None:
         assert package.read("xl/workbook.xml").startswith(b"<?xml")
 
 
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        ("custom/strings.xml", "xl/custom/strings.xml"),
+        ("/xl/custom/strings.xml", "xl/custom/strings.xml"),
+    ],
+)
+def test_resolves_relative_and_root_relative_relationship_targets(
+    tmp_path: Path, target: str, expected: str
+) -> None:
+    path = tmp_path / "standard.xlsx"
+    build_standard_v1(path, {"SYNTHETIC-1": 1}, [])
+
+    with SafePackage.open(path) as package:
+        assert package.resolve_relationship_target("xl/workbook.xml", target) == expected
+
+
+def test_rejects_percent_encoded_unsafe_relationship_target(tmp_path: Path) -> None:
+    path = tmp_path / "standard.xlsx"
+    build_standard_v1(path, {"SYNTHETIC-1": 1}, [])
+
+    with SafePackage.open(path) as package:
+        assert (
+            error_code(
+                lambda: package.resolve_relationship_target(
+                    "xl/workbook.xml", "%2e%2e/%2e%2e/strings.xml"
+                )
+            )
+            == "UNSAFE_RELATIONSHIP"
+        )
+
+
 def test_requires_an_existing_xlsx_file(tmp_path: Path) -> None:
     assert error_code(lambda: SafePackage.open(tmp_path / "missing.xlsx")) == "INVALID_PATH"
     assert error_code(lambda: SafePackage.open(tmp_path)) == "INVALID_PATH"

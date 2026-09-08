@@ -6,7 +6,6 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from posixpath import normpath
 from types import MappingProxyType
 
 from lxml import etree  # type: ignore[import-untyped]
@@ -22,6 +21,7 @@ MAX_WORKSHEET_ROWS = 100_000
 MAX_EXCEL_ROW = 1_048_576
 MAX_EXCEL_COLUMN = 16_384
 _COLUMNS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_A_TO_Z = frozenset(_COLUMNS)
 _CELL_REFERENCE = re.compile(r"^([A-Z]{1,3})([1-9][0-9]{0,6})$", re.ASCII)
 _ROW_NUMBER = re.compile(r"^[1-9][0-9]{0,6}$", re.ASCII)
 _REQUIRED_HEADERS = (
@@ -100,16 +100,53 @@ def _text(element: etree._Element) -> str:
     )
 
 
-def _parse_shared_strings(package: SafePackage) -> tuple[str, ...]:
-    if "xl/sharedStrings.xml" not in package.names:
+def _parse_shared_strings(
+    package: SafePackage, relationships: etree._Element
+) -> tuple[str, ...]:
+    all_relationships = relationships.xpath(
+        "./pkg:Relationship", namespaces={"pkg": PACKAGE_REL_NS}
+    )
+    shared_relationships = [
+        relationship
+        for relationship in all_relationships
+        if relationship.get("Type", "").endswith("/sharedStrings")
+    ]
+    if not shared_relationships:
         return ()
-    root = package.read_xml("xl/sharedStrings.xml", MAX_ENTRY)
+    if len(shared_relationships) != 1:
+        raise _template_error("xl/_rels/workbook.xml.rels")
+    relationship = shared_relationships[0]
+    relation_id = relationship.get("Id")
+    target = relationship.get("Target")
+    if (
+        not relation_id
+        or not target
+        or sum(item.get("Id") == relation_id for item in all_relationships) != 1
+    ):
+        raise _template_error("xl/_rels/workbook.xml.rels")
+    try:
+        part = package.resolve_relationship_target("xl/workbook.xml", target)
+        if any(
+            item is not relationship
+            and item.get("Target")
+            and package.resolve_relationship_target("xl/workbook.xml", item.get("Target") or "")
+            == part
+            for item in all_relationships
+        ):
+            raise _template_error("xl/_rels/workbook.xml.rels")
+        root = package.read_xml(part, MAX_ENTRY)
+    except WorkbookError as exc:
+        if exc.code in {"MISSING_PART", "UNSAFE_PATH", "UNSAFE_RELATIONSHIP"}:
+            raise _template_error("xl/_rels/workbook.xml.rels") from exc
+        raise
     return tuple(_text(item) for item in root.xpath("./main:si", namespaces={"main": MAIN_NS}))
 
 
 def _cell_value(cell: etree._Element, shared_strings: tuple[str, ...], location: str) -> str:
     formula = cell.find(f"{{{MAIN_NS}}}f")
     if formula is not None:
+        if formula.get("t") in {"shared", "array", "dataTable"}:
+            raise WorkbookError("UNSUPPORTED_FORMULA", "V1 不支持共享或数组公式", location)
         return f"={formula.text or ''}"
     cell_type = cell.get("t")
     if cell_type == "inlineStr":
@@ -129,7 +166,11 @@ def _cell_value(cell: etree._Element, shared_strings: tuple[str, ...], location:
     raise _template_error(location)
 
 
-def _worksheet_part(package: SafePackage) -> str:
+def _workbook_relationships(package: SafePackage) -> etree._Element:
+    return package.read_xml("xl/_rels/workbook.xml.rels", MAX_ENTRY)
+
+
+def _worksheet_part(package: SafePackage, relationships: etree._Element) -> str:
     workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
     sheets = workbook.xpath("./main:sheets/main:sheet", namespaces={"main": MAIN_NS})
     matched = [sheet for sheet in sheets if sheet.get("name") == STANDARD_V1.sheet_name]
@@ -139,7 +180,6 @@ def _worksheet_part(package: SafePackage) -> str:
     if not relation_id:
         raise _template_error("xl/workbook.xml")
 
-    relationships = package.read_xml("xl/_rels/workbook.xml.rels", MAX_ENTRY)
     matching_ids = [
         relation
         for relation in relationships.xpath(
@@ -152,10 +192,12 @@ def _worksheet_part(package: SafePackage) -> str:
     target = matching_ids[0].get("Target")
     if not target:
         raise _template_error("xl/_rels/workbook.xml.rels")
-    part = normpath(target.lstrip("/") if target.startswith("/") else f"xl/{target}")
-    if part in {"", "."} or part.startswith("../"):
-        raise _template_error("xl/_rels/workbook.xml.rels")
-    return part
+    try:
+        return package.resolve_relationship_target("xl/workbook.xml", target)
+    except WorkbookError as exc:
+        if exc.code in {"UNSAFE_PATH", "UNSAFE_RELATIONSHIP"}:
+            raise _template_error("xl/_rels/workbook.xml.rels") from exc
+        raise
 
 
 def _rows_from_worksheet(
@@ -175,7 +217,7 @@ def _rows_from_worksheet(
             column, cell_row = parsed
             if cell_row != row_number:
                 raise _template_error(cell.get("r", f"A{row_number}"))
-            if column not in _COLUMNS:
+            if column not in _A_TO_Z:
                 continue
             if column in values:
                 raise _template_error(cell.get("r", f"{column}{row_number}"))
@@ -210,10 +252,11 @@ def parse_invoice_bundle(path: Path | str) -> ParsedBundle:
     """Return the immutable product rows from one validated FIS V1 workbook."""
 
     with SafePackage.open(path) as package:
-        worksheet_part = _worksheet_part(package)
+        relationships = _workbook_relationships(package)
+        worksheet_part = _worksheet_part(package, relationships)
         worksheet = package.read_xml(worksheet_part, MAX_ENTRY)
         rows, max_row = _rows_from_worksheet(
-            worksheet, _parse_shared_strings(package), worksheet_part
+            worksheet, _parse_shared_strings(package, relationships), worksheet_part
         )
 
     _validate_headers(rows)
