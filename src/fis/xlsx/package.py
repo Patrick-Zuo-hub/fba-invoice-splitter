@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import re
+import struct
 import zlib
 from dataclasses import dataclass, field
+from lzma import LZMAError
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Self
 from urllib.parse import unquote_to_bytes, urlsplit
-from zipfile import BadZipFile, ZipFile, ZipInfo
+from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
 
 from lxml import etree  # type: ignore[import-untyped]
 
@@ -18,6 +20,8 @@ from fis.xlsx.errors import WorkbookError
 MAX_ENTRIES = 5000
 MAX_UNCOMPRESSED = 200 * 1024 * 1024
 MAX_ENTRY = 50 * 1024 * 1024
+MAX_RELATIONSHIP_TARGET_CHARS = 8192
+MAX_PERCENT_DECODE_ROUNDS = 3
 
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
@@ -39,7 +43,16 @@ def _ascii_lower(value: str) -> str:
 
 _CORE_PARTS = frozenset({"[Content_Types].xml", "_rels/.rels", "xl/workbook.xml"})
 _CANONICAL_CORE_PARTS = frozenset(_ascii_lower(part) for part in _CORE_PARTS)
-_ARCHIVE_ERRORS = (BadZipFile, EOFError, OSError, RuntimeError, zlib.error)
+_ARCHIVE_ERRORS = (
+    BadZipFile,
+    EOFError,
+    LZMAError,
+    OSError,
+    RuntimeError,
+    UnicodeDecodeError,
+    zlib.error,
+    struct.error,
+)
 _RELATIONSHIPS_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 
@@ -166,6 +179,10 @@ class SafePackage:
         total_size = 0
         canonical_names: set[str] = set()
         for info in infos:
+            if info.compress_type not in {ZIP_STORED, ZIP_DEFLATED}:
+                raise WorkbookError(
+                    "UNSUPPORTED_COMPRESSION", "XLSX 包含不支持的压缩算法", info.filename
+                )
             canonical_name = self._canonical_part_name(info.filename)
             if canonical_name in canonical_names:
                 raise WorkbookError("DUPLICATE_ENTRY", "XLSX 包含重复的文件条目", info.filename)
@@ -194,8 +211,14 @@ class SafePackage:
         """Decode percent escapes repeatedly while rejecting dangerous URI syntax."""
 
         current = value
+        if len(current) > MAX_RELATIONSHIP_TARGET_CHARS:
+            raise WorkbookError(error_code, "XLSX 文件路径或关系目标过长", location)
         first_pass = True
+        rounds = 0
         while "%" in current:
+            rounds += 1
+            if rounds > MAX_PERCENT_DECODE_ROUNDS:
+                raise WorkbookError(error_code, "XLSX 文件路径或关系目标编码层数过多", location)
             if _ENCODED_SEPARATOR.search(current):
                 raise WorkbookError(error_code, "XLSX 包含不安全的文件路径或关系目标", location)
             if _INVALID_PERCENT_ESCAPE.search(current):
@@ -211,6 +234,8 @@ class SafePackage:
             if decoded == current:
                 return decoded
             current = decoded
+            if len(current) > MAX_RELATIONSHIP_TARGET_CHARS:
+                raise WorkbookError(error_code, "XLSX 文件路径或关系目标过长", location)
             first_pass = False
         return current
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
-from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+from zipfile import ZIP_BZIP2, ZIP_DEFLATED, ZIP_LZMA, ZipFile, ZipInfo
 
 import pytest
 
@@ -197,6 +197,18 @@ def test_limits_are_checked_before_opening(tmp_path: Path, monkeypatch: pytest.M
     )
 
 
+@pytest.mark.parametrize("compression", [ZIP_BZIP2, ZIP_LZMA])
+def test_rejects_non_deflate_zip_compression_before_reading(
+    tmp_path: Path, compression: int
+) -> None:
+    path = tmp_path / "unsupported-compression.xlsx"
+    with ZipFile(path, "w", compression=compression) as archive:
+        for name, payload in CORE_PARTS.items():
+            archive.writestr(name, payload)
+
+    assert error_code(lambda: SafePackage.open(path)) == "UNSUPPORTED_COMPRESSION"
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
@@ -324,6 +336,20 @@ def test_rejects_unsafe_internal_relationship_targets(tmp_path: Path, target: st
         error_code(
             lambda: SafePackage.open(write_package(tmp_path / "unsafe-relation.xlsx", parts))
         )
+        == "UNSAFE_RELATIONSHIP"
+    )
+
+
+def test_rejects_excessive_percent_decode_rounds_without_unbounded_work(tmp_path: Path) -> None:
+    target = "%25" + "25" * 15_000
+    parts = dict(CORE_PARTS)
+    parts["xl/_rels/workbook.xml.rels"] = (
+        "<Relationships><Relationship Id='rId1' Type='worksheet' "
+        f"Target='{target}'/></Relationships>"
+    ).encode()
+
+    assert (
+        error_code(lambda: SafePackage.open(write_package(tmp_path / "layered-uri.xlsx", parts)))
         == "UNSAFE_RELATIONSHIP"
     )
 
