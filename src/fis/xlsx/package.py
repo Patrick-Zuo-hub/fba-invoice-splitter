@@ -354,17 +354,21 @@ class SafePackage:
     def _validate_internal_relationship_target(cls, relationship_part: str, target: str) -> None:
         """Ensure an internal OPC relationship cannot resolve outside the package."""
 
-        cls._resolve_relationship_target(
-            cls._source_part_for_relationship_part(relationship_part), target
-        )
+        if cls._canonical_part_name(relationship_part) == "_rels/.rels":
+            cls._resolve_relationship_target(None, target)
+            return
+        cls._resolve_relationship_target(cls._source_part_for_relationship_part(relationship_part), target)
 
     @classmethod
-    def _source_part_for_relationship_part(cls, relationship_part: str) -> str | None:
+    def _source_part_for_relationship_part(cls, relationship_part: str) -> str:
         canonical_relationship_part = cls._canonical_part_name(relationship_part)
         segments = canonical_relationship_part.split("/")
-        if canonical_relationship_part == "_rels/.rels":
-            return None
-        if len(segments) < 3 or segments[-2] != "_rels" or not segments[-1].endswith(".rels"):
+        if (
+            len(segments) < 2
+            or canonical_relationship_part == "_rels/.rels"
+            or segments[-2] != "_rels"
+            or not segments[-1].endswith(".rels")
+        ):
             raise WorkbookError(
                 "UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", relationship_part
             )

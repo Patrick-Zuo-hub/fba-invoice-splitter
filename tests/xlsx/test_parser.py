@@ -100,6 +100,30 @@ def test_resolves_configured_sheet_through_workbook_relationship(tmp_path: Path)
     assert parse_invoice_bundle(path).product_rows == (12,)
 
 
+def test_parses_configured_worksheet_stored_at_package_root(tmp_path: Path) -> None:
+    path = tmp_path / "root-worksheet.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["invoice.xml"] = parts.pop("xl/worksheets/sheet1.xml")
+    worksheet_relationships = parts.pop("xl/worksheets/_rels/sheet1.xml.rels")
+    parts["_rels/invoice.xml.rels"] = (
+        worksheet_relationships.replace(b"../drawings/", b"drawings/")
+        .replace(b"../comments1.xml", b"comments1.xml")
+    )
+    parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
+        b"worksheets/sheet1.xml", b"/invoice.xml"
+    )
+    parts["[Content_Types].xml"] = parts["[Content_Types].xml"].replace(
+        b"/xl/worksheets/sheet1.xml", b"/invoice.xml"
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    assert parse_invoice_bundle(path).product_rows == (12,)
+
+
 def test_rejects_missing_or_duplicate_configured_sheet_and_relationship(tmp_path: Path) -> None:
     path = tmp_path / "bad-workbook.xlsx"
     build_standard_v1(path, {"S1": 1}, [])
