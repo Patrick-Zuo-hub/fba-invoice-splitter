@@ -7,7 +7,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import pytest
 
 from fis.xlsx.errors import WorkbookError
-from fis.xlsx.parser import parse_invoice_bundle
+from fis.xlsx.parser import ParsedBundle, ParsedItem, ParsedShipment, parse_invoice_bundle
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
 
@@ -143,6 +143,98 @@ def test_reads_shared_rich_inline_and_formula_cells_without_using_cache(tmp_path
     assert cells["D"] == "shared rich"
     assert cells["E"] == "Rich text"
     assert cells["F"] == "=SUM(2,3)"
+
+
+def test_ignores_phonetic_text_in_shared_and_inline_rich_strings(tmp_path: Path) -> None:
+    path = tmp_path / "phonetic.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(
+            b'<c r="D12" t="inlineStr"><is><t>1</t></is></c>',
+            b'<c r="D12" t="s"><v>0</v></c>',
+        ).replace(
+            b'<c r="E12" t="inlineStr"><is><t>Synthetic Unit</t></is></c>',
+            b'<c r="E12" t="inlineStr"><is><t>inline </t><rPh><t>phonetic</t></rPh><r><t>text</t></r></is></c>',
+        ),
+    )
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["xl/sharedStrings.xml"] = (
+        b'<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b'<si><t xml:space="preserve">shared </t><rPh><t>phonetic</t></rPh><r><t>text</t></r></si></sst>'
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    cells = parse_invoice_bundle(path).shipments[0].items[0].cells
+
+    assert cells["D"] == "shared text"
+    assert cells["E"] == "inline text"
+
+
+@pytest.mark.parametrize("reference", ["D²", "A0", "A01", "XFE12", "A1048577", "A" + "9" * 5000])
+def test_rejects_invalid_cell_references_without_leaking_value_errors(
+    tmp_path: Path, reference: str
+) -> None:
+    path = tmp_path / "invalid-reference.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    extra_cell = f'<c r="{reference}" t="inlineStr"><is><t>bad</t></is></c>'.encode()
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(b"</row><row r=\"13\"", extra_cell + b'</row><row r="13"'),
+    )
+
+    error = _template_error(path)
+
+    assert error.location == reference
+
+
+@pytest.mark.parametrize(
+    ("row_reference", "case"),
+    [("0", "zero"), ("1048577", "past-excel-limit"), ("9" * 5000, "too-long")],
+)
+def test_rejects_invalid_row_references_as_template_errors(
+    tmp_path: Path, row_reference: str, case: str
+) -> None:
+    path = tmp_path / f"invalid-row-{case}.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(b'<row r="12">', f'<row r="{row_reference}">'.encode()),
+    )
+
+    assert _template_error(path).location == "xl/worksheets/sheet1.xml"
+
+
+def test_parsed_models_copy_mutable_inputs_and_reject_reassignment() -> None:
+    original_cells = {"A": "S1"}
+    item = ParsedItem("S1", 12, original_cells)
+    original_cells["A"] = "changed"
+    assert item.cells["A"] == "S1"
+    with pytest.raises(TypeError):
+        item.cells["A"] = "changed"
+
+    original_items = [item]
+    shipment = ParsedShipment("S1", original_items)  # type: ignore[arg-type]
+    original_items.clear()
+    assert shipment.items == (item,)
+    with pytest.raises(AttributeError):
+        shipment.items = ()  # type: ignore[misc]
+
+    original_shipments = [shipment]
+    original_product_rows = [12]
+    bundle = ParsedBundle(original_shipments, original_product_rows, 13, 14)  # type: ignore[arg-type]
+    original_shipments.clear()
+    original_product_rows.clear()
+    assert bundle.shipments == (shipment,)
+    assert bundle.product_rows == (12,)
+    with pytest.raises(AttributeError):
+        bundle.shipments = ()  # type: ignore[misc]
 
 
 def test_copies_only_a_to_z_when_product_row_has_later_columns(tmp_path: Path) -> None:

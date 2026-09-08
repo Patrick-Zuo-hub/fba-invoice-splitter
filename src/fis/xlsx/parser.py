@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,11 @@ MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 MAX_WORKSHEET_ROWS = 100_000
+MAX_EXCEL_ROW = 1_048_576
+MAX_EXCEL_COLUMN = 16_384
 _COLUMNS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_CELL_REFERENCE = re.compile(r"^([A-Z]{1,3})([1-9][0-9]{0,6})$", re.ASCII)
+_ROW_NUMBER = re.compile(r"^[1-9][0-9]{0,6}$", re.ASCII)
 _REQUIRED_HEADERS = (
     "货件编号SHIPMENT ID\n(亚马逊货物必填）\n不可合并",
     "跟踪编号\nREFERENCE ID\n(亚马逊货物必填）\n不可合并",
@@ -41,6 +46,12 @@ class ParsedShipment:
     shipment_id: str
     items: tuple[ParsedItem, ...]
 
+    def __post_init__(self) -> None:
+        items = tuple(self.items)
+        if any(item.shipment_id != self.shipment_id for item in items):
+            raise ValueError("all items must belong to their parsed shipment")
+        object.__setattr__(self, "items", items)
+
 
 @dataclass(frozen=True, slots=True)
 class ParsedBundle:
@@ -48,6 +59,10 @@ class ParsedBundle:
     product_rows: tuple[int, ...]
     separator_row: int
     total_row: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "shipments", tuple(self.shipments))
+        object.__setattr__(self, "product_rows", tuple(self.product_rows))
 
 
 def _template_error(location: str) -> WorkbookError:
@@ -59,24 +74,30 @@ def _normalized_header(value: str) -> str:
 
 
 def _cell_column_and_row(reference: str) -> tuple[str, int] | None:
-    if not reference:
+    match = _CELL_REFERENCE.fullmatch(reference)
+    if match is None:
         return None
-    column = ""
-    digits = ""
-    for character in reference:
-        if character.isalpha() and not digits:
-            column += character.upper()
-        elif character.isdigit():
-            digits += character
-        else:
-            return None
-    if not column.isascii() or not digits or int(digits) < 1:
+    column, row_text = match.groups()
+    column_number = 0
+    for character in column:
+        column_number = column_number * 26 + ord(character) - ord("A") + 1
+    row = int(row_text)
+    if column_number > MAX_EXCEL_COLUMN or row > MAX_EXCEL_ROW:
         return None
-    return column, int(digits)
+    return column, row
+
+
+def _row_number(value: str) -> int | None:
+    if _ROW_NUMBER.fullmatch(value) is None:
+        return None
+    row = int(value)
+    return row if row <= MAX_EXCEL_ROW else None
 
 
 def _text(element: etree._Element) -> str:
-    return "".join(element.xpath(".//main:t/text()", namespaces={"main": MAIN_NS}))
+    return "".join(
+        element.xpath("./main:t/text() | ./main:r/main:t/text()", namespaces={"main": MAIN_NS})
+    )
 
 
 def _parse_shared_strings(package: SafePackage) -> tuple[str, ...]:
@@ -138,22 +159,19 @@ def _worksheet_part(package: SafePackage) -> str:
 
 
 def _rows_from_worksheet(
-    root: etree._Element, shared_strings: tuple[str, ...]
+    root: etree._Element, shared_strings: tuple[str, ...], worksheet_part: str
 ) -> tuple[dict[int, dict[str, str]], int]:
     rows: dict[int, dict[str, str]] = {}
     max_row = 0
     for row in root.xpath("./main:sheetData/main:row", namespaces={"main": MAIN_NS}):
-        try:
-            row_number = int(row.get("r", ""))
-        except ValueError as exc:
-            raise _template_error("sheetData") from exc
-        if row_number < 1 or row_number > MAX_WORKSHEET_ROWS or row_number in rows:
-            raise _template_error(f"A{row_number if row_number > 0 else 1}")
+        row_number = _row_number(row.get("r", ""))
+        if row_number is None or row_number > MAX_WORKSHEET_ROWS or row_number in rows:
+            raise _template_error(worksheet_part)
         values: dict[str, str] = {}
         for cell in row.xpath("./main:c", namespaces={"main": MAIN_NS}):
             parsed = _cell_column_and_row(cell.get("r", ""))
             if parsed is None:
-                raise _template_error(f"A{row_number}")
+                raise _template_error(cell.get("r") or worksheet_part)
             column, cell_row = parsed
             if cell_row != row_number:
                 raise _template_error(cell.get("r", f"A{row_number}"))
@@ -192,8 +210,11 @@ def parse_invoice_bundle(path: Path | str) -> ParsedBundle:
     """Return the immutable product rows from one validated FIS V1 workbook."""
 
     with SafePackage.open(path) as package:
-        worksheet = package.read_xml(_worksheet_part(package), MAX_ENTRY)
-        rows, max_row = _rows_from_worksheet(worksheet, _parse_shared_strings(package))
+        worksheet_part = _worksheet_part(package)
+        worksheet = package.read_xml(worksheet_part, MAX_ENTRY)
+        rows, max_row = _rows_from_worksheet(
+            worksheet, _parse_shared_strings(package), worksheet_part
+        )
 
     _validate_headers(rows)
     start = STANDARD_V1.product_start_row
