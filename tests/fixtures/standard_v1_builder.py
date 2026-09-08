@@ -123,7 +123,7 @@ def _root_relationships() -> bytes:
 def _workbook() -> bytes:
     root = etree.Element(f"{{{MAIN_NS}}}workbook", nsmap=_NSMAP)
     book_views = _element(root, "bookViews")
-    _element(book_views, "workbookView", workbookViewId="0")
+    _element(book_views, "workbookView", activeTab="0")
     sheets = _element(root, "sheets")
     sheet = _element(sheets, "sheet", name=STANDARD_V1.sheet_name, sheetId="1")
     sheet.set(f"{{{REL_NS}}}id", "rId1")

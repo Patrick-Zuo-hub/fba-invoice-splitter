@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import posixpath
+import struct
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -132,3 +134,84 @@ def test_standard_v1_builder_emits_valid_anonymous_fixture(tmp_path: Path) -> No
         ) or archive.read("xl/media/image1.png")
         assert b"ONT8" not in archive.read("xl/worksheets/sheet1.xml")
         assert "客户".encode() not in b"".join(archive.read(name) for name in names)
+
+
+def test_standard_v1_workbook_view_uses_valid_ooxml_attributes(tmp_path: Path) -> None:
+    output = tmp_path / "standard-v1.xlsx"
+    build_standard_v1(output, {"SYNTHETIC-1": 1}, [])
+
+    with ZipFile(output) as archive:
+        workbook = etree.fromstring(archive.read("xl/workbook.xml"))
+        views = workbook.xpath("/main:workbook/main:bookViews/main:workbookView", namespaces=NS)
+        assert len(views) == 1
+        assert "workbookViewId" not in views[0].attrib
+
+
+def test_standard_v1_images_have_complete_relationship_and_png_contract(tmp_path: Path) -> None:
+    output = tmp_path / "standard-v1.xlsx"
+    build_standard_v1(output, {"SYNTHETIC-1": 1, "SYNTHETIC-2": 1}, [12, 13])
+
+    with ZipFile(output) as archive:
+        names = set(archive.namelist())
+        drawing = etree.fromstring(archive.read("xl/drawings/drawing1.xml"))
+        anchors = drawing.xpath("/xdr:wsDr/xdr:twoCellAnchor", namespaces=NS)
+        drawing_relationships = etree.fromstring(
+            archive.read("xl/drawings/_rels/drawing1.xml.rels")
+        )
+        relationships = {
+            relationship.get("Id"): relationship.get("Target")
+            for relationship in drawing_relationships
+        }
+        assert len(relationships) == len(list(drawing_relationships)) == len(anchors)
+        assert len(set(relationships)) == len(relationships)
+
+        embeds = [
+            anchor.xpath("string(xdr:pic/xdr:blipFill/a:blip/@r:embed)", namespaces=NS)
+            for anchor in anchors
+        ]
+        assert len(embeds) == len(set(embeds)) == len(anchors)
+        assert set(embeds) == set(relationships)
+
+        non_visual_ids = [
+            element.get("id")
+            for element in drawing.xpath(
+                "/xdr:wsDr/xdr:twoCellAnchor/xdr:pic/xdr:nvPicPr/xdr:cNvPr", namespaces=NS
+            )
+        ]
+        assert len(non_visual_ids) == len(set(non_visual_ids)) == len(anchors)
+
+        for anchor, expected_row in zip(anchors, (12, 13), strict=True):
+            assert anchor.get("editAs") == "oneCell"
+            assert int(anchor.xpath("string(xdr:from/xdr:col)", namespaces=NS)) == 2
+            assert int(anchor.xpath("string(xdr:to/xdr:col)", namespaces=NS)) == 3
+            assert int(anchor.xpath("string(xdr:from/xdr:row)", namespaces=NS)) == expected_row - 1
+            assert int(anchor.xpath("string(xdr:to/xdr:row)", namespaces=NS)) == expected_row
+
+        for relationship_id, target in relationships.items():
+            assert relationship_id in embeds
+            assert target is not None
+            media_name = posixpath.normpath(posixpath.join("xl/drawings", target))
+            assert media_name in names
+            png = archive.read(media_name)
+            assert png.startswith(b"\x89PNG\r\n\x1a\n")
+            assert png[12:16] == b"IHDR"
+            width, height = struct.unpack(">II", png[16:24])
+            assert (width, height) == (1, 1)
+
+        content_types = etree.fromstring(archive.read("[Content_Types].xml"))
+        png_defaults = [
+            default
+            for default in content_types
+            if default.tag.endswith("Default") and default.get("Extension") == "png"
+        ]
+        png_overrides = [
+            override
+            for override in content_types
+            if override.tag.endswith("Override")
+            and (override.get("PartName") or "").startswith("/xl/media/image")
+        ]
+        assert png_defaults or len(png_overrides) == len(anchors)
+        if png_defaults:
+            assert png_defaults[0].get("ContentType") == "image/png"
+        if png_overrides:
+            assert {override.get("ContentType") for override in png_overrides} == {"image/png"}
