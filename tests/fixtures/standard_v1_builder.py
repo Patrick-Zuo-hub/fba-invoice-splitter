@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from lxml import etree
 
@@ -58,6 +58,7 @@ def _normalize_shipments(shipments: Mapping[str, Any] | Iterable[Any]) -> list[t
 
     entries = shipments.items() if isinstance(shipments, Mapping) else shipments
     normalized: list[tuple[str, int]] = []
+    seen_ids: set[str] = set()
     for entry in entries:
         if isinstance(entry, tuple) and len(entry) == 2:
             shipment_id, count = entry
@@ -65,8 +66,11 @@ def _normalize_shipments(shipments: Mapping[str, Any] | Iterable[Any]) -> list[t
             shipment_id, count = entry, 1
         if not isinstance(shipment_id, str) or not shipment_id.strip():
             raise ValueError("shipment IDs must be non-empty strings")
+        if shipment_id in seen_ids:
+            raise ValueError("shipment IDs must be unique")
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError("shipment item counts must be positive integers")
+        seen_ids.add(shipment_id)
         normalized.append((shipment_id, count))
     if not normalized:
         raise ValueError("at least one shipment is required")
@@ -166,6 +170,8 @@ def _styles() -> bytes:
     _element(cell_style_xfs, "xf", numFmtId="0", fontId="0", fillId="0", borderId="0")
     cell_xfs = _element(root, "cellXfs", count="1")
     _element(cell_xfs, "xf", numFmtId="0", fontId="0", fillId="0", borderId="0", xfId="0")
+    cell_styles = _element(root, "cellStyles", count="1")
+    _element(cell_styles, "cellStyle", name="Normal", xfId="0", builtinId="0")
     return _xml(root)
 
 
@@ -220,6 +226,10 @@ def _worksheet(shipment_rows: list[tuple[int, str, int]], total_row: int) -> byt
     _value_cell(total, f"M{total_row}", str(len(shipment_rows)))
     _value_cell(total, f"N{total_row}", f"{len(shipment_rows) * 0.001:g}")
     _value_cell(total, f"P{total_row}", str(len(shipment_rows) * 10))
+
+    merge_cells = _element(root, "mergeCells", count=str(len(STANDARD_V1.value_ranges)))
+    for cell_range in STANDARD_V1.value_ranges.values():
+        _element(merge_cells, "mergeCell", ref=cell_range)
 
     drawing = _element(root, "drawing")
     drawing.set(f"{{{REL_NS}}}id", "rId1")
@@ -320,16 +330,23 @@ def _drawing_relationships(image_rows: list[int]) -> bytes:
 
 def _vml() -> bytes:
     nsmap = {"v": VML_NS, "o": OFFICE_NS, "x": EXCEL_NS}
-    root = etree.Element(f"{{{VML_NS}}}xml", nsmap=nsmap)
+    root = etree.Element("xml", nsmap=nsmap)
     layout = etree.SubElement(root, f"{{{OFFICE_NS}}}shapelayout")
     layout.set(f"{{{VML_NS}}}ext", "edit")
     idmap = etree.SubElement(layout, f"{{{OFFICE_NS}}}idmap", data="1")
     idmap.set(f"{{{VML_NS}}}ext", "edit")
-    shape_type = etree.SubElement(root, f"{{{VML_NS}}}shapetype", id="_x0000_t202")
+    shape_type = etree.SubElement(
+        root,
+        f"{{{VML_NS}}}shapetype",
+        id="_x0000_t202",
+        coordsize="21600,21600",
+        path="m,l,21600r21600,l21600,xe",
+    )
     shape_type.set(f"{{{VML_NS}}}ext", "edit")
+    shape_type.set(f"{{{OFFICE_NS}}}spt", "202")
     etree.SubElement(shape_type, f"{{{VML_NS}}}stroke", joinstyle="miter")
     path = etree.SubElement(shape_type, f"{{{VML_NS}}}path", gradientshapeok="t")
-    path.set("connecttype", "rect")
+    path.set(f"{{{OFFICE_NS}}}connecttype", "rect")
     for index, column in enumerate((11, 13, 15), start=1025):
         shape = etree.SubElement(
             root,
@@ -340,7 +357,7 @@ def _vml() -> bytes:
             fillcolor="#ffffe1",
             strokecolor="#000000",
         )
-        shape.set(f"{{{VML_NS}}}insetmode", "auto")
+        shape.set(f"{{{OFFICE_NS}}}insetmode", "auto")
         client = etree.SubElement(shape, f"{{{EXCEL_NS}}}ClientData", ObjectType="Note")
         etree.SubElement(client, f"{{{EXCEL_NS}}}MoveWithCells")
         etree.SubElement(client, f"{{{EXCEL_NS}}}SizeWithCells")
@@ -362,11 +379,6 @@ def build_standard_v1(
 
     normalized = _normalize_shipments(shipments)
     image_row_list = list(image_rows)
-    if any(
-        isinstance(row, bool) or not isinstance(row, int) or row < STANDARD_V1.product_start_row
-        for row in image_row_list
-    ):
-        raise ValueError("image rows must be positive worksheet rows in the product region")
 
     shipment_rows: list[tuple[int, str, int]] = []
     row_number = STANDARD_V1.product_start_row
@@ -378,6 +390,12 @@ def build_standard_v1(
             item_number += 1
     separator_row = row_number
     total_row = separator_row + 1
+    product_rows = set(range(STANDARD_V1.product_start_row, separator_row))
+    if len(image_row_list) != len(set(image_row_list)) or any(
+        isinstance(row, bool) or not isinstance(row, int) or row not in product_rows
+        for row in image_row_list
+    ):
+        raise ValueError("image rows must be unique rows in the product region")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     parts: dict[str, bytes] = {
@@ -398,4 +416,8 @@ def build_standard_v1(
 
     with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
         for part_name, payload in parts.items():
-            archive.writestr(part_name, payload)
+            info = ZipInfo(part_name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = ZIP_DEFLATED
+            info.create_system = 3
+            info.external_attr = 0o600 << 16
+            archive.writestr(info, payload)

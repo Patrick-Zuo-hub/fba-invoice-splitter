@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import posixpath
 import struct
+import time
+import warnings
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -18,6 +20,9 @@ NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "pkgrel": "http://schemas.openxmlformats.org/package/2006/relationships",
 }
+VML_NS = "urn:schemas-microsoft-com:vml"
+OFFICE_NS = "urn:schemas-microsoft-com:office:office"
+EXCEL_NS = "urn:schemas-microsoft-com:office:excel"
 
 
 def test_standard_v1_contract_is_deeply_immutable() -> None:
@@ -65,6 +70,10 @@ def test_standard_v1_builder_emits_valid_anonymous_fixture(tmp_path: Path) -> No
         assert sheet.get("name") == "装箱单&发票 发货信息"
 
         worksheet = etree.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        merge_refs = worksheet.xpath(
+            "/main:worksheet/main:mergeCells/main:mergeCell/@ref", namespaces=NS
+        )
+        assert merge_refs == list(STANDARD_V1.value_ranges.values())
         header_refs = worksheet.xpath(
             "/main:worksheet/main:sheetData/main:row[@r='11']/main:c/@r", namespaces=NS
         )
@@ -129,11 +138,134 @@ def test_standard_v1_builder_emits_valid_anonymous_fixture(tmp_path: Path) -> No
         assert "../comments1.xml" in worksheet_targets
         assert "../drawings/vmlDrawing1.vml" in worksheet_targets
 
-        assert archive.read("xl/media/image1.png") != archive.read(
-            "xl/media/image2.png"
-        ) or archive.read("xl/media/image1.png")
+        image1 = archive.read("xl/media/image1.png")
+        image2 = archive.read("xl/media/image2.png")
+        assert image1 == image2
+        assert image1.startswith(b"\x89PNG\r\n\x1a\n")
         assert b"ONT8" not in archive.read("xl/worksheets/sheet1.xml")
         assert "客户".encode() not in b"".join(archive.read(name) for name in names)
+
+
+def test_standard_v1_vml_comments_use_excel_namespaces_and_coordinates(tmp_path: Path) -> None:
+    output = tmp_path / "standard-v1.xlsx"
+    build_standard_v1(output, {"SYNTHETIC-1": 1}, [12])
+
+    with ZipFile(output) as archive:
+        vml = etree.fromstring(archive.read("xl/drawings/vmlDrawing1.vml"))
+        assert etree.QName(vml).localname == "xml"
+        assert vml.nsmap["v"] == VML_NS
+        assert vml.nsmap["o"] == OFFICE_NS
+        assert vml.nsmap["x"] == EXCEL_NS
+
+        shape_type = vml.find(f"{{{VML_NS}}}shapetype")
+        assert shape_type is not None
+        assert shape_type.get(f"{{{OFFICE_NS}}}spt") == "202"
+        assert shape_type.get("id") == "_x0000_t202"
+        assert shape_type.get(f"{{{OFFICE_NS}}}connecttype") is None
+        assert shape_type.find(f"{{{VML_NS}}}path").get(f"{{{OFFICE_NS}}}connecttype") == "rect"
+
+        shapes = vml.findall(f"{{{VML_NS}}}shape")
+        assert len(shapes) == 3
+        assert [shape.get(f"{{{OFFICE_NS}}}insetmode") for shape in shapes] == [
+            "auto",
+            "auto",
+            "auto",
+        ]
+        assert all(shape.get("type") == "#_x0000_t202" for shape in shapes)
+        assert [
+            (
+                int(shape.find(f"{{{EXCEL_NS}}}ClientData/{{{EXCEL_NS}}}Row").text),
+                int(shape.find(f"{{{EXCEL_NS}}}ClientData/{{{EXCEL_NS}}}Column").text),
+            )
+            for shape in shapes
+        ] == [(10, 11), (10, 13), (10, 15)]
+
+        comments = etree.fromstring(archive.read("xl/comments1.xml"))
+        comment_refs = comments.xpath(
+            "/main:comments/main:commentList/main:comment/@ref", namespaces=NS
+        )
+        assert comment_refs == ["L11", "N11", "P11"]
+        worksheet = etree.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        assert (
+            worksheet.xpath("string(/main:worksheet/main:legacyDrawing/@r:id)", namespaces=NS)
+            == "rId3"
+        )
+        worksheet_rels = etree.fromstring(archive.read("xl/worksheets/_rels/sheet1.xml.rels"))
+        relation_by_type = {
+            relation.get("Type"): relation.get("Target") for relation in worksheet_rels
+        }
+        assert (
+            relation_by_type[
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
+            ]
+            == "../comments1.xml"
+        )
+        assert (
+            relation_by_type[
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing"
+            ]
+            == "../drawings/vmlDrawing1.vml"
+        )
+
+
+def test_standard_v1_builder_is_byte_deterministic(tmp_path: Path) -> None:
+    first = tmp_path / "first.xlsx"
+    second = tmp_path / "second.xlsx"
+    shipments = {"SYNTHETIC-1": 1, "SYNTHETIC-2": 1}
+    build_standard_v1(first, shipments, [12, 13])
+    time.sleep(2)
+    build_standard_v1(second, shipments, [12, 13])
+
+    assert first.read_bytes() == second.read_bytes()
+
+
+def test_standard_v1_styles_declare_default_normal_style(tmp_path: Path) -> None:
+    output = tmp_path / "standard-v1.xlsx"
+    build_standard_v1(output, {"SYNTHETIC-1": 1}, [])
+
+    with ZipFile(output) as archive:
+        styles = etree.fromstring(archive.read("xl/styles.xml"))
+        cell_styles = styles.xpath("/main:styleSheet/main:cellStyles/main:cellStyle", namespaces=NS)
+        assert [
+            (style.get("name"), style.get("xfId"), style.get("builtinId")) for style in cell_styles
+        ] == [("Normal", "0", "0")]
+
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            return
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            load_workbook(output)
+        assert not any("no default style" in str(item.message).lower() for item in captured)
+
+
+@pytest.mark.parametrize("image_rows", [[14], [15], [99], [12, 12]])
+def test_standard_v1_rejects_image_rows_outside_or_repeated_product_rows(
+    tmp_path: Path, image_rows: list[int]
+) -> None:
+    with pytest.raises(ValueError, match="image row"):
+        build_standard_v1(
+            tmp_path / "invalid.xlsx", {"SYNTHETIC-1": 1, "SYNTHETIC-2": 1}, image_rows
+        )
+
+
+@pytest.mark.parametrize(
+    "shipments",
+    [
+        {},
+        {"": 1},
+        {"SYNTHETIC-1": 0},
+        {"SYNTHETIC-1": -1},
+        {"SYNTHETIC-1": True},
+        {"SYNTHETIC-1": 1.0},
+    ],
+)
+def test_standard_v1_rejects_invalid_shipments(
+    tmp_path: Path, shipments: dict[str, object]
+) -> None:
+    with pytest.raises(ValueError):
+        build_standard_v1(tmp_path / "invalid.xlsx", shipments, [])
 
 
 def test_standard_v1_workbook_view_uses_valid_ooxml_attributes(tmp_path: Path) -> None:
