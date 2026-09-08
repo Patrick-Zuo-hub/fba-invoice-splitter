@@ -40,6 +40,7 @@ def _ascii_lower(value: str) -> str:
 _CORE_PARTS = frozenset({"[Content_Types].xml", "_rels/.rels", "xl/workbook.xml"})
 _CANONICAL_CORE_PARTS = frozenset(_ascii_lower(part) for part in _CORE_PARTS)
 _ARCHIVE_ERRORS = (BadZipFile, EOFError, OSError, RuntimeError, zlib.error)
+_RELATIONSHIPS_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 
 @dataclass(slots=True)
@@ -259,7 +260,10 @@ class SafePackage:
                 continue
             root = self.read_xml(part, MAX_ENTRY)
             for element in root.iter():
-                if etree.QName(element).localname != "Relationship":
+                if element.tag not in {
+                    "Relationship",
+                    f"{{{_RELATIONSHIPS_NAMESPACE}}}Relationship",
+                }:
                     continue
                 relation_type = (element.get("Type") or "").lower()
                 target = element.get("Target") or ""
@@ -289,10 +293,11 @@ class SafePackage:
             raise WorkbookError(
                 "UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", target
             ) from exc
+        package_root_relative = decoded.startswith("/") and not decoded.startswith("//")
         if (
             uri.scheme
             or uri.netloc
-            or decoded.startswith(("/", "//"))
+            or decoded.startswith("//")
             or "\\" in decoded
             or _WINDOWS_DRIVE.match(decoded) is not None
             or uri.query
@@ -303,7 +308,9 @@ class SafePackage:
         relationship_segments = cls._canonical_part_name(relationship_part).split("/")
         if len(relationship_segments) < 2 or relationship_segments[-2] != "_rels":
             raise WorkbookError("UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", target)
-        resolved = relationship_segments[:-2]
+        resolved = [] if package_root_relative else relationship_segments[:-2]
+        if package_root_relative:
+            decoded = decoded[1:]
         for segment in decoded.split("/"):
             if not segment or segment == ".":
                 raise WorkbookError("UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", target)

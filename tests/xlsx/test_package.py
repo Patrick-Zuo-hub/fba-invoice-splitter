@@ -308,7 +308,7 @@ def test_opc_part_names_are_case_insensitive_for_core_and_duplicates(tmp_path: P
         "https://example.test/image.png",
         "../../outside.xml",
         "%2e%2e/%2e%2e/outside.xml",
-        "/outside.xml",
+        "/%2e%2e/outside.xml",
         "C:/outside.xml",
         "http://[",
     ],
@@ -326,6 +326,31 @@ def test_rejects_unsafe_internal_relationship_targets(tmp_path: Path, target: st
         )
         == "UNSAFE_RELATIONSHIP"
     )
+
+
+def test_relationship_files_allow_harmless_comments_and_processing_instructions(
+    tmp_path: Path,
+) -> None:
+    parts = dict(CORE_PARTS)
+    parts["_rels/.rels"] = (
+        b"<Relationships><!-- harmless --><?audit generated?><Relationship "
+        b"Id='rId1' Type='officeDocument' Target='xl/workbook.xml'/></Relationships>"
+    )
+
+    with SafePackage.open(write_package(tmp_path / "commented-rels.xlsx", parts)):
+        pass
+
+
+def test_allows_package_root_relative_internal_relationship_target(tmp_path: Path) -> None:
+    parts = dict(CORE_PARTS)
+    parts["xl/worksheets/sheet1.xml"] = b"<worksheet/>"
+    parts["_rels/.rels"] = (
+        b"<Relationships><Relationship Id='rId1' Type='worksheet' "
+        b"Target='/xl/worksheets/sheet1.xml'/></Relationships>"
+    )
+
+    with SafePackage.open(write_package(tmp_path / "root-relative.xlsx", parts)):
+        pass
 
 
 def test_corrupt_deflate_is_a_stable_closed_open_failure(
