@@ -194,7 +194,12 @@ def _worksheet(shipment_rows: list[tuple[int, str, int]], total_row: int) -> byt
 
     header_row = _element(sheet_data, "row", r="11")
     for column in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-        _inline_cell(header_row, f"{column}11", f"Header {column}")
+        headers = {
+            "A": "货件编号SHIPMENT ID\n(亚马逊货物必填）\n不可合并",
+            "B": "跟踪编号\nREFERENCE ID\n(亚马逊货物必填）\n不可合并",
+            "C": "图片\nPRODUCT PICTURE\n(必填)",
+        }
+        _inline_cell(header_row, f"{column}11", headers.get(column, f"Header {column}"))
 
     for row_number, shipment_id, item_number in shipment_rows:
         row = _element(sheet_data, "row", r=str(row_number))

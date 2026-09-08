@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+
+import pytest
+
+from fis.xlsx.errors import WorkbookError
+from fis.xlsx.parser import parse_invoice_bundle
+from tests.fixtures.standard_v1_builder import build_standard_v1
+
+
+def _rewrite_part(path: Path, part_name: str, rewrite: Callable[[bytes], bytes]) -> None:
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts[part_name] = rewrite(parts[part_name])
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+
+def _template_error(path: Path) -> WorkbookError:
+    with pytest.raises(WorkbookError) as captured:
+        parse_invoice_bundle(path)
+    assert captured.value.code == "TEMPLATE_VERSION_MISMATCH"
+    return captured.value
+
+
+def test_parses_product_rows_in_first_seen_shipment_order(tmp_path: Path) -> None:
+    path = tmp_path / "standard.xlsx"
+    build_standard_v1(path, [("S1", 2), ("S2", 1)], [])
+
+    bundle = parse_invoice_bundle(path)
+
+    assert [shipment.shipment_id for shipment in bundle.shipments] == ["S1", "S2"]
+    assert [[item.source_row for item in shipment.items] for shipment in bundle.shipments] == [
+        [12, 13],
+        [14],
+    ]
+    assert bundle.product_rows == (12, 13, 14)
+    assert bundle.separator_row == 15
+    assert bundle.total_row == 16
+    assert bundle.shipments[0].items[0].cells["A"] == "S1"
+    assert bundle.shipments[0].items[0].cells["B"] == "Synthetic Product 1"
+    with pytest.raises(TypeError):
+        bundle.shipments[0].items[0].cells["A"] = "changed"
+
+
+def test_rejects_product_row_with_only_one_required_identifier(tmp_path: Path) -> None:
+    path = tmp_path / "standard.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(
+            b'<c r="B12" t="inlineStr"><is><t>Synthetic Product 1</t></is></c>', b""
+        ),
+    )
+
+    assert _template_error(path).location == "B12"
+
+
+def test_resolves_configured_sheet_through_workbook_relationship(tmp_path: Path) -> None:
+    path = tmp_path / "renamed-part.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["xl/worksheets/custom.xml"] = parts.pop("xl/worksheets/sheet1.xml")
+    parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
+        b"worksheets/sheet1.xml", b"worksheets/../worksheets/custom.xml"
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    assert parse_invoice_bundle(path).product_rows == (12,)
+
+
+def test_rejects_missing_or_duplicate_configured_sheet_and_relationship(tmp_path: Path) -> None:
+    path = tmp_path / "bad-workbook.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/workbook.xml",
+        lambda xml: xml.replace("装箱单&amp;发票 发货信息".encode(), "其他工作表".encode()),
+    )
+    assert _template_error(path).location == "xl/workbook.xml"
+
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/workbook.xml",
+        lambda xml: xml.replace(
+            b"</sheets>",
+            "<sheet name=\"装箱单&amp;发票 发货信息\" sheetId=\"2\" r:id=\"rId1\"/></sheets>".encode(),
+        ),
+    )
+    assert _template_error(path).location == "xl/workbook.xml"
+
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/_rels/workbook.xml.rels",
+        lambda xml: xml.replace(
+            b"</Relationships>",
+            b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>',
+        ),
+    )
+    assert _template_error(path).location == "xl/_rels/workbook.xml.rels"
+
+
+def test_reads_shared_rich_inline_and_formula_cells_without_using_cache(tmp_path: Path) -> None:
+    path = tmp_path / "cell-types.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(
+            b'<c r="D12" t="inlineStr"><is><t>1</t></is></c>',
+            b'<c r="D12" t="s"><v>0</v></c>',
+        ).replace(
+            b'<c r="E12" t="inlineStr"><is><t>Synthetic Unit</t></is></c>',
+            b'<c r="E12" t="inlineStr"><is><r><t>Rich </t></r><r><t>text</t></r></is></c>',
+        ).replace(
+            b'<c r="F12" t="inlineStr"><is><t>1</t></is></c>',
+            b'<c r="F12"><f>SUM(2,3)</f><v>5</v></c>',
+        ),
+    )
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["xl/sharedStrings.xml"] = (
+        b'<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b"<si><r><t>shared </t></r><r><t>rich</t></r></si></sst>"
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    cells = parse_invoice_bundle(path).shipments[0].items[0].cells
+
+    assert cells["D"] == "shared rich"
+    assert cells["E"] == "Rich text"
+    assert cells["F"] == "=SUM(2,3)"
+
+
+def test_copies_only_a_to_z_when_product_row_has_later_columns(tmp_path: Path) -> None:
+    path = tmp_path / "later-columns.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(
+            b"</row><row r=\"13\"", b'<c r="AA12" t="inlineStr"><is><t>ignored</t></is></c></row><row r="13"'
+        ),
+    )
+
+    assert "AA" not in parse_invoice_bundle(path).shipments[0].items[0].cells
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "location"),
+    [
+        ("货件编号SHIPMENT ID".encode(), "图片PRODUCT PICTURE".encode(), "A11"),
+        ("跟踪编号".encode(), "普通标题".encode(), "B11"),
+        (b"PRODUCT PICTURE", b"REFERENCE ID", "C11"),
+    ],
+)
+def test_rejects_headers_that_are_moved_or_do_not_match(
+    tmp_path: Path, old: bytes, new: bytes, location: str
+) -> None:
+    path = tmp_path / "bad-header.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(path, "xl/worksheets/sheet1.xml", lambda xml: xml.replace(old, new))
+
+    assert _template_error(path).location == location
+
+
+def test_requires_empty_separator_and_immediate_normalized_total(tmp_path: Path) -> None:
+    path = tmp_path / "separator.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(
+            b'<row r="13"/>', b'<row r="13"><c r="C13" t="inlineStr"><is><t>x</t></is></c></row>'
+        ),
+    )
+    assert _template_error(path).location == "C13"
+
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace("合计TOTAL".encode(), b"total")
+    )
+    assert _template_error(path).location == "A14"
+
+
+def test_rejects_empty_product_region_and_internal_gap(tmp_path: Path) -> None:
+    path = tmp_path / "empty.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(
+            b'<row r="12"><c r="A12" t="inlineStr"><is><t>S1</t></is></c>',
+            b'<row r="12"><c r="A12" t="inlineStr"><is><t></t></is></c>',
+        ),
+    )
+    assert _template_error(path).location == "A12"
+
+    build_standard_v1(path, {"S1": 2}, [])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(
+            b'<c r="A13" t="inlineStr"><is><t>S1</t></is></c>',
+            b'<c r="A13" t="inlineStr"><is><t></t></is></c>',
+        ).replace(
+            b'<c r="B13" t="inlineStr"><is><t>Synthetic Product 2</t></is></c>',
+            b'<c r="B13" t="inlineStr"><is><t></t></is></c>',
+        ),
+    )
+    assert _template_error(path).location == "C13"
