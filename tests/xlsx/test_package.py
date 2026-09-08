@@ -216,6 +216,147 @@ def test_read_xml_rejects_unsafe_or_malformed_xml(
         assert error_code(lambda: package.read_xml("xl/workbook.xml", 1024)) == expected
 
 
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16"])
+def test_read_xml_rejects_dtd_and_entity_in_all_supported_encodings(
+    tmp_path: Path, encoding: str
+) -> None:
+    payload = (
+        f"<?xml version='1.0' encoding='{encoding.upper()}'?>"
+        "<!DOCTYPE workbook [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]>"
+        "<workbook>&xxe;</workbook>"
+    ).encode(encoding)
+    parts = dict(CORE_PARTS)
+    parts["xl/workbook.xml"] = payload
+
+    with SafePackage.open(write_package(tmp_path / f"dtd-{encoding}.xlsx", parts)) as package:
+        assert error_code(lambda: package.read_xml("xl/workbook.xml", 4096)) == "UNSAFE_XML"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "xl/%2e%2e/outside.xml",
+        "xl/%252e%252e/outside.xml",
+        "xl/%2foutside.xml",
+        "xl/%5coutside.xml",
+        "xl/%ZZ.xml",
+        "xl/%00name.xml",
+    ],
+)
+def test_rejects_percent_encoded_unsafe_part_names(tmp_path: Path, name: str) -> None:
+    parts = dict(CORE_PARTS)
+    parts[name] = b"unsafe"
+
+    assert (
+        error_code(lambda: SafePackage.open(write_package(tmp_path / "encoded-path.xlsx", parts)))
+        == "UNSAFE_PATH"
+    )
+
+
+def test_allows_safe_percent_encoded_opc_part_name(tmp_path: Path) -> None:
+    parts = dict(CORE_PARTS)
+    parts["xl/custom%20part.xml"] = b"safe"
+
+    with SafePackage.open(write_package(tmp_path / "encoded-space.xlsx", parts)) as package:
+        assert package.read("xl/custom%20part.xml") == b"safe"
+
+
+def test_percent_encoded_and_case_aliases_cannot_bypass_part_checks(tmp_path: Path) -> None:
+    encoded_macro = dict(CORE_PARTS)
+    encoded_macro["xl/%76baProject.bin"] = b"macro"
+    assert (
+        error_code(
+            lambda: SafePackage.open(write_package(tmp_path / "encoded-macro.xlsx", encoded_macro))
+        )
+        == "MACRO_UNSUPPORTED"
+    )
+
+    aliases = dict(CORE_PARTS)
+    aliases["xl/%77orkbook.xml"] = b"duplicate"
+    assert (
+        error_code(
+            lambda: SafePackage.open(write_package(tmp_path / "encoded-alias.xlsx", aliases))
+        )
+        == "DUPLICATE_ENTRY"
+    )
+
+
+def test_opc_part_names_are_case_insensitive_for_core_and_duplicates(tmp_path: Path) -> None:
+    uppercase_core = {
+        "[Content_Types].xml": CORE_PARTS["[Content_Types].xml"],
+        "_rels/.rels": CORE_PARTS["_rels/.rels"],
+        "xl/WORKBOOK.xml": CORE_PARTS["xl/workbook.xml"],
+    }
+    with SafePackage.open(
+        write_package(tmp_path / "uppercase-core.xlsx", uppercase_core)
+    ) as package:
+        assert package.read("xl/workbook.xml") == CORE_PARTS["xl/workbook.xml"]
+
+    duplicate_case = dict(CORE_PARTS)
+    duplicate_case["xl/WORKBOOK.xml"] = b"duplicate"
+    assert (
+        error_code(
+            lambda: SafePackage.open(write_package(tmp_path / "case-alias.xlsx", duplicate_case))
+        )
+        == "DUPLICATE_ENTRY"
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://example.test/image.png",
+        "../../outside.xml",
+        "%2e%2e/%2e%2e/outside.xml",
+        "/outside.xml",
+        "C:/outside.xml",
+        "http://[",
+    ],
+)
+def test_rejects_unsafe_internal_relationship_targets(tmp_path: Path, target: str) -> None:
+    parts = dict(CORE_PARTS)
+    parts["xl/_rels/workbook.xml.rels"] = (
+        "<Relationships><Relationship Id='rId1' Type='worksheet' "
+        f"Target='{target}'/></Relationships>"
+    ).encode()
+
+    assert (
+        error_code(
+            lambda: SafePackage.open(write_package(tmp_path / "unsafe-relation.xlsx", parts))
+        )
+        == "UNSAFE_RELATIONSHIP"
+    )
+
+
+def test_corrupt_deflate_is_a_stable_closed_open_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fis.xlsx.package as package_module
+
+    path = write_package(tmp_path / "corrupt.xlsx")
+    with ZipFile(path) as archive:
+        info = archive.getinfo("[Content_Types].xml")
+        header_offset = info.header_offset
+    payload = bytearray(path.read_bytes())
+    name_length = int.from_bytes(payload[header_offset + 26 : header_offset + 28], "little")
+    extra_length = int.from_bytes(payload[header_offset + 28 : header_offset + 30], "little")
+    compressed_start = header_offset + 30 + name_length + extra_length
+    payload[compressed_start : compressed_start + info.compress_size] = b"\x00" * info.compress_size
+    path.write_bytes(payload)
+
+    created: list[ZipFile] = []
+    original = cast(Callable[..., ZipFile], package_module.ZipFile)  # type: ignore[attr-defined]
+
+    def tracked_zipfile(*args: object, **kwargs: object) -> ZipFile:
+        archive = original(*args, **kwargs)
+        created.append(archive)
+        return archive
+
+    monkeypatch.setattr(package_module, "ZipFile", tracked_zipfile)
+    assert error_code(lambda: SafePackage.open(path)) == "INVALID_XLSX"
+    assert created[0].fp is None
+
+
 def test_read_is_bounded_by_actual_bytes_and_missing_parts_fail(tmp_path: Path) -> None:
     parts = dict(CORE_PARTS)
     parts["xl/workbook.xml"] = b"012345"
