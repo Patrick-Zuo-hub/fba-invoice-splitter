@@ -254,32 +254,261 @@ _PIC_XDR_CHILDREN = {
     "ext": set(),
 }
 
+_PIC_A_CHILDREN = {
+    "cNvPicPr": {"picLocks"},
+    "blipFill": {"blip", "srcRect", "stretch", "tile"},
+    "stretch": {"fillRect"},
+    "spPr": {
+        "xfrm",
+        "custGeom",
+        "prstGeom",
+        "ln",
+        "noFill",
+        "solidFill",
+        "gradFill",
+        "pattFill",
+        "blipFill",
+        "grpFill",
+        "effectLst",
+        "effectDag",
+        "scene3d",
+        "sp3d",
+    },
+    "xfrm": {"off", "ext", "chOff", "chExt"},
+    "prstGeom": {"avLst"},
+    "custGeom": {"avLst", "gdLst", "ahLst", "cxnLst", "rect"},
+    "avLst": {"gd"},
+    "gdLst": {"gd"},
+    "ahLst": {"ah"},
+    "cxnLst": {"cxn"},
+    "ln": {
+        "noFill",
+        "solidFill",
+        "gradFill",
+        "pattFill",
+        "prstDash",
+        "round",
+        "bevel",
+        "miter",
+        "headEnd",
+        "tailEnd",
+        "custDash",
+    },
+    "style": {"lnRef", "fillRef", "effectRef", "fontRef"},
+    "lnRef": {"srgbClr", "schemeClr", "sysClr", "scrgbClr", "hslClr", "prstClr"},
+    "fillRef": {"srgbClr", "schemeClr", "sysClr", "scrgbClr", "hslClr", "prstClr"},
+    "effectRef": {"srgbClr", "schemeClr", "sysClr", "scrgbClr", "hslClr", "prstClr"},
+    "fontRef": {"srgbClr", "schemeClr", "sysClr", "scrgbClr", "hslClr", "prstClr"},
+    "solidFill": {"srgbClr", "schemeClr", "sysClr", "scrgbClr", "hslClr", "prstClr"},
+    "gradFill": {"gsLst", "lin", "path"},
+    "gsLst": {"gs"},
+    "gs": {"srgbClr", "schemeClr", "sysClr", "scrgbClr", "hslClr", "prstClr"},
+    "pattFill": {"fgClr", "bgClr"},
+    "fgClr": {"srgbClr", "schemeClr", "sysClr", "scrgbClr", "hslClr", "prstClr"},
+    "bgClr": {"srgbClr", "schemeClr", "sysClr", "scrgbClr", "hslClr", "prstClr"},
+    "fillOverlay": {"noFill", "solidFill", "gradFill", "pattFill", "blipFill", "grpFill"},
+    "effectLst": {"blur", "fillOverlay", "glow", "innerShdw", "outerShdw", "reflection", "softEdge"},
+    "effectDag": {"cont"},
+    "scene3d": {"camera", "lightRig", "backdrop"},
+    "camera": {"rot"},
+    "lightRig": {"rot"},
+    "sp3d": {"bevelT", "bevelB", "extrusionClr", "contourClr", "camera", "lightRig"},
+    "blip": {
+        "alphaBiLevel",
+        "alphaCeiling",
+        "alphaFloor",
+        "alphaInv",
+        "alphaMod",
+        "alphaModFix",
+        "alphaRepl",
+        "biLevel",
+        "blur",
+        "clrChange",
+        "clrRepl",
+        "duotone",
+        "grayscl",
+        "hsl",
+        "lum",
+        "tint",
+        "gamma",
+        "invGamma",
+        "satMod",
+        "shade",
+        "comp",
+        "complement",
+    },
+    "srgbClr": {
+        "alpha",
+        "alphaModFix",
+        "alphaOff",
+        "blue",
+        "blueMod",
+        "blueOff",
+        "green",
+        "greenMod",
+        "greenOff",
+        "red",
+        "redMod",
+        "redOff",
+        "shade",
+        "tint",
+    },
+    "schemeClr": {
+        "alpha",
+        "alphaModFix",
+        "alphaOff",
+        "blue",
+        "blueMod",
+        "blueOff",
+        "green",
+        "greenMod",
+        "greenOff",
+        "red",
+        "redMod",
+        "redOff",
+        "shade",
+        "tint",
+    },
+    "sysClr": {
+        "alpha",
+        "alphaModFix",
+        "alphaOff",
+        "blue",
+        "blueMod",
+        "blueOff",
+        "green",
+        "greenMod",
+        "greenOff",
+        "red",
+        "redMod",
+        "redOff",
+        "shade",
+        "tint",
+    },
+    "scrgbClr": set(),
+    "hslClr": set(),
+    "prstClr": set(),
+}
+_PIC_A_LEAF_ELEMENTS = {
+    "cNvPicPr",
+    "blip",
+    "picLocks",
+    "fillRect",
+    "tile",
+    "srcRect",
+    "off",
+    "ext",
+    "chOff",
+    "chExt",
+    "avLst",
+    "gd",
+    "ah",
+    "cxn",
+    "rect",
+    "noFill",
+    "prstDash",
+    "round",
+    "bevel",
+    "miter",
+    "headEnd",
+    "tailEnd",
+    "custDash",
+    "gs",
+    "rot",
+    "lin",
+    "path",
+    "blur",
+    "fillOverlay",
+    "glow",
+    "innerShdw",
+    "outerShdw",
+    "reflection",
+    "softEdge",
+    "cont",
+    "camera",
+    "lightRig",
+    "backdrop",
+    "bevelT",
+    "bevelB",
+    "extrusionClr",
+    "contourClr",
+    "alphaBiLevel",
+    "alphaCeiling",
+    "alphaFloor",
+    "alphaInv",
+    "alphaMod",
+    "alphaModFix",
+    "alphaRepl",
+    "biLevel",
+    "clrChange",
+    "clrRepl",
+    "duotone",
+    "grayscl",
+    "hsl",
+    "lum",
+    "tint",
+    "gamma",
+    "invGamma",
+    "satMod",
+    "shade",
+    "comp",
+    "complement",
+    "alpha",
+    "alphaOff",
+    "blue",
+    "blueMod",
+    "blueOff",
+    "green",
+    "greenMod",
+    "greenOff",
+    "red",
+    "redMod",
+    "redOff",
+}
+
 
 def _validate_picture_subtree(picture: etree._Element, location: str) -> None:
-    """Reject spreadsheetDrawing objects hidden inside an otherwise valid picture."""
+    """Validate each picture descendant by QName and its actual parent path."""
 
-    for element in picture.iter():
+    def visit(element: etree._Element, parent_namespace: str | None, parent_local: str | None) -> None:
         if not isinstance(element.tag, str) or not element.tag.startswith("{"):
-            continue
-        namespace, _, local_name = element.tag[1:].partition("}")
-        if namespace != XDR_NS:
-            continue
-        allowed_children = _PIC_XDR_CHILDREN.get(local_name)
-        if allowed_children is None:
             raise _drawing_error("UNSUPPORTED_DRAWING", location)
+        namespace, _, local_name = element.tag[1:].partition("}")
+        if namespace == XDR_NS:
+            if local_name not in _PIC_XDR_CHILDREN:
+                raise _drawing_error("UNSUPPORTED_DRAWING", location)
+            if parent_namespace is not None and parent_namespace != XDR_NS:
+                raise _drawing_error("UNSUPPORTED_DRAWING", location)
+            allowed_children = _PIC_XDR_CHILDREN[local_name]
+        elif namespace == DRAWING_NS:
+            if parent_namespace not in {XDR_NS, DRAWING_NS}:
+                raise _drawing_error("UNSUPPORTED_DRAWING", location)
+            allowed_children = _PIC_A_CHILDREN.get(parent_local or "", set())
+            if local_name not in _PIC_A_CHILDREN and local_name not in _PIC_A_LEAF_ELEMENTS:
+                raise _drawing_error("UNSUPPORTED_DRAWING", location)
+        else:
+            raise _drawing_error("UNSUPPORTED_DRAWING", location)
+
         for child in element:
             if not isinstance(child.tag, str) or not child.tag.startswith("{"):
-                continue
-            child_namespace, _, child_local_name = child.tag[1:].partition("}")
-            if child_namespace == XDR_NS and child_local_name not in allowed_children:
                 raise _drawing_error("UNSUPPORTED_DRAWING", location)
-        if local_name == "nvPicPr":
+            child_namespace, _, child_local = child.tag[1:].partition("}")
+            if child_namespace == XDR_NS:
+                if namespace != XDR_NS or child_local not in allowed_children:
+                    raise _drawing_error("UNSUPPORTED_DRAWING", location)
+            elif child_namespace == DRAWING_NS:
+                drawing_children = _PIC_A_CHILDREN.get(local_name, set())
+                if namespace not in {XDR_NS, DRAWING_NS} or child_local not in drawing_children:
+                    raise _drawing_error("UNSUPPORTED_DRAWING", location)
+            else:
+                raise _drawing_error("UNSUPPORTED_DRAWING", location)
+            visit(child, namespace, local_name)
+
+        if namespace == XDR_NS and local_name == "nvPicPr":
             xdr_children = [
                 child.tag[1:].partition("}")[2]
                 for child in element
-                if isinstance(child.tag, str)
-                and child.tag.startswith("{")
-                and child.tag[1:].partition("}")[0] == XDR_NS
+                if child.tag.startswith("{") and child.tag[1:].partition("}")[0] == XDR_NS
             ]
             if (
                 xdr_children[:2] != ["cNvPr", "cNvPicPr"]
@@ -287,6 +516,8 @@ def _validate_picture_subtree(picture: etree._Element, location: str) -> None:
                 or xdr_children.count("cNvPicPr") != 1
             ):
                 raise _drawing_error("INVALID_DRAWING", location)
+
+    visit(picture, None, None)
 
 
 def _parse_anchor(anchor_element: etree._Element, drawing_part: str, number: int) -> tuple[Anchor, str, str]:

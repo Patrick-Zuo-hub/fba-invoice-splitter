@@ -255,6 +255,28 @@ def test_rejects_unknown_xdr_descendants_inside_shape_properties(
     assert _drawing_error(path, "UNSUPPORTED_DRAWING")
 
 
+@pytest.mark.parametrize(
+    "nested_xml",
+    [
+        b'<a:extLst><a:ext><nvPicPr><cNvPr id="2" name="nested"/><cNvPicPr/></nvPicPr></a:ext></a:extLst>',
+        b"<a:extLst><a:ext/></a:extLst>",
+        b'<foo:unknown xmlns:foo="urn:foreign"/>',
+    ],
+)
+def test_rejects_xdr_or_foreign_wrappers_inside_picture_subtree(
+    tmp_path: Path, nested_xml: bytes
+) -> None:
+    path = tmp_path / "wrapped-picture-object.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    _rewrite_part(
+        path,
+        "xl/drawings/drawing1.xml",
+        lambda xml: xml.replace(b"</spPr>", nested_xml + b"</spPr>", 1),
+    )
+
+    assert _drawing_error(path, "UNSUPPORTED_DRAWING")
+
+
 def test_accepts_prefixed_worksheet_namespace_for_drawing_lookup(tmp_path: Path) -> None:
     path = tmp_path / "prefixed-worksheet.xlsx"
     build_standard_v1(path, {"S1": 1}, [12])
