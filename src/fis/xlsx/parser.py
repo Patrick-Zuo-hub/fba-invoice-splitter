@@ -24,6 +24,7 @@ _COLUMNS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _A_TO_Z = frozenset(_COLUMNS)
 _CELL_REFERENCE = re.compile(r"^([A-Z]{1,3})([1-9][0-9]{0,6})$", re.ASCII)
 _ROW_NUMBER = re.compile(r"^[1-9][0-9]{0,6}$", re.ASCII)
+_SHEET_ID = re.compile(r"^[1-9][0-9]{0,9}$", re.ASCII)
 _REQUIRED_HEADERS = (
     "货件编号SHIPMENT ID\n(亚马逊货物必填）\n不可合并",
     "跟踪编号\nREFERENCE ID\n(亚马逊货物必填）\n不可合并",
@@ -170,9 +171,34 @@ def _workbook_relationships(package: SafePackage) -> etree._Element:
     return package.read_xml("xl/_rels/workbook.xml.rels", MAX_ENTRY)
 
 
+def _validate_workbook_sheets(sheets: list[etree._Element]) -> None:
+    names: set[str] = set()
+    sheet_ids: set[str] = set()
+    relationship_ids: set[str] = set()
+    for sheet in sheets:
+        name = sheet.get("name")
+        sheet_id = sheet.get("sheetId")
+        relationship_id = sheet.get(f"{{{OFFICE_REL_NS}}}id")
+        if (
+            not name
+            or name.casefold() in names
+            or not sheet_id
+            or _SHEET_ID.fullmatch(sheet_id) is None
+            or int(sheet_id) > 4_294_967_295
+            or sheet_id in sheet_ids
+            or not relationship_id
+            or relationship_id in relationship_ids
+        ):
+            raise _template_error("xl/workbook.xml")
+        names.add(name.casefold())
+        sheet_ids.add(sheet_id)
+        relationship_ids.add(relationship_id)
+
+
 def _worksheet_part(package: SafePackage, relationships: etree._Element) -> str:
     workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
     sheets = workbook.xpath("./main:sheets/main:sheet", namespaces={"main": MAIN_NS})
+    _validate_workbook_sheets(sheets)
     matched = [sheet for sheet in sheets if sheet.get("name") == STANDARD_V1.sheet_name]
     if len(matched) != 1:
         raise _template_error("xl/workbook.xml")

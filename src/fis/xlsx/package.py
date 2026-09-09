@@ -26,6 +26,7 @@ MAX_PERCENT_DECODE_ROUNDS = 3
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _ENCODED_SEPARATOR = re.compile(r"%(?:2[fF]|5[cC])")
+_ENCODED_DOT_SEGMENT = re.compile(r"(?:^|/)%2[eE](?:%2[eE])?(?:/|$)")
 _XML_PARSER = etree.XMLParser(
     resolve_entities=False,
     no_network=True,
@@ -329,12 +330,19 @@ class SafePackage:
             if not self._canonical_part_name(part).endswith(".rels"):
                 continue
             root = self.read_xml(part, MAX_ENTRY)
+            relationship_ids: set[str] = set()
             for element in root.iter():
                 if element.tag not in {
                     "Relationship",
                     f"{{{_RELATIONSHIPS_NAMESPACE}}}Relationship",
                 }:
                     continue
+                relationship_id = element.get("Id")
+                if not relationship_id or relationship_id in relationship_ids:
+                    raise WorkbookError(
+                        "INVALID_RELATIONSHIP", "XLSX 关系缺少或重复 Id", f"{part}:{relationship_id or 'Id'}"
+                    )
+                relationship_ids.add(relationship_id)
                 relation_type = (element.get("Type") or "").lower()
                 target = element.get("Target") or ""
                 location = target or part
@@ -342,22 +350,27 @@ class SafePackage:
                     raise WorkbookError(
                         "EXTERNAL_RESOURCE", "V1 不支持外部链接或外部资源", location
                     )
-                self._validate_internal_relationship_target(part, target)
+                resolved_target = self._validate_internal_relationship_target(part, target)
                 if "vbaproject" in relation_type or "macro" in relation_type:
                     raise WorkbookError("MACRO_UNSUPPORTED", "V1 不支持包含宏的工作簿", location)
                 if "oleobject" in relation_type or "embedding" in relation_type:
                     raise WorkbookError("OLE_UNSUPPORTED", "V1 不支持 OLE 嵌入对象", location)
                 if "activex" in relation_type:
                     raise WorkbookError("ACTIVEX_UNSUPPORTED", "V1 不支持 ActiveX 控件", location)
+                if resolved_target not in self._canonical_entries:
+                    raise WorkbookError(
+                        "MISSING_RELATIONSHIP_TARGET", "XLSX 关系目标不存在或不是文件部件", location
+                    )
 
     @classmethod
-    def _validate_internal_relationship_target(cls, relationship_part: str, target: str) -> None:
+    def _validate_internal_relationship_target(cls, relationship_part: str, target: str) -> str:
         """Ensure an internal OPC relationship cannot resolve outside the package."""
 
         if cls._canonical_part_name(relationship_part) == "_rels/.rels":
-            cls._resolve_relationship_target(None, target)
-            return
-        cls._resolve_relationship_target(cls._source_part_for_relationship_part(relationship_part), target)
+            return cls._resolve_relationship_target(None, target)
+        return cls._resolve_relationship_target(
+            cls._source_part_for_relationship_part(relationship_part), target
+        )
 
     @classmethod
     def _source_part_for_relationship_part(cls, relationship_part: str) -> str:
@@ -385,6 +398,8 @@ class SafePackage:
 
         if not target:
             raise WorkbookError("UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", target)
+        if _ENCODED_DOT_SEGMENT.search(target):
+            raise WorkbookError("UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", target)
         decoded = cls._decode_percent_uri(target, target, "UNSAFE_RELATIONSHIP")
         try:
             uri = urlsplit(decoded)
@@ -410,8 +425,10 @@ class SafePackage:
         if package_root_relative:
             decoded = decoded[1:]
         for segment in decoded.split("/"):
-            if not segment or segment == ".":
+            if not segment:
                 raise WorkbookError("UNSAFE_RELATIONSHIP", "XLSX 包含不安全的内部关系目标", target)
+            if segment == ".":
+                continue
             if segment == "..":
                 if not resolved:
                     raise WorkbookError(

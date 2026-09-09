@@ -73,6 +73,38 @@ def test_rejects_percent_encoded_unsafe_relationship_target(tmp_path: Path) -> N
         )
 
 
+def test_rejects_duplicate_relationship_ids_within_one_relationship_part(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-relationship-id.xlsx"
+    build_standard_v1(path, {"SYNTHETIC-1": 1}, [])
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
+        b"</Relationships>",
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>',
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    assert error_code(lambda: SafePackage.open(path)) == "INVALID_RELATIONSHIP"
+
+
+@pytest.mark.parametrize("target", ["missing.xml", "worksheets"])
+def test_rejects_dangling_or_directory_relationship_targets(tmp_path: Path, target: str) -> None:
+    path = tmp_path / "dangling-target.xlsx"
+    build_standard_v1(path, {"SYNTHETIC-1": 1}, [])
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
+        b'Target="styles.xml"', f'Target="{target}"'.encode()
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    assert error_code(lambda: SafePackage.open(path)) == "MISSING_RELATIONSHIP_TARGET"
+
+
 def test_requires_an_existing_xlsx_file(tmp_path: Path) -> None:
     assert error_code(lambda: SafePackage.open(tmp_path / "missing.xlsx")) == "INVALID_PATH"
     assert error_code(lambda: SafePackage.open(tmp_path)) == "INVALID_PATH"

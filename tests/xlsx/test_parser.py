@@ -100,6 +100,40 @@ def test_resolves_configured_sheet_through_workbook_relationship(tmp_path: Path)
     assert parse_invoice_bundle(path).product_rows == (12,)
 
 
+def test_resolves_literal_dot_segment_in_worksheet_relationship_target(tmp_path: Path) -> None:
+    path = tmp_path / "dot-target.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/_rels/workbook.xml.rels",
+        lambda xml: xml.replace(b"worksheets/sheet1.xml", b"./worksheets/sheet1.xml"),
+    )
+
+    assert parse_invoice_bundle(path).product_rows == (12,)
+
+
+@pytest.mark.parametrize(
+    "extra_sheet",
+    [
+        b'<sheet name="Alpha" sheetId="2" r:id="rId2"/><sheet name="alpha" sheetId="3" r:id="rId3"/>',
+        b'<sheet name="Other" r:id="rId2"/>',
+        b'<sheet name="Other" sheetId="2" r:id="rId1"/>',
+    ],
+)
+def test_rejects_invalid_metadata_on_unselected_workbook_sheets(
+    tmp_path: Path, extra_sheet: bytes
+) -> None:
+    path = tmp_path / "invalid-sheet-metadata.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/workbook.xml",
+        lambda xml: xml.replace(b"</sheets>", extra_sheet + b"</sheets>"),
+    )
+
+    assert _template_error(path).location == "xl/workbook.xml"
+
+
 def test_parses_configured_worksheet_stored_at_package_root(tmp_path: Path) -> None:
     path = tmp_path / "root-worksheet.xlsx"
     build_standard_v1(path, {"S1": 1}, [])
@@ -108,8 +142,8 @@ def test_parses_configured_worksheet_stored_at_package_root(tmp_path: Path) -> N
     parts["invoice.xml"] = parts.pop("xl/worksheets/sheet1.xml")
     worksheet_relationships = parts.pop("xl/worksheets/_rels/sheet1.xml.rels")
     parts["_rels/invoice.xml.rels"] = (
-        worksheet_relationships.replace(b"../drawings/", b"drawings/")
-        .replace(b"../comments1.xml", b"comments1.xml")
+        worksheet_relationships.replace(b"../drawings/", b"xl/drawings/")
+        .replace(b"../comments1.xml", b"xl/comments1.xml")
     )
     parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
         b"worksheets/sheet1.xml", b"/invoice.xml"
@@ -154,7 +188,7 @@ def test_rejects_missing_or_duplicate_configured_sheet_and_relationship(tmp_path
             b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>',
         ),
     )
-    assert _template_error(path).location == "xl/_rels/workbook.xml.rels"
+    assert _workbook_error(path, "INVALID_RELATIONSHIP").location == "xl/_rels/workbook.xml.rels:rId1"
 
 
 def test_reads_shared_rich_inline_and_formula_cells_without_using_cache(tmp_path: Path) -> None:
@@ -259,7 +293,6 @@ def test_rejects_shared_formula_masters_and_followers(tmp_path: Path, formula: b
     "duplicate",
     [
         f'<Relationship Id="rId10" Type="{OFFICE_RELATIONSHIP}/sharedStrings" Target="other.xml"/>',
-        f'<Relationship Id="rId9" Type="{OFFICE_RELATIONSHIP}/styles" Target="styles.xml"/>',
         f'<Relationship Id="rId10" Type="{OFFICE_RELATIONSHIP}/styles" Target="sharedStrings.xml"/>',
         f'<Relationship Id="rId10" Type="{OFFICE_RELATIONSHIP}/styles" Target="SHAREDSTRINGS.xml"/>',
     ],
@@ -275,6 +308,7 @@ def test_rejects_duplicate_shared_string_relationship_ids_and_targets(
         parts,
         b'<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>',
     )
+    parts["xl/other.xml"] = b"<other/>"
     parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
         b"</Relationships>", duplicate.encode() + b"</Relationships>"
     )
