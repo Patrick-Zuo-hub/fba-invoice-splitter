@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -65,6 +66,20 @@ def test_classifies_a_supported_product_anchor_to_its_one_based_source_row() -> 
     )
 
     assert classify_anchor(anchor, (12, 13)) == 12
+
+
+@pytest.mark.parametrize(
+    "anchor",
+    [
+        Anchor(11, 2, 10, 0, 11, 2, 9, 1, "row-offset-reverse"),
+        Anchor(11, 2, 0, 10, 12, 2, 0, 9, "col-offset-reverse"),
+        Anchor(11, 2, 0, 0, 11, 1, 0, 0, "left-of-start"),
+    ],
+)
+def test_rejects_anchor_when_either_axis_ends_before_start(anchor: Anchor) -> None:
+    with pytest.raises(WorkbookError) as captured:
+        classify_anchor(anchor, (12, 13))
+    assert captured.value.code == "INVALID_DRAWING"
 
 
 @pytest.mark.parametrize(
@@ -197,6 +212,112 @@ def test_rejects_unsupported_anchor_objects_and_external_images(
     assert _drawing_error(path, "UNSUPPORTED_DRAWING")
 
 
+def test_rejects_alternate_content_at_any_depth_in_drawing(tmp_path: Path) -> None:
+    path = tmp_path / "drawing-alternate-content.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    _rewrite_part(
+        path,
+        "xl/drawings/drawing1.xml",
+        lambda xml: xml.replace(
+            b"<wsDr ",
+            b'<wsDr xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" ',
+            1,
+        ).replace(b"</spPr>", b"<mc:AlternateContent/></spPr>", 1),
+    )
+
+    assert _drawing_error(path, "UNSUPPORTED_DRAWING")
+
+
+def test_rejects_unknown_direct_picture_child(tmp_path: Path) -> None:
+    path = tmp_path / "picture-group.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    _rewrite_part(
+        path,
+        "xl/drawings/drawing1.xml",
+        lambda xml: xml.replace(b"</pic>", b"<grpSp/></pic>", 1),
+    )
+
+    assert _drawing_error(path, "UNSUPPORTED_DRAWING")
+
+
+def test_accepts_prefixed_worksheet_namespace_for_drawing_lookup(tmp_path: Path) -> None:
+    path = tmp_path / "prefixed-worksheet.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+
+    def prefix_main_namespace(xml: bytes) -> bytes:
+        namespace = b"http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        prefixed = xml.replace(b'xmlns="' + namespace + b'"', b'xmlns:s="' + namespace + b'"', 1)
+        return re.sub(
+            rb"(<|</)([A-Za-z][A-Za-z0-9]*)",
+            lambda match: match.group(1) + b"s:" + match.group(2),
+            prefixed,
+        )
+
+    _rewrite_part(path, "xl/worksheets/sheet1.xml", prefix_main_namespace)
+
+    assert parse_workbook_drawings(path, parse_invoice_bundle(path)).product_images[0].source_row == 12
+
+
+def test_rejects_alternate_content_at_any_depth_in_worksheet(tmp_path: Path) -> None:
+    path = tmp_path / "worksheet-alternate-content.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(
+            b"<worksheet ",
+            b'<worksheet xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" ',
+            1,
+        ).replace(b"</sheetData>", b"<mc:AlternateContent/></sheetData>", 1),
+    )
+
+    assert _drawing_error(path, "UNSUPPORTED_DRAWING")
+
+
+def test_rejects_worksheet_drawing_relationship_without_declaration(tmp_path: Path) -> None:
+    path = tmp_path / "undeclared-drawing-relation.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    _rewrite_part(
+        path,
+        "xl/worksheets/sheet1.xml",
+        lambda xml: xml.replace(b'<drawing r:id="rId1"/>', b"", 1),
+    )
+
+    assert _drawing_error(path, "INVALID_DRAWING")
+
+
+def test_rejects_extra_worksheet_drawing_relationship(tmp_path: Path) -> None:
+    path = tmp_path / "extra-drawing-relation.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    _rewrite_part(
+        path,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        lambda xml: xml.replace(
+            b"</Relationships>",
+            b'<Relationship Id="rId99" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>',
+            1,
+        ),
+    )
+
+    assert _drawing_error(path, "INVALID_DRAWING")
+
+
+def test_rejects_wrong_drawing_part_content_type(tmp_path: Path) -> None:
+    path = tmp_path / "wrong-drawing-content-type.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    _rewrite_part(
+        path,
+        "[Content_Types].xml",
+        lambda xml: xml.replace(
+            b'PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"',
+            b'PartName="/xl/drawings/drawing1.xml" ContentType="application/xml"',
+            1,
+        ),
+    )
+
+    assert _drawing_error(path, "INVALID_DRAWING")
+
+
 @pytest.mark.parametrize(
     "part, old, new, code",
     [
@@ -234,6 +355,29 @@ def test_rejects_orphaned_media_and_allows_a_workbook_without_a_drawing(tmp_path
     inventory = parse_workbook_drawings(absent, parse_invoice_bundle(absent))
     assert inventory.product_images == ()
     assert inventory.fixed_images == ()
+
+
+def test_allows_media_referenced_by_another_drawing_part(tmp_path: Path) -> None:
+    path = tmp_path / "second-drawing.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    with ZipFile(path, "a", compression=ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "xl/drawings/drawing2.xml",
+            b'<wsDr xmlns="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>',
+        )
+        archive.writestr(
+            "xl/drawings/_rels/drawing2.xml.rels",
+            b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image2.png"/>'
+            b"</Relationships>",
+        )
+        archive.writestr(
+            "xl/media/image2.png",
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02",
+        )
+
+    assert parse_workbook_drawings(path, parse_invoice_bundle(path)).product_images[0].source_row == 12
 
 
 @pytest.mark.parametrize("target", ["../media/./image1.png", "/xl/media/image1.png", "../media/IMAGE1.PNG"])

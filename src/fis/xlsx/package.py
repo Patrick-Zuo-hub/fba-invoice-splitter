@@ -55,6 +55,7 @@ _ARCHIVE_ERRORS = (
     struct.error,
 )
 _RELATIONSHIPS_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/relationships"
+_CONTENT_TYPES_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/content-types"
 
 
 @dataclass(slots=True)
@@ -153,6 +154,52 @@ class SafePackage:
 
         self._require_open()
         return self._resolve_relationship_target(source_part, target)
+
+    def resolve_relationship_part_target(self, relationship_part: str, target: str) -> str:
+        """Resolve a target using the source part represented by a ``.rels`` part."""
+
+        self._require_open()
+        canonical_relationship_part = self._canonical_part_name(relationship_part)
+        if canonical_relationship_part == "_rels/.rels":
+            return self._resolve_relationship_target(None, target)
+        source_part = self._source_part_for_relationship_part(canonical_relationship_part)
+        return self._resolve_relationship_target(source_part, target)
+
+    def content_type_for_part(self, part: str) -> str | None:
+        """Return the canonical content type resolved from ``[Content_Types].xml``."""
+
+        self._require_open()
+        root = self.read_xml("[Content_Types].xml", MAX_ENTRY)
+        if root.tag != f"{{{_CONTENT_TYPES_NAMESPACE}}}Types":
+            raise WorkbookError("INVALID_CONTENT_TYPES", "XLSX 内容类型部件无效", "[Content_Types].xml")
+        defaults: dict[str, str] = {}
+        overrides: dict[str, str] = {}
+        for element in root:
+            if element.tag == f"{{{_CONTENT_TYPES_NAMESPACE}}}Default":
+                extension = _ascii_lower(element.get("Extension") or "")
+                content_type = (element.get("ContentType") or "").lower()
+                if not extension or not content_type or extension in defaults:
+                    raise WorkbookError(
+                        "INVALID_CONTENT_TYPES", "XLSX 内容类型部件无效", "[Content_Types].xml"
+                    )
+                defaults[extension] = content_type
+            elif element.tag == f"{{{_CONTENT_TYPES_NAMESPACE}}}Override":
+                raw_part_name = element.get("PartName") or ""
+                raw_part_name = raw_part_name.removeprefix("/")
+                part_name = self._canonical_part_name(raw_part_name)
+                content_type = (element.get("ContentType") or "").lower()
+                if not content_type or part_name in overrides:
+                    raise WorkbookError(
+                        "INVALID_CONTENT_TYPES", "XLSX 内容类型部件无效", "[Content_Types].xml"
+                    )
+                overrides[part_name] = content_type
+            else:
+                raise WorkbookError(
+                    "INVALID_CONTENT_TYPES", "XLSX 内容类型部件无效", "[Content_Types].xml"
+                )
+        canonical_part = self._canonical_part_name(part)
+        suffix = PurePosixPath(canonical_part).suffix.removeprefix(".")
+        return overrides.get(canonical_part, defaults.get(suffix))
 
     def close(self) -> None:
         """Close the underlying archive. Access after close is rejected."""
