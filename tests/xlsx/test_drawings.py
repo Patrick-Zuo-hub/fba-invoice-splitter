@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import base64
+import io
 import re
+import struct
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+from PIL import Image
 
 from fis.xlsx.drawings import Anchor, classify_anchor, parse_workbook_drawings
 from fis.xlsx.errors import WorkbookError
@@ -19,6 +23,23 @@ from tests.fixtures.standard_v1_builder import build_standard_v1
 _JPEG_1X1 = base64.b64decode(
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAGf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9k="
 )
+
+
+def _pillow_image_bytes(format_name: str) -> bytes:
+    with io.BytesIO() as stream:
+        image_mode = "RGBA" if format_name == "PNG" else "RGB"
+        color = (1, 2, 3, 255) if image_mode == "RGBA" else (1, 2, 3)
+        Image.new(image_mode, (1, 1), color).save(stream, format=format_name)
+        return stream.getvalue()
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + chunk_type
+        + data
+        + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+    )
 
 
 def _rewrite_part(path: Path, part_name: str, rewrite: Callable[[bytes], bytes]) -> None:
@@ -173,7 +194,7 @@ def test_supports_png_and_jpeg_images_when_content_type_and_magic_match(tmp_path
     )
     with ZipFile(path) as archive:
         parts = {name: archive.read(name) for name in archive.namelist()}
-    parts["xl/media/image1.jpg"] = _JPEG_1X1
+    parts["xl/media/image1.jpg"] = _pillow_image_bytes("JPEG")
     parts.pop("xl/media/image1.png")
     parts["xl/drawings/_rels/drawing1.xml.rels"] = parts[
         "xl/drawings/_rels/drawing1.xml.rels"
@@ -184,6 +205,15 @@ def test_supports_png_and_jpeg_images_when_content_type_and_magic_match(tmp_path
 
     inventory = parse_workbook_drawings(path, parse_invoice_bundle(path))
     assert inventory.product_images[0].media_part == "xl/media/image1.jpg"
+
+
+def test_accepts_pillow_generated_png(tmp_path: Path) -> None:
+    path = tmp_path / "pillow-png.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    _rewrite_part(path, "xl/media/image1.png", lambda _: _pillow_image_bytes("PNG"))
+
+    inventory = parse_workbook_drawings(path, parse_invoice_bundle(path))
+    assert inventory.product_images[0].media_part == "xl/media/image1.png"
 
 
 @pytest.mark.parametrize("extension, content_type, payload", [
@@ -618,8 +648,43 @@ def test_rejects_truncated_png_and_jpeg_payloads(tmp_path: Path) -> None:
 
     jpeg = tmp_path / "truncated-jpeg.xlsx"
     build_standard_v1(jpeg, {"S1": 1}, [12])
-    _rewrite_part(jpeg, "xl/media/image1.png", lambda _: b"\xff\xd8\xff\xd9")
+    _rewrite_part(jpeg, "xl/media/image1.png", lambda _: _JPEG_1X1[:-2])
     assert _drawing_error(jpeg, "INVALID_DRAWING")
+
+
+def test_rejects_structurally_valid_but_undecodable_media(tmp_path: Path) -> None:
+    png = tmp_path / "undecodable-png.xlsx"
+    build_standard_v1(png, {"S1": 1}, [12])
+    png_payload = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + _png_chunk(b"IDAT", b"not-zlib-data")
+        + _png_chunk(b"IEND", b"")
+    )
+    _rewrite_part(png, "xl/media/image1.png", lambda _: png_payload)
+    assert _drawing_error(png, "UNSUPPORTED_DRAWING").location == "xl/media/image1.png"
+
+    jpeg = tmp_path / "undecodable-jpeg.xlsx"
+    build_standard_v1(jpeg, {"S1": 1}, [12])
+    with ZipFile(jpeg) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["[Content_Types].xml"] = parts["[Content_Types].xml"].replace(
+        b'Extension="png" ContentType="image/png"',
+        b'Extension="jpg" ContentType="image/jpeg"',
+    )
+    parts["xl/media/image1.jpg"] = (
+        b"\xff\xd8"
+        b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+        b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\x00\xff\xd9"
+    )
+    parts.pop("xl/media/image1.png")
+    parts["xl/drawings/_rels/drawing1.xml.rels"] = parts[
+        "xl/drawings/_rels/drawing1.xml.rels"
+    ].replace(b"image1.png", b"image1.jpg")
+    with ZipFile(jpeg, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+    assert _drawing_error(jpeg, "UNSUPPORTED_DRAWING").location == "xl/media/image1.jpg"
 
 
 def test_content_types_are_read_once_and_rejected_after_package_close(

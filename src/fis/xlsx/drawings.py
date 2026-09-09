@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import re
 import struct
+import warnings
 import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 
 from lxml import etree  # type: ignore[import-untyped]
+from PIL import Image, UnidentifiedImageError
 
 from fis.xlsx.errors import WorkbookError
 from fis.xlsx.package import MAX_ENTRY, SafePackage
@@ -49,6 +52,7 @@ WORKSHEET_RELATIONSHIP_TYPES = frozenset(
     }
 )
 _MAX_OFFSET = 2_147_483_647
+_MAX_IMAGE_PIXELS = 50_000_000
 _SUPPORTED_MEDIA = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
 _ASCII_INTEGER = re.compile(r"^[0-9]+$", re.ASCII)
 _CLIENT_DATA_ATTRIBUTES = {"fLocksWithSheet", "fPrintsWithSheet", "fPublished"}
@@ -645,6 +649,37 @@ def _validate_media(package: SafePackage, media_part: str) -> None:
         valid = _valid_jpeg(payload)
     if not valid:
         raise _drawing_error("INVALID_DRAWING", media_part)
+    if not _decodable_media(payload, suffix):
+        raise _drawing_error("UNSUPPORTED_DRAWING", media_part)
+
+
+def _decodable_media(payload: bytes, suffix: str) -> bool:
+    expected_format = "PNG" if suffix == "png" else "JPEG"
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(payload)) as image:
+                if image.format != expected_format:
+                    return False
+                width, height = image.size
+                if width <= 0 or height <= 0 or width * height > _MAX_IMAGE_PIXELS:
+                    return False
+                image.verify()
+            with Image.open(BytesIO(payload)) as image:
+                if image.format != expected_format:
+                    return False
+                width, height = image.size
+                if width <= 0 or height <= 0 or width * height > _MAX_IMAGE_PIXELS:
+                    return False
+                image.load()
+    except (
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        OSError,
+        UnidentifiedImageError,
+    ):
+        return False
+    return True
 
 
 def _valid_png(payload: bytes) -> bool:
