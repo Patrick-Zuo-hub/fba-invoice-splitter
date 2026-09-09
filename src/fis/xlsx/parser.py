@@ -179,7 +179,7 @@ def _workbook_relationships(package: SafePackage) -> etree._Element:
 
 def _validate_workbook_sheets(
     package: SafePackage, sheets: list[etree._Element], relationships: etree._Element
-) -> None:
+) -> dict[str, tuple[str, etree._Element]]:
     names: set[str] = set()
     sheet_ids: set[str] = set()
     relationship_ids: set[str] = set()
@@ -210,27 +210,45 @@ def _validate_workbook_sheets(
             "./pkg:Relationship", namespaces={"pkg": PACKAGE_REL_NS}
         )
     }
+    worksheet_parts: dict[str, str] = {}
+    resolved_parts: set[str] = set()
     for relationship_id in sheet_relationship_ids:
         relationship = relationships_by_id.get(relationship_id)
-        if relationship is None or relationship.get("Type", "").lower() not in _WORKSHEET_RELATIONSHIP_TYPES:
+        if (
+            relationship is None
+            or relationship.get("Type", "").lower() not in _WORKSHEET_RELATIONSHIP_TYPES
+        ):
             raise _template_error("xl/workbook.xml")
         target = relationship.get("Target")
         if not target:
             raise _template_error("xl/workbook.xml")
         try:
-            worksheet = package.read_xml(
-                package.resolve_relationship_target("xl/workbook.xml", target), MAX_ENTRY
-            )
+            worksheet_part = package.resolve_relationship_target("xl/workbook.xml", target)
+        except WorkbookError as exc:
+            raise _template_error("xl/workbook.xml") from exc
+        if worksheet_part in resolved_parts:
+            raise _template_error("xl/workbook.xml")
+        resolved_parts.add(worksheet_part)
+        worksheet_parts[relationship_id] = worksheet_part
+
+    worksheets: dict[str, tuple[str, etree._Element]] = {}
+    for relationship_id, worksheet_part in worksheet_parts.items():
+        try:
+            worksheet = package.read_xml(worksheet_part, MAX_ENTRY)
         except WorkbookError as exc:
             raise _template_error("xl/workbook.xml") from exc
         if worksheet.tag != f"{{{MAIN_NS}}}worksheet":
             raise _template_error("xl/workbook.xml")
+        worksheets[relationship_id] = (worksheet_part, worksheet)
+    return worksheets
 
 
-def _worksheet_part(package: SafePackage, relationships: etree._Element) -> str:
+def _worksheet_part(
+    package: SafePackage, relationships: etree._Element
+) -> tuple[str, etree._Element]:
     workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
     sheets = workbook.xpath("./main:sheets/main:sheet", namespaces={"main": MAIN_NS})
-    _validate_workbook_sheets(package, sheets, relationships)
+    worksheets = _validate_workbook_sheets(package, sheets, relationships)
     matched = [sheet for sheet in sheets if sheet.get("name") == STANDARD_V1.sheet_name]
     if len(matched) != 1:
         raise _template_error("xl/workbook.xml")
@@ -238,24 +256,10 @@ def _worksheet_part(package: SafePackage, relationships: etree._Element) -> str:
     if not relation_id:
         raise _template_error("xl/workbook.xml")
 
-    matching_ids = [
-        relation
-        for relation in relationships.xpath(
-            "./pkg:Relationship", namespaces={"pkg": PACKAGE_REL_NS}
-        )
-        if relation.get("Id") == relation_id
-    ]
-    if len(matching_ids) != 1 or not matching_ids[0].get("Type", "").endswith("/worksheet"):
-        raise _template_error("xl/_rels/workbook.xml.rels")
-    target = matching_ids[0].get("Target")
-    if not target:
-        raise _template_error("xl/_rels/workbook.xml.rels")
     try:
-        return package.resolve_relationship_target("xl/workbook.xml", target)
-    except WorkbookError as exc:
-        if exc.code in {"UNSAFE_PATH", "UNSAFE_RELATIONSHIP"}:
-            raise _template_error("xl/_rels/workbook.xml.rels") from exc
-        raise
+        return worksheets[relation_id]
+    except KeyError as exc:
+        raise _template_error("xl/workbook.xml") from exc
 
 
 def _rows_from_worksheet(
@@ -311,8 +315,7 @@ def parse_invoice_bundle(path: Path | str) -> ParsedBundle:
 
     with SafePackage.open(path) as package:
         relationships = _workbook_relationships(package)
-        worksheet_part = _worksheet_part(package, relationships)
-        worksheet = package.read_xml(worksheet_part, MAX_ENTRY)
+        worksheet_part, worksheet = _worksheet_part(package, relationships)
         rows, max_row = _rows_from_worksheet(
             worksheet, _parse_shared_strings(package, relationships), worksheet_part
         )

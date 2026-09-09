@@ -7,6 +7,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import pytest
 
 from fis.xlsx.errors import WorkbookError
+from fis.xlsx.package import SafePackage
 from fis.xlsx.parser import ParsedBundle, ParsedItem, ParsedShipment, parse_invoice_bundle
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
@@ -110,6 +111,48 @@ def test_resolves_literal_dot_segment_in_worksheet_relationship_target(tmp_path:
     )
 
     assert parse_invoice_bundle(path).product_rows == (12,)
+
+
+def test_rejects_workbook_sheets_that_resolve_to_the_same_worksheet_part(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-worksheet-target.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/workbook.xml",
+        lambda xml: xml.replace(
+            b"</sheets>",
+            b'<sheet name="Other" sheetId="2" r:id="rId3"/></sheets>',
+        ),
+    )
+    _rewrite_part(
+        path,
+        "xl/_rels/workbook.xml.rels",
+        lambda xml: xml.replace(
+            b"</Relationships>",
+            b'<Relationship Id="rId3" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            b'Target="./worksheets/sheet1.xml"/></Relationships>',
+        ),
+    )
+
+    assert _template_error(path).location == "xl/workbook.xml"
+
+
+def test_reads_selected_worksheet_part_only_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "single-worksheet-read.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    original_read_xml = SafePackage.read_xml
+    reads: list[str] = []
+
+    def counted_read_xml(package: SafePackage, part_name: str, max_bytes: int):
+        if part_name == "xl/worksheets/sheet1.xml":
+            reads.append(part_name)
+        return original_read_xml(package, part_name, max_bytes)
+
+    monkeypatch.setattr(SafePackage, "read_xml", counted_read_xml)
+
+    assert parse_invoice_bundle(path).product_rows == (12,)
+    assert reads == ["xl/worksheets/sheet1.xml"]
 
 
 @pytest.mark.parametrize(
