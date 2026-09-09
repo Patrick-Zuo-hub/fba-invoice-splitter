@@ -191,6 +191,16 @@ def _worksheet(shipment_rows: list[tuple[int, str, int]], total_row: int) -> byt
     root = etree.Element(f"{{{MAIN_NS}}}worksheet", nsmap=_NSMAP)
     dimension = _element(root, "dimension", ref=f"A1:Z{total_row}")
     del dimension
+    sheet_views = _element(root, "sheetViews")
+    sheet_view = _element(sheet_views, "sheetView", workbookViewId="0")
+    selected_reference = f"Q{total_row - 2}"
+    _element(sheet_view, "pane", topLeftCell=selected_reference)
+    _element(
+        sheet_view,
+        "selection",
+        activeCell=selected_reference,
+        sqref=selected_reference,
+    )
     sheet_data = _element(root, "sheetData")
 
     for row_number in range(1, 11):

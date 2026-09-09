@@ -10,6 +10,7 @@ from lxml import etree
 
 from fis.xlsx.errors import WorkbookError
 from fis.xlsx.parser import ParsedBundle, ParsedItem, ParsedShipment, parse_invoice_bundle
+from fis.xlsx.template import STANDARD_V1
 from fis.xlsx.transform import (
     DRAWING_NS,
     MAIN_NS,
@@ -63,26 +64,46 @@ def test_totals_reject_missing_or_non_exact_numbers(bad_value: object) -> None:
 def test_totals_are_exact_and_independent_of_global_decimal_context() -> None:
     rows = [
         {
-            "K": "123456789012345678901234567890.12345678901234567890",
+            "K": "12345678901234.5",
             "M": "0.00000000000000000000000000000000000000000000000009",
-            "N": "99999999999999999999999999999999999999999999999999",
-            "P": "1.00000000000000000000000000000000000000000000000001",
+            "N": "99999999999999",
+            "P": "1.00000000000001",
         },
         {
-            "K": "0.87654321098765432110",
+            "K": "0.5",
             "M": "0.00000000000000000000000000000000000000000000000002",
             "N": "1",
-            "P": "2.00000000000000000000000000000000000000000000000002",
+            "P": "2.00000000000002",
         },
     ]
     with localcontext() as context:
         context.prec = 3
         totals = compute_totals(rows)
 
-    assert totals["K"] == Decimal(123456789012345678901234567891)
+    assert totals["K"] == Decimal(12345678901235)
     assert totals["M"] == Decimal("0.00000000000000000000000000000000000000000000000011")
-    assert totals["N"] == Decimal(100000000000000000000000000000000000000000000000000)
-    assert totals["P"] == Decimal("3.00000000000000000000000000000000000000000000000003")
+    assert totals["N"] == Decimal(100000000000000)
+    assert totals["P"] == Decimal("3.00000000000003")
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "1e5000",
+        "1e1000000000",
+        "1e-5000",
+        "1234567890123456",
+        "1." + "0" * 200,
+    ],
+)
+def test_totals_reject_values_outside_safe_excel_resource_bounds(bad_value: str) -> None:
+    row = {"K": bad_value, "M": "1", "N": "1", "P": "1"}
+
+    with pytest.raises(WorkbookError) as caught:
+        compute_totals([row])
+
+    assert caught.value.code == "INVALID_TOTAL_INPUT"
+    assert caught.value.location == "K"
 
 
 @pytest.mark.parametrize(
@@ -175,8 +196,11 @@ def _worksheet(*, unsafe_formula: bool = False) -> bytes:
             _formula_cell(row, "R10", "G9/G10")
         if number == 19:
             _formula_cell(row, "Q19", "A18" if unsafe_formula else 'IF(A1="A18",1,0)')
-    merges = etree.SubElement(root, f"{{{MAIN_NS}}}mergeCells", count="2")
-    etree.SubElement(merges, f"{{{MAIN_NS}}}mergeCell", ref="C4:F4")
+    merges = etree.SubElement(
+        root, f"{{{MAIN_NS}}}mergeCells", count=str(len(STANDARD_V1.value_ranges) + 1)
+    )
+    for reference in STANDARD_V1.value_ranges.values():
+        etree.SubElement(merges, f"{{{MAIN_NS}}}mergeCell", ref=reference)
     etree.SubElement(merges, f"{{{MAIN_NS}}}mergeCell", ref="A19:B19")
     validations = etree.SubElement(root, f"{{{MAIN_NS}}}dataValidations", count="1")
     etree.SubElement(validations, f"{{{MAIN_NS}}}dataValidation", sqref="A12:A16 C4")
@@ -231,8 +255,13 @@ def test_sheet_transform_compacts_rows_writes_values_and_preserves_styles() -> N
     assert _cell_at(root, "G10").xpath("string(main:v)", namespaces={"main": MAIN_NS}) == "0.9"
     assert _cell_at(root, "O10").xpath("string(main:f)", namespaces={"main": MAIN_NS}) == "P15/N15"
     assert _cell_at(root, "O10").xpath("string(main:v)", namespaces={"main": MAIN_NS}) == "100"
-    assert _cell_at(root, "R10").xpath("string(main:v)", namespaces={"main": MAIN_NS}) == "11.11111111111111111111111111"
-    assert root.xpath("./main:mergeCells/main:mergeCell/@ref", namespaces={"main": MAIN_NS}) == ["C4:F4", "A16:B16"]
+    assert _cell_at(root, "R10").xpath(
+        "string(main:v)", namespaces={"main": MAIN_NS}
+    ) == "11.1111111111111"
+    assert root.xpath("./main:mergeCells/main:mergeCell/@ref", namespaces={"main": MAIN_NS}) == [
+        *STANDARD_V1.value_ranges.values(),
+        "A16:B16",
+    ]
     assert root.xpath("string(./main:dataValidations/main:dataValidation/@sqref)", namespaces={"main": MAIN_NS}) == "A12:A13 C4"
     assert root.xpath("string(./main:hyperlinks/main:hyperlink/@ref)", namespaces={"main": MAIN_NS}) == "A15"
     assert root.xpath("string(./main:dimension/@ref)", namespaces={"main": MAIN_NS}) == "A1:Z17"
@@ -255,6 +284,34 @@ def test_sheet_transform_accepts_the_official_anonymous_v1_fixture(tmp_path: Pat
     assert _parsed_xml(output).xpath(
         "string(.//main:c[@r='O10']/main:f)", namespaces={"main": MAIN_NS}
     ) == "P15/N15"
+
+
+@pytest.mark.parametrize("shipment_number", range(1, 6))
+def test_each_five_shipment_fixture_output_ignores_stale_q16_view_state(
+    tmp_path: Path, shipment_number: int
+) -> None:
+    path = tmp_path / "five-shipments.xlsx"
+    build_standard_v1(
+        path,
+        {f"S{number}": 1 for number in range(1, 6)},
+        range(12, 17),
+    )
+    parsed = parse_invoice_bundle(path)
+    with ZipFile(path) as archive:
+        worksheet = archive.read("xl/worksheets/sheet1.xml")
+
+    output = _parsed_xml(
+        transform_sheet_xml(
+            worksheet,
+            parsed,
+            (11 + shipment_number,),
+            {},
+        )
+    )
+
+    assert output.xpath("./main:sheetViews//@topLeftCell", namespaces={"main": MAIN_NS}) == []
+    assert output.xpath("./main:sheetViews//@activeCell", namespaces={"main": MAIN_NS}) == []
+    assert output.xpath("./main:sheetViews//@sqref", namespaces={"main": MAIN_NS}) == []
 
 
 def test_sheet_transform_rejects_an_unconfigured_affected_formula() -> None:
@@ -293,6 +350,32 @@ def test_sheet_transform_rejects_zero_volume_before_writing_formula_cache() -> N
     assert caught.value.location == "N"
 
 
+def test_sheet_transform_rejects_formula_cache_overflow() -> None:
+    huge = ParsedItem("S1", 13, {"K": "1", "M": "1e307", "N": "1e-307", "P": "1e307"})
+    bundle = ParsedBundle((ParsedShipment("S1", (huge,)),), (13,), 14, 15)
+    root = _parsed_xml(_worksheet())
+    sheet_data = root.find(f"{{{MAIN_NS}}}sheetData")
+    assert sheet_data is not None
+    for row in list(sheet_data):
+        number = int(row.get("r", "0"))
+        if 12 <= number <= 18:
+            sheet_data.remove(row)
+    product = etree.SubElement(sheet_data, f"{{{MAIN_NS}}}row", r="13")
+    _cell(product, "A13", "S1", style="7")
+    etree.SubElement(sheet_data, f"{{{MAIN_NS}}}row", r="14")
+    total = etree.SubElement(sheet_data, f"{{{MAIN_NS}}}row", r="15")
+    _cell(total, "A15", "合计TOTAL", style="7")
+    for column in "KMNP":
+        _cell(total, f"{column}15", "0", style="7")
+    _cell_at(root, "O10").find(f"{{{MAIN_NS}}}f").text = "P15/N15"
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), bundle, (13,), {})
+
+    assert caught.value.code == "INVALID_TOTAL_INPUT"
+    assert caught.value.location == "N"
+
+
 @pytest.mark.parametrize("missing_ref", ["K18", "G8", "O10", "C4"])
 def test_sheet_transform_rejects_missing_configured_target_cells(missing_ref: str) -> None:
     root = _parsed_xml(_worksheet())
@@ -324,9 +407,41 @@ def test_sheet_transform_rejects_missing_style_or_unexpected_baseline_formula() 
     assert caught.value.location == "O10"
 
 
+def test_sheet_transform_requires_each_configured_merged_value_range() -> None:
+    root = _parsed_xml(_worksheet())
+    merge = root.xpath(
+        "./main:mergeCells/main:mergeCell[@ref='C4:F4']", namespaces={"main": MAIN_NS}
+    )[0]
+    merge.getparent().remove(merge)
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "TEMPLATE_VERSION_MISMATCH"
+    assert caught.value.location == "C4:F4"
+
+
+@pytest.mark.parametrize("conflicting_ref", ["C4:F4", "C4:G4"])
+def test_sheet_transform_rejects_duplicate_or_overlapping_configured_merges(
+    conflicting_ref: str,
+) -> None:
+    root = _parsed_xml(_worksheet())
+    merges = root.find(f"{{{MAIN_NS}}}mergeCells")
+    assert merges is not None
+    etree.SubElement(merges, f"{{{MAIN_NS}}}mergeCell", ref=conflicting_ref)
+    merges.set("count", str(len(merges)))
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "TEMPLATE_VERSION_MISMATCH"
+
+
 def test_sheet_transform_is_sheet_aware_and_blocks_current_sheet_whole_rows() -> None:
     other_sheet = _parsed_xml(_worksheet())
-    _cell_at(other_sheet, "Q19").find(f"{{{MAIN_NS}}}f").text = "'Other Sheet'!A18"
+    _cell_at(other_sheet, "Q19").find(f"{{{MAIN_NS}}}f").text = (
+        "SUM(A:A)+'Other Sheet'!A18"
+    )
     transform_sheet_xml(etree.tostring(other_sheet), _bundle(), (13, 16), {})
 
     current_rows = _parsed_xml(_worksheet())
@@ -334,6 +449,62 @@ def test_sheet_transform_is_sheet_aware_and_blocks_current_sheet_whole_rows() ->
     with pytest.raises(WorkbookError) as caught:
         transform_sheet_xml(etree.tostring(current_rows), _bundle(), (13, 16), {})
     assert caught.value.code == "UNSAFE_FORMULA_TRANSFORM"
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        "SUM('装箱单&发票 发货信息':Other!A14)",
+        "SUM(Other!NamedRange)",
+    ],
+)
+def test_sheet_transform_blocks_3d_and_incompletely_parsed_sheet_references(
+    formula: str,
+) -> None:
+    root = _parsed_xml(_worksheet())
+    _cell_at(root, "Q19").find(f"{{{MAIN_NS}}}f").text = formula
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "UNSAFE_FORMULA_TRANSFORM"
+
+
+@pytest.mark.parametrize("foreign_location", ["element", "attribute"])
+def test_sheet_transform_blocks_reference_nodes_and_attributes_in_foreign_namespaces(
+    foreign_location: str,
+) -> None:
+    evil_ns = "urn:evil"
+    root = _parsed_xml(_worksheet())
+    if foreign_location == "element":
+        etree.SubElement(root, f"{{{evil_ns}}}mergeCell", ref="A14")
+    else:
+        _cell_at(root, "A12").set(f"{{{evil_ns}}}ref", "A14")
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "UNSAFE_REFERENCE"
+
+
+@pytest.mark.parametrize("kept_row", [12, 13, 14, 15, 16])
+def test_sheet_transform_discards_stale_ui_view_references_for_each_shipment(
+    kept_row: int,
+) -> None:
+    root = _parsed_xml(_worksheet())
+    views = etree.Element(f"{{{MAIN_NS}}}sheetViews")
+    view = etree.SubElement(views, f"{{{MAIN_NS}}}sheetView", workbookViewId="0")
+    etree.SubElement(view, f"{{{MAIN_NS}}}pane", topLeftCell="Q16")
+    etree.SubElement(view, f"{{{MAIN_NS}}}selection", activeCell="Q16", sqref="Q16")
+    root.insert(1, views)
+
+    output = _parsed_xml(
+        transform_sheet_xml(etree.tostring(root), _bundle(), (kept_row,), {})
+    )
+
+    assert output.xpath("./main:sheetViews//@topLeftCell", namespaces={"main": MAIN_NS}) == []
+    assert output.xpath("./main:sheetViews//@activeCell", namespaces={"main": MAIN_NS}) == []
+    assert output.xpath("./main:sheetViews//@sqref", namespaces={"main": MAIN_NS}) == []
 
 
 def test_sheet_transform_updates_conditional_format_and_auto_filter_ranges() -> None:
@@ -353,7 +524,7 @@ def test_sheet_transform_updates_conditional_format_and_auto_filter_ranges() -> 
 
 def test_sheet_transform_rejects_reference_to_removed_row() -> None:
     root = _parsed_xml(_worksheet())
-    merge = root.xpath("./main:mergeCells/main:mergeCell", namespaces={"main": MAIN_NS})[1]
+    merge = root.xpath("./main:mergeCells/main:mergeCell", namespaces={"main": MAIN_NS})[-1]
     merge.set("ref", "A14:B14")
 
     with pytest.raises(WorkbookError) as caught:

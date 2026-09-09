@@ -6,7 +6,7 @@ import copy
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, DecimalException, InvalidOperation, Overflow, Underflow, localcontext
 from typing import cast
 
 from lxml import etree  # type: ignore[import-untyped]
@@ -40,6 +40,10 @@ _SQREF_TOKEN = re.compile(
     re.ASCII | re.IGNORECASE,
 )
 _TOTAL_COLUMNS = ("K", "M", "N", "P")
+_MAX_DECIMAL_TEXT = 128
+_MAX_SIGNIFICANT_DIGITS = 15
+_MIN_EXCEL_EXPONENT = -307
+_MAX_EXCEL_EXPONENT = 307
 
 
 def _error(code: str, message: str, location: str | None = None) -> WorkbookError:
@@ -93,20 +97,39 @@ def _decimal(value: object, column: str) -> Decimal:
     if isinstance(value, Decimal):
         number = value
     elif isinstance(value, int):
+        if value.bit_length() > 1024:
+            raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column)
         number = Decimal(value)
     elif isinstance(value, str):
-        if not value.strip():
+        stripped = value.strip()
+        if not stripped or len(stripped) > _MAX_DECIMAL_TEXT:
             raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column)
         try:
-            number = Decimal(value.strip())
+            number = Decimal(stripped)
         except InvalidOperation as exc:
             raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column) from exc
     else:
         # Binary floating point is deliberately not accepted as invoice source data.
         raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column)
+    _validate_excel_decimal(number, column)
+    return number
+
+
+def _validate_excel_decimal(number: Decimal, column: str) -> None:
     if not number.is_finite():
         raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column)
-    return number
+    parts = number.as_tuple()
+    exponent = cast(int, parts.exponent)
+    if (
+        len(parts.digits) > _MAX_SIGNIFICANT_DIGITS
+        or exponent < _MIN_EXCEL_EXPONENT
+        or exponent > _MAX_EXCEL_EXPONENT
+        or (
+            not number.is_zero()
+            and (number.adjusted() < _MIN_EXCEL_EXPONENT or number.adjusted() > _MAX_EXCEL_EXPONENT)
+        )
+    ):
+        raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column)
 
 
 def compute_totals(rows: Iterable[Mapping[str, object]]) -> dict[str, Decimal]:
@@ -120,7 +143,12 @@ def compute_totals(rows: Iterable[Mapping[str, object]]) -> dict[str, Decimal]:
             except (KeyError, TypeError) as exc:
                 raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column) from exc
             values[column].append(_decimal(value, column))
-    return {column: _sum_decimals_exact(items) for column, items in values.items()}
+    result: dict[str, Decimal] = {}
+    for column, items in values.items():
+        total = _sum_decimals_exact(items)
+        _validate_excel_decimal(total, column)
+        result[column] = total
+    return result
 
 
 def _sum_decimals_exact(values: Sequence[Decimal]) -> Decimal:
@@ -138,17 +166,33 @@ def _sum_decimals_exact(values: Sequence[Decimal]) -> Decimal:
         if parts.sign:
             coefficient = -coefficient
         total += coefficient * 10 ** (cast(int, parts.exponent) - exponent)
+    while total and total % 10 == 0:
+        total //= 10
+        exponent += 1
     sign = 1 if total < 0 else 0
     digits = tuple(int(character) for character in str(abs(total)))
     return Decimal((sign, digits, exponent))
 
 
-def _divide_for_cache(numerator: Decimal, denominator: Decimal) -> Decimal:
+def _divide_for_cache(numerator: Decimal, denominator: Decimal, column: str) -> Decimal:
     """Produce deterministic cached arithmetic independent of global Decimal settings."""
 
     with localcontext() as context:
-        context.prec = 28
-        return numerator / denominator
+        context.prec = _MAX_SIGNIFICANT_DIGITS
+        context.Emin = _MIN_EXCEL_EXPONENT
+        context.Emax = _MAX_EXCEL_EXPONENT
+        context.traps[Overflow] = True
+        context.traps[Underflow] = True
+        try:
+            result = numerator / denominator
+        except DecimalException as exc:
+            raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column) from exc
+    if not result.is_finite() or (
+        not result.is_zero()
+        and (result.adjusted() < _MIN_EXCEL_EXPONENT or result.adjusted() > _MAX_EXCEL_EXPONENT)
+    ):
+        raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column)
+    return result
 
 
 class _RowTransform:
@@ -328,10 +372,22 @@ def _assert_formula_unaffected(
     inspected = _formula_without_strings(formula)
     if "[" in inspected or "]" in inspected:
         raise _error("UNSAFE_FORMULA_TRANSFORM", "公式引用结构不受支持", location)
+    if re.search(
+        r"(?:'(?:[^']|'')+'|[^!,:()+\-*/\s]+)\s*:\s*"
+        r"(?:'(?:[^']|'')+'|[^!,:()+\-*/\s]+)\s*!",
+        inspected,
+    ):
+        raise _error("UNSAFE_FORMULA_TRANSFORM", "三维公式引用不受支持", location)
+    consumed_bangs: set[int] = set()
     for match in _FORMULA_REFERENCE.finditer(inspected):
         sheet = match.group("sheet")
-        if sheet is not None and _sheet_name(sheet) != current_sheet:
-            continue
+        if sheet is not None:
+            bang = inspected.rfind("!", match.start("sheet"), match.start("reference"))
+            if bang < 0:
+                raise _error("UNSAFE_FORMULA_TRANSFORM", "公式引用无法完整解析", location)
+            consumed_bangs.add(bang)
+            if _sheet_name(sheet) != current_sheet:
+                continue
         reference = match.group("reference").upper()
         if re.fullmatch(r"\$?[A-Z]{1,3}:\$?[A-Z]{1,3}", reference):
             continue
@@ -343,6 +399,8 @@ def _assert_formula_unaffected(
             ) from exc
         if translated != reference:
             raise _error("UNSAFE_FORMULA_TRANSFORM", "公式引用受商品行转换影响", location)
+    if any(character == "!" and index not in consumed_bangs for index, character in enumerate(inspected)):
+        raise _error("UNSAFE_FORMULA_TRANSFORM", "公式引用无法完整解析", location)
 
 
 def _decimal_text(value: Decimal) -> str:
@@ -407,6 +465,93 @@ def _validate_configured_targets(
         _require_styled_cell(rows, value_range.split(":", 1)[0])
     _validate_formula_target(rows, "O10", f"P{parsed.total_row}/N{parsed.total_row}")
     _validate_formula_target(rows, "R10", "G9/G10")
+
+
+def _range_rectangle(reference: str) -> tuple[int, int, int, int]:
+    parts = reference.split(":")
+    if len(parts) != 2:
+        raise _error("UNSAFE_REFERENCE", "合并区域引用无效", reference)
+    left = _parse_cell_ref(parts[0], reference)
+    right = _parse_cell_ref(parts[1], reference)
+    return (
+        min(_column_number(left[1]), _column_number(right[1])),
+        min(left[3], right[3]),
+        max(_column_number(left[1]), _column_number(right[1])),
+        max(left[3], right[3]),
+    )
+
+
+def _rectangles_overlap(
+    left: tuple[int, int, int, int], right: tuple[int, int, int, int]
+) -> bool:
+    return not (
+        left[2] < right[0]
+        or right[2] < left[0]
+        or left[3] < right[1]
+        or right[3] < left[1]
+    )
+
+
+def _validate_configured_merges(root: etree._Element) -> None:
+    containers = root.findall(f"{{{MAIN_NS}}}mergeCells")
+    if len(containers) != 1:
+        raise _error("TEMPLATE_VERSION_MISMATCH", "模板合并区域结构无效", "mergeCells")
+    merges = containers[0].findall(f"{{{MAIN_NS}}}mergeCell")
+    references = [merge.get("ref") for merge in merges]
+    if any(reference is None for reference in references):
+        raise _error("UNSAFE_REFERENCE", "合并区域缺少引用", "mergeCell")
+    safe_references = cast(list[str], references)
+    configured = tuple(STANDARD_V1.value_ranges.values())
+    configured_rectangles = {reference: _range_rectangle(reference) for reference in configured}
+    for reference in configured:
+        if safe_references.count(reference) != 1:
+            raise _error(
+                "TEMPLATE_VERSION_MISMATCH", "模板值区域必须保持完整合并", reference
+            )
+    count = containers[0].get("count")
+    if count is not None and (
+        not count.isascii() or not count.isdigit() or int(count) != len(merges)
+    ):
+        raise _error("TEMPLATE_VERSION_MISMATCH", "模板合并区域数量无效", "mergeCells")
+    for reference in safe_references:
+        rectangle = _range_rectangle(reference)
+        for configured_reference, configured_rectangle in configured_rectangles.items():
+            if reference != configured_reference and _rectangles_overlap(
+                rectangle, configured_rectangle
+            ):
+                raise _error(
+                    "TEMPLATE_VERSION_MISMATCH", "模板合并区域存在冲突", reference
+                )
+
+
+def _validate_reference_qnames(root: etree._Element) -> None:
+    known_reference_nodes = {
+        f"{{{MAIN_NS}}}{local_name}"
+        for local_name in (
+            "autoFilter",
+            "conditionalFormatting",
+            "dataValidation",
+            "dimension",
+            "hyperlink",
+            "ignoredError",
+            "mergeCell",
+            "protectedRange",
+            "selection",
+            "sortCondition",
+            "sortState",
+        )
+    }
+    for element in root.iter():
+        for attribute in element.attrib:
+            attribute_name = etree.QName(attribute)
+            if attribute_name.localname not in {"ref", "sqref"}:
+                continue
+            if attribute_name.namespace is not None or element.tag not in known_reference_nodes:
+                raise _error(
+                    "UNSAFE_REFERENCE",
+                    "工作表包含未支持的引用结构",
+                    etree.QName(element).localname,
+                )
 
 
 def _clear_value_children(cell: etree._Element) -> None:
@@ -496,11 +641,13 @@ def transform_sheet_xml(
     root = _xml_root(sheet_xml, "worksheet")
     if root.tag != f"{{{MAIN_NS}}}worksheet":
         raise _error("INVALID_XML", "工作表 XML 根节点无效", "worksheet")
+    _validate_reference_qnames(root)
     sheet_data = root.find(f"{{{MAIN_NS}}}sheetData")
     if sheet_data is None:
         raise _error("TEMPLATE_VERSION_MISMATCH", "工作表缺少数据区域", "sheetData")
     source_rows = _row_elements(sheet_data)
     _required_rows(parsed, source_rows)
+    _validate_configured_merges(root)
     _validate_configured_targets(source_rows, parsed)
 
     new_rows: list[tuple[int, etree._Element]] = []
@@ -554,12 +701,12 @@ def transform_sheet_xml(
     _write_formula(
         _require_styled_cell(rows, "O10"),
         f"P{total_row}/N{total_row}",
-        _divide_for_cache(totals["P"], totals["N"]),
+        _divide_for_cache(totals["P"], totals["N"], "N"),
     )
     _write_formula(
         _require_styled_cell(rows, "R10"),
         "G9/G10",
-        _divide_for_cache(totals["M"], totals["N"]),
+        _divide_for_cache(totals["M"], totals["N"], "N"),
     )
 
     unknown_fields = set(output_values).difference(STANDARD_V1.value_ranges)
@@ -639,16 +786,31 @@ def transform_sheet_xml(
     for pane in root.xpath("./main:sheetViews/main:sheetView/main:pane", namespaces={"main": MAIN_NS}):
         top_left = pane.get("topLeftCell")
         if top_left:
-            pane.set("topLeftCell", _translate_cell(top_left, transform, top_left))
+            try:
+                translated = _translate_cell(top_left, transform, top_left)
+            except WorkbookError:
+                translated = None
+            if translated != top_left:
+                pane.attrib.pop("topLeftCell", None)
     for selection in root.xpath(
         "./main:sheetViews/main:sheetView/main:selection", namespaces={"main": MAIN_NS}
     ):
         active = selection.get("activeCell")
         if active:
-            selection.set("activeCell", _translate_cell(active, transform, active))
+            try:
+                translated_active = _translate_cell(active, transform, active)
+            except WorkbookError:
+                translated_active = None
+            if translated_active != active:
+                selection.attrib.pop("activeCell", None)
         sqref = selection.get("sqref")
         if sqref:
-            selection.set("sqref", _translate_sqref(sqref, transform, sqref))
+            try:
+                translated_sqref = _translate_sqref(sqref, transform, sqref)
+            except WorkbookError:
+                translated_sqref = None
+            if translated_sqref != sqref:
+                selection.attrib.pop("sqref", None)
     dimension = root.find(f"{{{MAIN_NS}}}dimension")
     if dimension is not None and dimension.get("ref"):
         dimension.set(
@@ -657,25 +819,6 @@ def transform_sheet_xml(
                 dimension.get("ref") or "", transform, "dimension", allow_product_compaction=True
             ),
         )
-    known_reference_nodes = {
-        "autoFilter",
-        "conditionalFormatting",
-        "dataValidation",
-        "dimension",
-        "hyperlink",
-        "ignoredError",
-        "mergeCell",
-        "protectedRange",
-        "selection",
-        "sortCondition",
-        "sortState",
-    }
-    for element in root.xpath(".//*[@ref or @sqref]"):
-        local_name = etree.QName(element).localname
-        if local_name not in known_reference_nodes:
-            raise _error(
-                "UNSAFE_REFERENCE", "工作表包含未支持的引用结构", local_name
-            )
     return _serialize(root)
 
 
