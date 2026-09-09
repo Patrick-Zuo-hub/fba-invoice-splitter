@@ -91,6 +91,9 @@ def test_resolves_configured_sheet_through_workbook_relationship(tmp_path: Path)
     with ZipFile(path) as archive:
         parts = {name: archive.read(name) for name in archive.namelist()}
     parts["xl/worksheets/custom.xml"] = parts.pop("xl/worksheets/sheet1.xml")
+    parts["xl/worksheets/_rels/custom.xml.rels"] = parts.pop(
+        "xl/worksheets/_rels/sheet1.xml.rels"
+    )
     parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
         b"worksheets/sheet1.xml", b"worksheets/../worksheets/custom.xml"
     )

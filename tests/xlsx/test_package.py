@@ -105,6 +105,18 @@ def test_rejects_dangling_or_directory_relationship_targets(tmp_path: Path, targ
     assert error_code(lambda: SafePackage.open(path)) == "MISSING_RELATIONSHIP_TARGET"
 
 
+def test_rejects_relationship_part_without_a_source_part(tmp_path: Path) -> None:
+    path = tmp_path / "missing-relationship-source.xlsx"
+    build_standard_v1(path, {"SYNTHETIC-1": 1}, [])
+    with ZipFile(path, "a", compression=ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "xl/drawings/_rels/nonexistent.xml.rels",
+            b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
+        )
+
+    assert error_code(lambda: SafePackage.open(path)) == "MISSING_RELATIONSHIP_SOURCE"
+
+
 @pytest.mark.parametrize(
     ("attribute", "value"), [("Type", ""), ("Target", ""), ("Type", "worksheet")]
 )

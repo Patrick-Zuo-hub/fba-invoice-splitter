@@ -374,8 +374,17 @@ class SafePackage:
 
     def _validate_relationships(self) -> None:
         for part in self._entries:
-            if not self._canonical_part_name(part).endswith(".rels"):
+            canonical_part = self._canonical_part_name(part)
+            if not canonical_part.endswith(".rels"):
                 continue
+            if canonical_part != "_rels/.rels":
+                source_part = self._source_part_for_relationship_part(canonical_part)
+                if source_part not in self._canonical_entries:
+                    raise WorkbookError(
+                        "MISSING_RELATIONSHIP_SOURCE",
+                        "XLSX 关系部件对应的源部件不存在",
+                        part,
+                    )
             root = self.read_xml(part, MAX_ENTRY)
             relationship_ids: set[str] = set()
             for element in root.iter():

@@ -39,6 +39,12 @@ DRAWING_RELATIONSHIP_TYPES = frozenset(
         "http://purl.oclc.org/ooxml/officedocument/relationships/drawing",
     }
 )
+WORKSHEET_RELATIONSHIP_TYPES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/officedocument/2006/relationships/worksheet",
+        "http://purl.oclc.org/ooxml/officedocument/relationships/worksheet",
+    }
+)
 _MAX_OFFSET = 2_147_483_647
 _SUPPORTED_MEDIA = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
 
@@ -91,6 +97,17 @@ class DrawingInventory:
         object.__setattr__(self, "product_images", tuple(self.product_images))
         object.__setattr__(self, "fixed_images", tuple(self.fixed_images))
         object.__setattr__(self, "relationships", MappingProxyType(dict(self.relationships)))
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedDrawing:
+    drawing_part: str
+    parsed: tuple[tuple[Anchor, str, str], ...]
+    media_by_id: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parsed", tuple(self.parsed))
+        object.__setattr__(self, "media_by_id", MappingProxyType(dict(self.media_by_id)))
 
 
 def _drawing_error(code: str, location: str) -> WorkbookError:
@@ -224,6 +241,54 @@ def _anchor_cell(parent: etree._Element, location: str) -> tuple[int, int, int, 
     return tuple(_integer_child(parent, name, location) for name in ("row", "col", "rowOff", "colOff"))  # type: ignore[return-value]
 
 
+_PIC_XDR_CHILDREN = {
+    "pic": {"nvPicPr", "blipFill", "spPr", "style", "extLst"},
+    "nvPicPr": {"cNvPr", "cNvPicPr", "nvPr", "extLst"},
+    "cNvPr": set(),
+    "cNvPicPr": set(),
+    "nvPr": {"extLst"},
+    "blipFill": set(),
+    "spPr": set(),
+    "style": set(),
+    "extLst": {"ext"},
+    "ext": set(),
+}
+
+
+def _validate_picture_subtree(picture: etree._Element, location: str) -> None:
+    """Reject spreadsheetDrawing objects hidden inside an otherwise valid picture."""
+
+    for element in picture.iter():
+        if not isinstance(element.tag, str) or not element.tag.startswith("{"):
+            continue
+        namespace, _, local_name = element.tag[1:].partition("}")
+        if namespace != XDR_NS:
+            continue
+        allowed_children = _PIC_XDR_CHILDREN.get(local_name)
+        if allowed_children is None:
+            raise _drawing_error("UNSUPPORTED_DRAWING", location)
+        for child in element:
+            if not isinstance(child.tag, str) or not child.tag.startswith("{"):
+                continue
+            child_namespace, _, child_local_name = child.tag[1:].partition("}")
+            if child_namespace == XDR_NS and child_local_name not in allowed_children:
+                raise _drawing_error("UNSUPPORTED_DRAWING", location)
+        if local_name == "nvPicPr":
+            xdr_children = [
+                child.tag[1:].partition("}")[2]
+                for child in element
+                if isinstance(child.tag, str)
+                and child.tag.startswith("{")
+                and child.tag[1:].partition("}")[0] == XDR_NS
+            ]
+            if (
+                xdr_children[:2] != ["cNvPr", "cNvPicPr"]
+                or xdr_children.count("cNvPr") != 1
+                or xdr_children.count("cNvPicPr") != 1
+            ):
+                raise _drawing_error("INVALID_DRAWING", location)
+
+
 def _parse_anchor(anchor_element: etree._Element, drawing_part: str, number: int) -> tuple[Anchor, str, str]:
     location = f"{drawing_part}:anchor-{number}"
     expected = [
@@ -240,6 +305,7 @@ def _parse_anchor(anchor_element: etree._Element, drawing_part: str, number: int
     from_row, from_col, from_row_off, from_col_off = _anchor_cell(anchor_element[0], location)
     to_row, to_col, to_row_off, to_col_off = _anchor_cell(anchor_element[1], location)
     picture = anchor_element[2]
+    _validate_picture_subtree(picture, location)
     picture_children = [child.tag for child in picture]
     required_picture_children = [
         f"{{{XDR_NS}}}nvPicPr",
@@ -330,73 +396,85 @@ def _contains_alternate_content(root: etree._Element) -> bool:
     return any(element.tag == f"{{{MC_NS}}}AlternateContent" for element in root.iter())
 
 
-def _all_image_relationship_targets(package: SafePackage) -> set[str]:
-    targets: set[str] = set()
-    for relationship_part in package.names:
-        if not relationship_part.lower().endswith(".rels"):
-            continue
-        try:
-            root = package.read_xml(relationship_part, MAX_ENTRY)
-        except WorkbookError as exc:
-            raise _drawing_error("INVALID_DRAWING", relationship_part) from exc
-        if root.tag != f"{{{PACKAGE_REL_NS}}}Relationships":
-            raise _drawing_error("INVALID_DRAWING", relationship_part)
-        for relation in root:
-            if relation.tag != f"{{{PACKAGE_REL_NS}}}Relationship":
-                raise _drawing_error("INVALID_DRAWING", relationship_part)
-            if relation.get("Type", "").lower() not in IMAGE_RELATIONSHIP_TYPES:
-                continue
-            target = relation.get("Target")
-            if not target:
-                raise _drawing_error("INVALID_DRAWING", relationship_part)
-            try:
-                targets.add(package.resolve_relationship_part_target(relationship_part, target))
-            except WorkbookError as exc:
-                raise _drawing_error("INVALID_DRAWING", relationship_part) from exc
-    return targets
+def _worksheet_drawing_parts(
+    package: SafePackage,
+) -> list[tuple[str, str, str]]:
+    """Return every drawing declared by every workbook worksheet."""
 
-
-def _parse_inventory(package: SafePackage, parsed_bundle: ParsedBundle) -> DrawingInventory:
-    worksheet_part, worksheet = _worksheet_part(package, _workbook_relationships(package))
-    if _contains_alternate_content(worksheet):
-        raise _drawing_error("UNSUPPORTED_DRAWING", worksheet_part)
-    drawing_elements = worksheet.findall(f"{{{MAIN_NS}}}drawing")
-    worksheet_relations = _relationships_optional(package, worksheet_part, worksheet_part, required=False)
-    worksheet_drawing_relations = [
-        relation
-        for relation in worksheet_relations
-        if relation.get("Type", "").lower() in DRAWING_RELATIONSHIP_TYPES
-    ]
-    if not drawing_elements:
-        if worksheet_drawing_relations:
-            raise _drawing_error("INVALID_DRAWING", worksheet_part)
-        return _empty_inventory()
-    if len(drawing_elements) != 1:
-        raise _drawing_error("INVALID_DRAWING", worksheet_part)
-    if len(worksheet_drawing_relations) != 1:
-        raise _drawing_error("INVALID_DRAWING", worksheet_part)
-    drawing_id = drawing_elements[0].get(f"{{{OFFICE_REL_NS}}}id")
-    if not drawing_id:
-        raise _drawing_error("INVALID_DRAWING", worksheet_part)
-    drawing_relation = _unique_relationship(
-        worksheet_relations, drawing_id, DRAWING_RELATIONSHIP_TYPES, worksheet_part
-    )
-    if drawing_relation is not worksheet_drawing_relations[0]:
-        raise _drawing_error("INVALID_DRAWING", worksheet_part)
-    target = drawing_relation.get("Target")
-    if not target:
-        raise _drawing_error("INVALID_DRAWING", worksheet_part)
     try:
-        drawing_part = package.resolve_relationship_target(worksheet_part, target)
-        drawing = package.read_xml(drawing_part, MAX_ENTRY)
+        workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
+        workbook_relations = _relationships(package, "xl/workbook.xml", "xl/workbook.xml")
     except WorkbookError as exc:
-        raise _drawing_error("INVALID_DRAWING", worksheet_part) from exc
+        raise _drawing_error("INVALID_DRAWING", "xl/workbook.xml") from exc
+    if workbook.tag != f"{{{MAIN_NS}}}workbook":
+        raise _drawing_error("INVALID_DRAWING", "xl/workbook.xml")
+    sheets = workbook.findall(f"{{{MAIN_NS}}}sheets/{{{MAIN_NS}}}sheet")
+    records: list[tuple[str, str, str]] = []
+    for sheet in sheets:
+        relationship_id = sheet.get(f"{{{OFFICE_REL_NS}}}id")
+        if not relationship_id:
+            raise _drawing_error("INVALID_DRAWING", "xl/workbook.xml")
+        worksheet_relation = _unique_relationship(
+            workbook_relations, relationship_id, WORKSHEET_RELATIONSHIP_TYPES, "xl/workbook.xml"
+        )
+        target = worksheet_relation.get("Target")
+        if not target:
+            raise _drawing_error("INVALID_DRAWING", "xl/workbook.xml")
+        try:
+            worksheet_part = package.resolve_relationship_target("xl/workbook.xml", target)
+            worksheet = package.read_xml(worksheet_part, MAX_ENTRY)
+        except WorkbookError as exc:
+            raise _drawing_error("INVALID_DRAWING", "xl/workbook.xml") from exc
+        if worksheet.tag != f"{{{MAIN_NS}}}worksheet":
+            raise _drawing_error("INVALID_DRAWING", worksheet_part)
+        if _contains_alternate_content(worksheet):
+            raise _drawing_error("UNSUPPORTED_DRAWING", worksheet_part)
+
+        drawing_elements = worksheet.findall(f"{{{MAIN_NS}}}drawing")
+        worksheet_relations = _relationships_optional(
+            package, worksheet_part, worksheet_part, required=False
+        )
+        drawing_relations = [
+            relation
+            for relation in worksheet_relations
+            if relation.get("Type", "").lower() in DRAWING_RELATIONSHIP_TYPES
+        ]
+        if not drawing_elements:
+            if drawing_relations:
+                raise _drawing_error("INVALID_DRAWING", worksheet_part)
+            continue
+        if len(drawing_elements) != 1 or len(drawing_relations) != 1:
+            raise _drawing_error("INVALID_DRAWING", worksheet_part)
+        drawing_id = drawing_elements[0].get(f"{{{OFFICE_REL_NS}}}id")
+        if not drawing_id:
+            raise _drawing_error("INVALID_DRAWING", worksheet_part)
+        drawing_relation = _unique_relationship(
+            worksheet_relations, drawing_id, DRAWING_RELATIONSHIP_TYPES, worksheet_part
+        )
+        if drawing_relation is not drawing_relations[0]:
+            raise _drawing_error("INVALID_DRAWING", worksheet_part)
+        target = drawing_relation.get("Target")
+        if not target:
+            raise _drawing_error("INVALID_DRAWING", worksheet_part)
+        try:
+            drawing_part = package.resolve_relationship_target(worksheet_part, target)
+        except WorkbookError as exc:
+            raise _drawing_error("INVALID_DRAWING", worksheet_part) from exc
+        records.append((worksheet_part, drawing_id, drawing_part))
+    return records
+
+
+def _parse_drawing_part(package: SafePackage, drawing_part: str) -> _ParsedDrawing:
     try:
         drawing_content_type = package.content_type_for_part(drawing_part)
     except WorkbookError as exc:
         raise _drawing_error("INVALID_DRAWING", drawing_part) from exc
     if drawing_content_type != DRAWING_CONTENT_TYPE:
         raise _drawing_error("INVALID_DRAWING", drawing_part)
+    try:
+        drawing = package.read_xml(drawing_part, MAX_ENTRY)
+    except WorkbookError as exc:
+        raise _drawing_error("INVALID_DRAWING", drawing_part) from exc
     if drawing.tag != f"{{{XDR_NS}}}wsDr":
         raise _drawing_error("UNSUPPORTED_DRAWING", drawing_part)
     if _contains_alternate_content(drawing):
@@ -445,11 +523,34 @@ def _parse_inventory(package: SafePackage, parsed_bundle: ParsedBundle) -> Drawi
         if media_part in media_by_id.values():
             raise _drawing_error("INVALID_DRAWING", f"{drawing_part}:{relationship_id}")
         media_by_id[relationship_id] = media_part
-    all_media = {name.lower() for name in package.names if name.lower().startswith("xl/media/")}
-    if all_media != {target.lower() for target in _all_image_relationship_targets(package)}:
-        raise _drawing_error("INVALID_DRAWING", drawing_part)
     for media_part in media_by_id.values():
         _validate_media(package, media_part)
+    return _ParsedDrawing(drawing_part, tuple(parsed), media_by_id)
+
+
+def _all_reachable_media(package: SafePackage) -> tuple[dict[str, tuple[str, _ParsedDrawing]], set[str]]:
+    records: dict[str, tuple[str, _ParsedDrawing]] = {}
+    media_parts: set[str] = set()
+    for worksheet_part, drawing_id, drawing_part in _worksheet_drawing_parts(package):
+        parsed_drawing = _parse_drawing_part(package, drawing_part)
+        records[worksheet_part] = (drawing_id, parsed_drawing)
+        media_parts.update(parsed_drawing.media_by_id.values())
+    return records, media_parts
+
+
+def _parse_inventory(package: SafePackage, parsed_bundle: ParsedBundle) -> DrawingInventory:
+    worksheet_part, _ = _worksheet_part(package, _workbook_relationships(package))
+    drawing_records, reachable_media = _all_reachable_media(package)
+    all_media = {name.lower() for name in package.names if name.lower().startswith("xl/media/")}
+    if all_media != {target.lower() for target in reachable_media}:
+        raise _drawing_error("INVALID_DRAWING", worksheet_part)
+    selected = drawing_records.get(worksheet_part)
+    if selected is None:
+        return _empty_inventory()
+    drawing_id, drawing = selected
+    drawing_part = drawing.drawing_part
+    parsed = drawing.parsed
+    media_by_id = drawing.media_by_id
 
     product_images: list[ProductImage] = []
     fixed_images: list[FixedImage] = []
@@ -486,6 +587,10 @@ def parse_workbook_drawings(path: Path | str, parsed_bundle: ParsedBundle) -> Dr
     except WorkbookError as exc:
         if exc.code == "EXTERNAL_RESOURCE":
             raise _drawing_error("UNSUPPORTED_DRAWING", exc.location or "relationship") from exc
-        if exc.code in {"INVALID_RELATIONSHIP", "MISSING_RELATIONSHIP_TARGET"}:
+        if exc.code in {
+            "INVALID_RELATIONSHIP",
+            "MISSING_RELATIONSHIP_SOURCE",
+            "MISSING_RELATIONSHIP_TARGET",
+        }:
             raise _drawing_error("INVALID_DRAWING", exc.location or "relationship") from exc
         raise

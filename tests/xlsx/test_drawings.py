@@ -32,7 +32,7 @@ def _remove_drawing(path: Path) -> None:
         b"",
     )
     for name in tuple(parts):
-        if name.startswith(("xl/drawings/drawing1", "xl/media/")):
+        if name.startswith(("xl/drawings/drawing1", "xl/drawings/_rels/drawing1", "xl/media/")):
             parts.pop(name)
     parts["xl/worksheets/_rels/sheet1.xml.rels"] = parts[
         "xl/worksheets/_rels/sheet1.xml.rels"
@@ -240,6 +240,21 @@ def test_rejects_unknown_direct_picture_child(tmp_path: Path) -> None:
     assert _drawing_error(path, "UNSUPPORTED_DRAWING")
 
 
+@pytest.mark.parametrize("nested_child", [b"<grpSp/>", b"<unknown/>", b"<pic/>"])
+def test_rejects_unknown_xdr_descendants_inside_shape_properties(
+    tmp_path: Path, nested_child: bytes
+) -> None:
+    path = tmp_path / "nested-picture-object.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    _rewrite_part(
+        path,
+        "xl/drawings/drawing1.xml",
+        lambda xml: xml.replace(b"</spPr>", nested_child + b"</spPr>", 1),
+    )
+
+    assert _drawing_error(path, "UNSUPPORTED_DRAWING")
+
+
 def test_accepts_prefixed_worksheet_namespace_for_drawing_lookup(tmp_path: Path) -> None:
     path = tmp_path / "prefixed-worksheet.xlsx"
     build_standard_v1(path, {"S1": 1}, [12])
@@ -360,6 +375,63 @@ def test_rejects_orphaned_media_and_allows_a_workbook_without_a_drawing(tmp_path
 def test_allows_media_referenced_by_another_drawing_part(tmp_path: Path) -> None:
     path = tmp_path / "second-drawing.xlsx"
     build_standard_v1(path, {"S1": 1}, [12])
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["xl/worksheets/sheet2.xml"] = (
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        b'<drawing r:id="rId1"/></worksheet>'
+    )
+    parts["xl/worksheets/_rels/sheet2.xml.rels"] = (
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing2.xml"/>'
+        b"</Relationships>"
+    )
+    parts["xl/drawings/drawing2.xml"] = (
+        b'<wsDr xmlns="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        b'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        b"<twoCellAnchor><from><col>0</col><colOff>0</colOff><row>0</row><rowOff>0</rowOff></from>"
+        b"<to><col>1</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></to>"
+        b'<pic><nvPicPr><cNvPr id="1" name="Other image"/><cNvPicPr/></nvPicPr>'
+        b'<blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></blipFill>'
+        b'<spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></spPr></pic><clientData/></twoCellAnchor>'
+        b"</wsDr>"
+    )
+    parts["xl/drawings/_rels/drawing2.xml.rels"] = (
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image2.png"/>'
+        b"</Relationships>"
+    )
+    parts["xl/media/image2.png"] = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02"
+    )
+    parts["xl/workbook.xml"] = parts["xl/workbook.xml"].replace(
+        b"</sheets>", b'<sheet name="Other" sheetId="2" r:id="rId3"/></sheets>', 1
+    )
+    parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
+        b"</Relationships>",
+        b'<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>',
+        1,
+    )
+    parts["[Content_Types].xml"] = parts["[Content_Types].xml"].replace(
+        b"</Types>",
+        b'<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/drawings/drawing2.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/></Types>',
+        1,
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    assert parse_workbook_drawings(path, parse_invoice_bundle(path)).product_images[0].source_row == 12
+
+
+def test_rejects_unreachable_drawing_image_relationship_from_masking_orphan_media(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unreachable-drawing.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
     with ZipFile(path, "a", compression=ZIP_DEFLATED) as archive:
         archive.writestr(
             "xl/drawings/drawing2.xml",
@@ -377,7 +449,7 @@ def test_allows_media_referenced_by_another_drawing_part(tmp_path: Path) -> None
             b"\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02",
         )
 
-    assert parse_workbook_drawings(path, parse_invoice_bundle(path)).product_images[0].source_row == 12
+    assert _drawing_error(path, "INVALID_DRAWING")
 
 
 @pytest.mark.parametrize("target", ["../media/./image1.png", "/xl/media/image1.png", "../media/IMAGE1.PNG"])
