@@ -57,6 +57,15 @@ _SUPPORTED_MEDIA = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg
 _ASCII_INTEGER = re.compile(r"^[0-9]+$", re.ASCII)
 _CLIENT_DATA_ATTRIBUTES = {"fLocksWithSheet", "fPrintsWithSheet", "fPublished"}
 _BOOLEAN_VALUES = {"0", "1", "false", "true"}
+_PIL_DECODE_ERRORS = (
+    Image.DecompressionBombError,
+    Image.DecompressionBombWarning,
+    OSError,
+    UnidentifiedImageError,
+    SyntaxError,
+    ValueError,
+    struct.error,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -655,30 +664,37 @@ def _validate_media(package: SafePackage, media_part: str) -> None:
 
 def _decodable_media(payload: bytes, suffix: str) -> bool:
     expected_format = "PNG" if suffix == "png" else "JPEG"
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(BytesIO(payload)) as image:
-                if image.format != expected_format:
-                    return False
-                width, height = image.size
-                if width <= 0 or height <= 0 or width * height > _MAX_IMAGE_PIXELS:
-                    return False
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        try:
+            image = Image.open(BytesIO(payload))
+        except _PIL_DECODE_ERRORS:
+            return False
+        with image:
+            if image.format != expected_format:
+                return False
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > _MAX_IMAGE_PIXELS:
+                return False
+            try:
                 image.verify()
-            with Image.open(BytesIO(payload)) as image:
-                if image.format != expected_format:
-                    return False
-                width, height = image.size
-                if width <= 0 or height <= 0 or width * height > _MAX_IMAGE_PIXELS:
-                    return False
+            except _PIL_DECODE_ERRORS:
+                return False
+
+        try:
+            image = Image.open(BytesIO(payload))
+        except _PIL_DECODE_ERRORS:
+            return False
+        with image:
+            if image.format != expected_format:
+                return False
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > _MAX_IMAGE_PIXELS:
+                return False
+            try:
                 image.load()
-    except (
-        Image.DecompressionBombError,
-        Image.DecompressionBombWarning,
-        OSError,
-        UnidentifiedImageError,
-    ):
-        return False
+            except _PIL_DECODE_ERRORS:
+                return False
     return True
 
 

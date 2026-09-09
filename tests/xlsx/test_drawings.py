@@ -687,6 +687,21 @@ def test_rejects_structurally_valid_but_undecodable_media(tmp_path: Path) -> Non
     assert _drawing_error(jpeg, "UNSUPPORTED_DRAWING").location == "xl/media/image1.jpg"
 
 
+def test_rejects_png_ztxt_decompression_bomb(tmp_path: Path) -> None:
+    path = tmp_path / "png-ztxt-bomb.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    payload = _pillow_image_bytes("PNG")
+    ihdr_end = 8 + 12 + 13
+    ztxt = _png_chunk(
+        b"zTXt",
+        b"comment\x00\x00" + zlib.compress(b"x" * 1_048_577),
+    )
+    payload = payload[:ihdr_end] + ztxt + payload[ihdr_end:]
+    _rewrite_part(path, "xl/media/image1.png", lambda _: payload)
+
+    assert _drawing_error(path, "UNSUPPORTED_DRAWING").location == "xl/media/image1.png"
+
+
 def test_content_types_are_read_once_and_rejected_after_package_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
