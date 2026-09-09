@@ -25,6 +25,12 @@ _A_TO_Z = frozenset(_COLUMNS)
 _CELL_REFERENCE = re.compile(r"^([A-Z]{1,3})([1-9][0-9]{0,6})$", re.ASCII)
 _ROW_NUMBER = re.compile(r"^[1-9][0-9]{0,6}$", re.ASCII)
 _SHEET_ID = re.compile(r"^[1-9][0-9]{0,9}$", re.ASCII)
+_WORKSHEET_RELATIONSHIP_TYPES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/officedocument/2006/relationships/worksheet",
+        "http://purl.oclc.org/ooxml/officedocument/relationships/worksheet",
+    }
+)
 _REQUIRED_HEADERS = (
     "货件编号SHIPMENT ID\n(亚马逊货物必填）\n不可合并",
     "跟踪编号\nREFERENCE ID\n(亚马逊货物必填）\n不可合并",
@@ -171,10 +177,13 @@ def _workbook_relationships(package: SafePackage) -> etree._Element:
     return package.read_xml("xl/_rels/workbook.xml.rels", MAX_ENTRY)
 
 
-def _validate_workbook_sheets(sheets: list[etree._Element]) -> None:
+def _validate_workbook_sheets(
+    package: SafePackage, sheets: list[etree._Element], relationships: etree._Element
+) -> None:
     names: set[str] = set()
     sheet_ids: set[str] = set()
     relationship_ids: set[str] = set()
+    sheet_relationship_ids: list[str] = []
     for sheet in sheets:
         name = sheet.get("name")
         sheet_id = sheet.get("sheetId")
@@ -193,12 +202,35 @@ def _validate_workbook_sheets(sheets: list[etree._Element]) -> None:
         names.add(name.casefold())
         sheet_ids.add(sheet_id)
         relationship_ids.add(relationship_id)
+        sheet_relationship_ids.append(relationship_id)
+
+    relationships_by_id = {
+        relationship.get("Id"): relationship
+        for relationship in relationships.xpath(
+            "./pkg:Relationship", namespaces={"pkg": PACKAGE_REL_NS}
+        )
+    }
+    for relationship_id in sheet_relationship_ids:
+        relationship = relationships_by_id.get(relationship_id)
+        if relationship is None or relationship.get("Type", "").lower() not in _WORKSHEET_RELATIONSHIP_TYPES:
+            raise _template_error("xl/workbook.xml")
+        target = relationship.get("Target")
+        if not target:
+            raise _template_error("xl/workbook.xml")
+        try:
+            worksheet = package.read_xml(
+                package.resolve_relationship_target("xl/workbook.xml", target), MAX_ENTRY
+            )
+        except WorkbookError as exc:
+            raise _template_error("xl/workbook.xml") from exc
+        if worksheet.tag != f"{{{MAIN_NS}}}worksheet":
+            raise _template_error("xl/workbook.xml")
 
 
 def _worksheet_part(package: SafePackage, relationships: etree._Element) -> str:
     workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
     sheets = workbook.xpath("./main:sheets/main:sheet", namespaces={"main": MAIN_NS})
-    _validate_workbook_sheets(sheets)
+    _validate_workbook_sheets(package, sheets, relationships)
     matched = [sheet for sheet in sheets if sheet.get("name") == STANDARD_V1.sheet_name]
     if len(matched) != 1:
         raise _template_error("xl/workbook.xml")

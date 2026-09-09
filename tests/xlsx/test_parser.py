@@ -134,6 +134,24 @@ def test_rejects_invalid_metadata_on_unselected_workbook_sheets(
     assert _template_error(path).location == "xl/workbook.xml"
 
 
+@pytest.mark.parametrize("relationship_id", ["rId99", "rId2"])
+def test_rejects_missing_or_non_worksheet_relation_on_unselected_sheet(
+    tmp_path: Path, relationship_id: str
+) -> None:
+    path = tmp_path / "invalid-unselected-sheet-relation.xlsx"
+    build_standard_v1(path, {"S1": 1}, [])
+    _rewrite_part(
+        path,
+        "xl/workbook.xml",
+        lambda xml: xml.replace(
+            b"</sheets>",
+            f'<sheet name="Other" sheetId="2" r:id="{relationship_id}"/></sheets>'.encode(),
+        ),
+    )
+
+    assert _template_error(path).location == "xl/workbook.xml"
+
+
 def test_parses_configured_worksheet_stored_at_package_root(tmp_path: Path) -> None:
     path = tmp_path / "root-worksheet.xlsx"
     build_standard_v1(path, {"S1": 1}, [])

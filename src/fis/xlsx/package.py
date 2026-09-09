@@ -343,9 +343,24 @@ class SafePackage:
                         "INVALID_RELATIONSHIP", "XLSX 关系缺少或重复 Id", f"{part}:{relationship_id or 'Id'}"
                     )
                 relationship_ids.add(relationship_id)
-                relation_type = (element.get("Type") or "").lower()
-                target = element.get("Target") or ""
-                location = target or part
+                relationship_type = element.get("Type")
+                target = element.get("Target")
+                location = f"{part}:{relationship_id}"
+                try:
+                    relationship_uri = (
+                        urlsplit(relationship_type) if relationship_type is not None else None
+                    )
+                except ValueError:
+                    relationship_uri = None
+                if (
+                    not relationship_type
+                    or not target
+                    or any(character.isspace() or ord(character) < 32 for character in relationship_type)
+                    or relationship_uri is None
+                    or not relationship_uri.scheme
+                ):
+                    raise WorkbookError("INVALID_RELATIONSHIP", "XLSX 关系缺少或无效字段", location)
+                relation_type = relationship_type.lower()
                 if (element.get("TargetMode") or "").lower() == "external":
                     raise WorkbookError(
                         "EXTERNAL_RESOURCE", "V1 不支持外部链接或外部资源", location

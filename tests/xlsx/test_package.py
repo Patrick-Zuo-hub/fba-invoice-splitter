@@ -105,6 +105,34 @@ def test_rejects_dangling_or_directory_relationship_targets(tmp_path: Path, targ
     assert error_code(lambda: SafePackage.open(path)) == "MISSING_RELATIONSHIP_TARGET"
 
 
+@pytest.mark.parametrize(
+    ("attribute", "value"), [("Type", ""), ("Target", ""), ("Type", "worksheet")]
+)
+def test_rejects_missing_or_non_absolute_relationship_contract_fields(
+    tmp_path: Path, attribute: str, value: str
+) -> None:
+    path = tmp_path / "invalid-relationship-contract.xlsx"
+    build_standard_v1(path, {"SYNTHETIC-1": 1}, [])
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    original = b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"'
+    replacement = (
+        b'Type="" Target="styles.xml"'
+        if attribute == "Type" and not value
+        else b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target=""'
+        if attribute == "Target"
+        else b'Type="worksheet" Target="styles.xml"'
+    )
+    parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
+        original, replacement
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    assert error_code(lambda: SafePackage.open(path)) == "INVALID_RELATIONSHIP"
+
+
 def test_requires_an_existing_xlsx_file(tmp_path: Path) -> None:
     assert error_code(lambda: SafePackage.open(tmp_path / "missing.xlsx")) == "INVALID_PATH"
     assert error_code(lambda: SafePackage.open(tmp_path)) == "INVALID_PATH"
@@ -217,7 +245,7 @@ def test_rejects_macro_parts_content_types_and_relationships(
     [
         (
             "xl/_rels/workbook.xml.rels",
-            b"<Relationships><Relationship Id='rId1' Type='image' Target='https://example.test/a.png' TargetMode='External'/></Relationships>",
+            b"<Relationships><Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='https://example.test/a.png' TargetMode='External'/></Relationships>",
             "EXTERNAL_RESOURCE",
         ),
         ("xl/embeddings/oleObject1.bin", b"ole", "OLE_UNSUPPORTED"),
@@ -408,7 +436,7 @@ def test_opc_part_names_are_case_insensitive_for_core_and_duplicates(tmp_path: P
 def test_rejects_unsafe_internal_relationship_targets(tmp_path: Path, target: str) -> None:
     parts = dict(CORE_PARTS)
     parts["xl/_rels/workbook.xml.rels"] = (
-        "<Relationships><Relationship Id='rId1' Type='worksheet' "
+        "<Relationships><Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet' "
         f"Target='{target}'/></Relationships>"
     ).encode()
 
@@ -424,7 +452,7 @@ def test_rejects_excessive_percent_decode_rounds_without_unbounded_work(tmp_path
     target = "%25" + "25" * 15_000
     parts = dict(CORE_PARTS)
     parts["xl/_rels/workbook.xml.rels"] = (
-        "<Relationships><Relationship Id='rId1' Type='worksheet' "
+        "<Relationships><Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet' "
         f"Target='{target}'/></Relationships>"
     ).encode()
 
@@ -440,7 +468,7 @@ def test_relationship_files_allow_harmless_comments_and_processing_instructions(
     parts = dict(CORE_PARTS)
     parts["_rels/.rels"] = (
         b"<Relationships><!-- harmless --><?audit generated?><Relationship "
-        b"Id='rId1' Type='officeDocument' Target='xl/workbook.xml'/></Relationships>"
+        b"Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument' Target='xl/workbook.xml'/></Relationships>"
     )
 
     with SafePackage.open(write_package(tmp_path / "commented-rels.xlsx", parts)):
@@ -451,7 +479,7 @@ def test_allows_package_root_relative_internal_relationship_target(tmp_path: Pat
     parts = dict(CORE_PARTS)
     parts["xl/worksheets/sheet1.xml"] = b"<worksheet/>"
     parts["_rels/.rels"] = (
-        b"<Relationships><Relationship Id='rId1' Type='worksheet' "
+        b"<Relationships><Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet' "
         b"Target='/xl/worksheets/sheet1.xml'/></Relationships>"
     )
 
