@@ -44,6 +44,7 @@ _MAX_DECIMAL_TEXT = 128
 _MAX_SIGNIFICANT_DIGITS = 15
 _MIN_EXCEL_EXPONENT = -307
 _MAX_EXCEL_EXPONENT = 307
+_ALLOWLISTED_BROKEN_VALIDATION_SQREF = "O4:P4 R5:S5"
 
 
 def _error(code: str, message: str, location: str | None = None) -> WorkbookError:
@@ -524,29 +525,65 @@ def _validate_configured_merges(root: etree._Element) -> None:
                 )
 
 
-def _validate_reference_qnames(root: etree._Element) -> None:
-    known_reference_nodes = {
-        f"{{{MAIN_NS}}}{local_name}"
-        for local_name in (
-            "autoFilter",
-            "conditionalFormatting",
-            "dataValidation",
-            "dimension",
-            "hyperlink",
-            "ignoredError",
-            "mergeCell",
-            "protectedRange",
-            "selection",
-            "sortCondition",
-            "sortState",
-        )
-    }
+def _main(local_name: str) -> str:
+    return f"{{{MAIN_NS}}}{local_name}"
+
+
+_REFERENCE_PATHS: dict[str, tuple[str, tuple[str, ...]]] = {
+    _main("dimension"): ("ref", (_main("worksheet"),)),
+    _main("mergeCell"): ("ref", (_main("mergeCells"), _main("worksheet"))),
+    _main("dataValidation"): (
+        "sqref",
+        (_main("dataValidations"), _main("worksheet")),
+    ),
+    _main("hyperlink"): ("ref", (_main("hyperlinks"), _main("worksheet"))),
+    _main("conditionalFormatting"): ("sqref", (_main("worksheet"),)),
+    _main("autoFilter"): ("ref", (_main("worksheet"),)),
+    _main("sortState"): ("ref", (_main("autoFilter"), _main("worksheet"))),
+    _main("sortCondition"): (
+        "ref",
+        (_main("sortState"), _main("autoFilter"), _main("worksheet")),
+    ),
+    _main("ignoredError"): (
+        "sqref",
+        (_main("ignoredErrors"), _main("worksheet")),
+    ),
+    _main("protectedRange"): (
+        "sqref",
+        (_main("protectedRanges"), _main("worksheet")),
+    ),
+    _main("selection"): (
+        "sqref",
+        (_main("sheetView"), _main("sheetViews"), _main("worksheet")),
+    ),
+}
+
+
+def _has_parent_path(element: etree._Element, expected: tuple[str, ...]) -> bool:
+    parent = element.getparent()
+    for tag in expected:
+        if parent is None or parent.tag != tag:
+            return False
+        parent = parent.getparent()
+    return True
+
+
+def _validate_reference_qnames(
+    root: etree._Element, processed: set[etree._Element] | None = None
+) -> None:
     for element in root.iter():
         for attribute in element.attrib:
             attribute_name = etree.QName(attribute)
             if attribute_name.localname not in {"ref", "sqref"}:
                 continue
-            if attribute_name.namespace is not None or element.tag not in known_reference_nodes:
+            contract = _REFERENCE_PATHS.get(element.tag)
+            if (
+                attribute_name.namespace is not None
+                or contract is None
+                or attribute_name.localname != contract[0]
+                or not _has_parent_path(element, contract[1])
+                or (processed is not None and element not in processed)
+            ):
                 raise _error(
                     "UNSAFE_REFERENCE",
                     "工作表包含未支持的引用结构",
@@ -626,6 +663,19 @@ def _required_rows(parsed: ParsedBundle, rows: Mapping[int, etree._Element]) -> 
             raise _error("TEMPLATE_VERSION_MISMATCH", "工作表缺少必要行", f"row {number}")
 
 
+def _is_allowlisted_broken_validation(validation: etree._Element) -> bool:
+    children = list(validation)
+    return (
+        validation.get("type") == "list"
+        and validation.get("sqref") == _ALLOWLISTED_BROKEN_VALIDATION_SQREF
+        and len(children) == 1
+        and children[0].tag == f"{{{MAIN_NS}}}formula1"
+        and not children[0].attrib
+        and len(children[0]) == 0
+        and children[0].text == "#REF!"
+    )
+
+
 def transform_sheet_xml(
     sheet_xml: bytes,
     parsed: ParsedBundle,
@@ -642,6 +692,7 @@ def transform_sheet_xml(
     if root.tag != f"{{{MAIN_NS}}}worksheet":
         raise _error("INVALID_XML", "工作表 XML 根节点无效", "worksheet")
     _validate_reference_qnames(root)
+    processed_reference_nodes: set[etree._Element] = set()
     sheet_data = root.find(f"{{{MAIN_NS}}}sheetData")
     if sheet_data is None:
         raise _error("TEMPLATE_VERSION_MISMATCH", "工作表缺少数据区域", "sheetData")
@@ -725,14 +776,27 @@ def transform_sheet_xml(
         if reference is None:
             raise _error("UNSAFE_REFERENCE", "合并区域缺少引用", "mergeCell")
         merge.set("ref", _translate_range(reference, transform, reference))
+        processed_reference_nodes.add(merge)
     for validation in root.xpath(
         "./main:dataValidations/main:dataValidation", namespaces={"main": MAIN_NS}
     ):
         sqref = validation.get("sqref")
         if sqref is None:
             raise _error("UNSAFE_REFERENCE", "数据验证缺少引用", "dataValidation")
+        allowlisted_broken_formula = _is_allowlisted_broken_validation(validation)
+        formula_children = list(validation)
+        allowed_formula_tags = {f"{{{MAIN_NS}}}formula1", f"{{{MAIN_NS}}}formula2"}
+        if (
+            any(child.tag not in allowed_formula_tags for child in formula_children)
+            or sum(child.tag == f"{{{MAIN_NS}}}formula1" for child in formula_children) > 1
+            or sum(child.tag == f"{{{MAIN_NS}}}formula2" for child in formula_children) > 1
+        ):
+            raise _error("UNSAFE_REFERENCE", "数据验证公式结构不受支持", sqref)
         validation.set("sqref", _translate_sqref(sqref, transform, sqref))
+        processed_reference_nodes.add(validation)
         for formula in validation.xpath("./main:formula1 | ./main:formula2", namespaces={"main": MAIN_NS}):
+            if allowlisted_broken_formula:
+                continue
             _assert_formula_unaffected(
                 formula.text or "",
                 transform,
@@ -746,6 +810,7 @@ def transform_sheet_xml(
         if reference is None:
             raise _error("UNSAFE_REFERENCE", "超链接缺少引用", "hyperlink")
         hyperlink.set("ref", _translate_range(reference, transform, reference))
+        processed_reference_nodes.add(hyperlink)
     for conditional in root.xpath(
         "./main:conditionalFormatting", namespaces={"main": MAIN_NS}
     ):
@@ -753,6 +818,7 @@ def transform_sheet_xml(
         if sqref is None:
             raise _error("UNSAFE_REFERENCE", "条件格式缺少引用", "conditionalFormatting")
         conditional.set("sqref", _translate_sqref(sqref, transform, sqref))
+        processed_reference_nodes.add(conditional)
         for formula in conditional.xpath(
             ".//main:cfRule/main:formula", namespaces={"main": MAIN_NS}
         ):
@@ -775,6 +841,7 @@ def transform_sheet_xml(
                 reference, transform, reference, allow_product_compaction=True
             ),
         )
+        processed_reference_nodes.add(element)
     for element in root.xpath(
         "./main:ignoredErrors/main:ignoredError | ./main:protectedRanges/main:protectedRange",
         namespaces={"main": MAIN_NS},
@@ -783,6 +850,7 @@ def transform_sheet_xml(
         if sqref is None:
             raise _error("UNSAFE_REFERENCE", "工作表区域缺少引用", "sqref")
         element.set("sqref", _translate_sqref(sqref, transform, sqref))
+        processed_reference_nodes.add(element)
     for pane in root.xpath("./main:sheetViews/main:sheetView/main:pane", namespaces={"main": MAIN_NS}):
         top_left = pane.get("topLeftCell")
         if top_left:
@@ -805,6 +873,7 @@ def transform_sheet_xml(
                 selection.attrib.pop("activeCell", None)
         sqref = selection.get("sqref")
         if sqref:
+            processed_reference_nodes.add(selection)
             try:
                 translated_sqref = _translate_sqref(sqref, transform, sqref)
             except WorkbookError:
@@ -813,12 +882,14 @@ def transform_sheet_xml(
                 selection.attrib.pop("sqref", None)
     dimension = root.find(f"{{{MAIN_NS}}}dimension")
     if dimension is not None and dimension.get("ref"):
+        processed_reference_nodes.add(dimension)
         dimension.set(
             "ref",
             _translate_range(
                 dimension.get("ref") or "", transform, "dimension", allow_product_compaction=True
             ),
         )
+    _validate_reference_qnames(root, processed_reference_nodes)
     return _serialize(root)
 
 

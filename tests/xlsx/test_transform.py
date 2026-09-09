@@ -522,6 +522,87 @@ def test_sheet_transform_updates_conditional_format_and_auto_filter_ranges() -> 
     ) == "A11:Z13"
 
 
+def test_sheet_transform_preserves_only_the_exact_v1_broken_list_validation() -> None:
+    root = _parsed_xml(_worksheet())
+    validations = root.find(f"{{{MAIN_NS}}}dataValidations")
+    assert validations is not None
+    anomaly = etree.SubElement(
+        validations,
+        f"{{{MAIN_NS}}}dataValidation",
+        type="list",
+        sqref="O4:P4 R5:S5",
+    )
+    etree.SubElement(anomaly, f"{{{MAIN_NS}}}formula1").text = "#REF!"
+
+    output = _parsed_xml(transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {}))
+
+    preserved = output.xpath(
+        "./main:dataValidations/main:dataValidation[@sqref='O4:P4 R5:S5']",
+        namespaces={"main": MAIN_NS},
+    )
+    assert len(preserved) == 1
+    assert preserved[0].xpath("string(main:formula1)", namespaces={"main": MAIN_NS}) == "#REF!"
+
+
+@pytest.mark.parametrize(
+    ("sqref", "formula1", "add_formula2"),
+    [
+        ("O4:P4 R5:S5 A1", "#REF!", False),
+        ("O4:P4  R5:S5", "#REF!", False),
+        ("O4:P4 R5:S5", " #REF!", False),
+        ("O4:P4 R5:S5", "#ref!", False),
+        ("O4:P4 R5:S5", "#REF!", True),
+    ],
+)
+def test_v1_broken_validation_allowlist_is_exact_and_narrow(
+    sqref: str, formula1: str, add_formula2: bool
+) -> None:
+    root = _parsed_xml(_worksheet())
+    validations = root.find(f"{{{MAIN_NS}}}dataValidations")
+    assert validations is not None
+    anomaly = etree.SubElement(
+        validations, f"{{{MAIN_NS}}}dataValidation", type="list", sqref=sqref
+    )
+    etree.SubElement(anomaly, f"{{{MAIN_NS}}}formula1").text = formula1
+    if add_formula2:
+        etree.SubElement(anomaly, f"{{{MAIN_NS}}}formula2").text = "1"
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code in {"UNSAFE_FORMULA_TRANSFORM", "UNSAFE_REFERENCE"}
+
+
+@pytest.mark.parametrize("misplaced_tag", ["mergeCell", "hyperlink", "dataValidation"])
+def test_known_reference_qname_is_blocked_outside_its_supported_structure_path(
+    misplaced_tag: str,
+) -> None:
+    root = _parsed_xml(_worksheet())
+    extensions = etree.SubElement(root, f"{{{MAIN_NS}}}extLst")
+    extension = etree.SubElement(extensions, f"{{{MAIN_NS}}}ext", uri="synthetic")
+    attribute = "sqref" if misplaced_tag == "dataValidation" else "ref"
+    etree.SubElement(
+        extension,
+        f"{{{MAIN_NS}}}{misplaced_tag}",
+        **{attribute: "A14"},
+    )
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "UNSAFE_REFERENCE"
+
+
+def test_reference_node_on_valid_path_must_be_the_instance_actually_processed() -> None:
+    root = _parsed_xml(_worksheet())
+    etree.SubElement(root, f"{{{MAIN_NS}}}dimension", ref="A1:Z20")
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "UNSAFE_REFERENCE"
+
+
 def test_sheet_transform_rejects_reference_to_removed_row() -> None:
     root = _parsed_xml(_worksheet())
     merge = root.xpath("./main:mergeCells/main:mergeCell", namespaces={"main": MAIN_NS})[-1]

@@ -262,6 +262,15 @@ def _worksheet(shipment_rows: list[tuple[int, str, int]], total_row: int) -> byt
     for cell_range in STANDARD_V1.value_ranges.values():
         _element(merge_cells, "mergeCell", ref=cell_range)
 
+    validations = _element(root, "dataValidations", count="1")
+    broken_list = _element(
+        validations,
+        "dataValidation",
+        type="list",
+        sqref="O4:P4 R5:S5",
+    )
+    _element(broken_list, "formula1").text = "#REF!"
+
     drawing = _element(root, "drawing")
     drawing.set(f"{{{REL_NS}}}id", "rId1")
     legacy = _element(root, "legacyDrawing")
