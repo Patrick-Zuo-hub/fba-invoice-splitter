@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+import struct
+import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -47,6 +50,9 @@ WORKSHEET_RELATIONSHIP_TYPES = frozenset(
 )
 _MAX_OFFSET = 2_147_483_647
 _SUPPORTED_MEDIA = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
+_ASCII_INTEGER = re.compile(r"^[0-9]+$", re.ASCII)
+_CLIENT_DATA_ATTRIBUTES = {"fLocksWithSheet", "fPrintsWithSheet", "fPublished"}
+_BOOLEAN_VALUES = {"0", "1", "false", "true"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +178,18 @@ def classify_anchor(
         raise ValueError("product_rows must contain positive row numbers")
 
     source_row = anchor.from_row + 1
+    if any(
+        offset != 0
+        for offset in (
+            anchor.from_row_off,
+            anchor.from_col_off,
+            anchor.to_row_off,
+            anchor.to_col_off,
+        )
+    ):
+        if source_row in product_row_set or any(row in product_row_set for row in _anchor_rows(anchor)):
+            raise _drawing_error("AMBIGUOUS_IMAGE", location)
+        raise _drawing_error("INVALID_DRAWING", location)
     if source_row in product_row_set:
         if anchor.from_col + 1 != image_column:
             raise _drawing_error("AMBIGUOUS_IMAGE", location)
@@ -225,16 +243,21 @@ def _integer_child(parent: etree._Element, name: str, location: str) -> int:
     values = parent.findall(f"{{{XDR_NS}}}{name}")
     if len(values) != 1 or values[0].text is None:
         raise _drawing_error("INVALID_DRAWING", location)
+    value_element = values[0]
+    if value_element.attrib or len(value_element) != 0 or not _ASCII_INTEGER.fullmatch(value_element.text):
+        raise _drawing_error("INVALID_DRAWING", location)
     try:
-        value = int(values[0].text)
+        value = int(value_element.text)
     except ValueError as exc:
         raise _drawing_error("INVALID_DRAWING", location) from exc
-    if str(value) != values[0].text or value < 0:
+    if str(value) != value_element.text or value < 0:
         raise _drawing_error("INVALID_DRAWING", location)
     return value
 
 
 def _anchor_cell(parent: etree._Element, location: str) -> tuple[int, int, int, int]:
+    if parent.attrib or (parent.text and parent.text.strip()):
+        raise _drawing_error("INVALID_DRAWING", location)
     expected = [f"{{{XDR_NS}}}{name}" for name in ("col", "colOff", "row", "rowOff")]
     if [child.tag for child in parent] != expected:
         raise _drawing_error("INVALID_DRAWING", location)
@@ -522,6 +545,10 @@ def _validate_picture_subtree(picture: etree._Element, location: str) -> None:
 
 def _parse_anchor(anchor_element: etree._Element, drawing_part: str, number: int) -> tuple[Anchor, str, str]:
     location = f"{drawing_part}:anchor-{number}"
+    if set(anchor_element.attrib) - {"editAs"}:
+        raise _drawing_error("INVALID_DRAWING", location)
+    if anchor_element.get("editAs") not in {None, "oneCell", "twoCell", "absolute"}:
+        raise _drawing_error("INVALID_DRAWING", location)
     expected = [
         f"{{{XDR_NS}}}from",
         f"{{{XDR_NS}}}to",
@@ -535,6 +562,12 @@ def _parse_anchor(anchor_element: etree._Element, drawing_part: str, number: int
         raise _drawing_error("INVALID_DRAWING", location)
     from_row, from_col, from_row_off, from_col_off = _anchor_cell(anchor_element[0], location)
     to_row, to_col, to_row_off, to_col_off = _anchor_cell(anchor_element[1], location)
+    client_data = anchor_element[3]
+    if len(client_data) or (client_data.text and client_data.text.strip()):
+        raise _drawing_error("INVALID_DRAWING", location)
+    for attribute, value in client_data.attrib.items():
+        if attribute not in _CLIENT_DATA_ATTRIBUTES or value.lower() not in _BOOLEAN_VALUES:
+            raise _drawing_error("INVALID_DRAWING", location)
     picture = anchor_element[2]
     _validate_picture_subtree(picture, location)
     picture_children = [child.tag for child in picture]
@@ -607,16 +640,125 @@ def _validate_media(package: SafePackage, media_part: str) -> None:
         raise _drawing_error("INVALID_DRAWING", media_part)
     payload = package.read(media_part, MAX_ENTRY)
     if suffix == "png":
-        valid = (
-            len(payload) >= 33
-            and payload.startswith(b"\x89PNG\r\n\x1a\n")
-            and payload[8:12] == b"\x00\x00\x00\r"
-            and payload[12:16] == b"IHDR"
-        )
+        valid = _valid_png(payload)
     else:
-        valid = len(payload) >= 4 and payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9")
+        valid = _valid_jpeg(payload)
     if not valid:
         raise _drawing_error("INVALID_DRAWING", media_part)
+
+
+def _valid_png(payload: bytes) -> bool:
+    if not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+    offset = 8
+    saw_ihdr = False
+    saw_idat = False
+    while offset < len(payload):
+        if len(payload) - offset < 12:
+            return False
+        length = struct.unpack(">I", payload[offset : offset + 4])[0]
+        end = offset + 12 + length
+        if end > len(payload):
+            return False
+        chunk_type = payload[offset + 4 : offset + 8]
+        chunk_data = payload[offset + 8 : offset + 8 + length]
+        expected_crc = struct.unpack(">I", payload[offset + 8 + length : end])[0]
+        if zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF != expected_crc:
+            return False
+        if not saw_ihdr:
+            if chunk_type != b"IHDR" or length != 13:
+                return False
+            width, height = struct.unpack(">II", chunk_data[:8])
+            if width == 0 or height == 0:
+                return False
+            saw_ihdr = True
+        elif chunk_type == b"IHDR":
+            return False
+        if chunk_type == b"IDAT":
+            saw_idat = True
+        if chunk_type == b"IEND":
+            return length == 0 and saw_idat and end == len(payload)
+        offset = end
+    return False
+
+
+_JPEG_SOF_MARKERS = {
+    *range(0xC0, 0xC4),
+    *range(0xC5, 0xC8),
+    *range(0xC9, 0xCC),
+    *range(0xCD, 0xD0),
+}
+
+
+def _valid_jpeg(payload: bytes) -> bool:
+    if len(payload) < 4 or payload[:2] != b"\xff\xd8":
+        return False
+    offset = 2
+    saw_sof = False
+    saw_sos = False
+    while offset < len(payload):
+        if payload[offset] != 0xFF:
+            return False
+        while offset < len(payload) and payload[offset] == 0xFF:
+            offset += 1
+        if offset >= len(payload):
+            return False
+        marker = payload[offset]
+        offset += 1
+        if marker == 0xD9:
+            return saw_sof and saw_sos and offset == len(payload)
+        if marker in {0x00, 0xD8}:
+            return False
+        if marker == 0xDA:
+            if offset + 2 > len(payload):
+                return False
+            length = struct.unpack(">H", payload[offset : offset + 2])[0]
+            if length < 6 or offset + length > len(payload):
+                return False
+            component_count = payload[offset + 2]
+            if component_count == 0 or length < 6 + 2 * component_count:
+                return False
+            saw_sos = True
+            offset += length
+            while offset < len(payload):
+                if payload[offset] != 0xFF:
+                    offset += 1
+                    continue
+                scan_marker_start = offset
+                while offset < len(payload) and payload[offset] == 0xFF:
+                    offset += 1
+                if offset >= len(payload):
+                    return False
+                scan_marker = payload[offset]
+                offset += 1
+                if scan_marker == 0x00 or 0xD0 <= scan_marker <= 0xD7:
+                    continue
+                if scan_marker == 0xD9:
+                    return saw_sof and offset == len(payload)
+                offset = scan_marker_start
+                break
+            continue
+        if marker == 0x01 or offset + 2 > len(payload):
+            return False
+        length = struct.unpack(">H", payload[offset : offset + 2])[0]
+        if length < 2 or offset + length > len(payload):
+            return False
+        if marker in _JPEG_SOF_MARKERS:
+            if length < 8:
+                return False
+            height = struct.unpack(">H", payload[offset + 3 : offset + 5])[0]
+            width = struct.unpack(">H", payload[offset + 5 : offset + 7])[0]
+            component_count = payload[offset + 7]
+            if (
+                width == 0
+                or height == 0
+                or component_count == 0
+                or length < 8 + 3 * component_count
+            ):
+                return False
+            saw_sof = True
+        offset += length
+    return False
 
 
 def _empty_inventory() -> DrawingInventory:
@@ -641,6 +783,7 @@ def _worksheet_drawing_parts(
         raise _drawing_error("INVALID_DRAWING", "xl/workbook.xml")
     sheets = workbook.findall(f"{{{MAIN_NS}}}sheets/{{{MAIN_NS}}}sheet")
     records: list[tuple[str, str, str]] = []
+    seen_drawing_parts: set[str] = set()
     for sheet in sheets:
         relationship_id = sheet.get(f"{{{OFFICE_REL_NS}}}id")
         if not relationship_id:
@@ -691,6 +834,9 @@ def _worksheet_drawing_parts(
             drawing_part = package.resolve_relationship_target(worksheet_part, target)
         except WorkbookError as exc:
             raise _drawing_error("INVALID_DRAWING", worksheet_part) from exc
+        if drawing_part in seen_drawing_parts:
+            raise _drawing_error("INVALID_DRAWING", drawing_part)
+        seen_drawing_parts.add(drawing_part)
         records.append((worksheet_part, drawing_id, drawing_part))
     return records
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -11,8 +12,13 @@ import pytest
 
 from fis.xlsx.drawings import Anchor, classify_anchor, parse_workbook_drawings
 from fis.xlsx.errors import WorkbookError
+from fis.xlsx.package import SafePackage
 from fis.xlsx.parser import ParsedBundle, parse_invoice_bundle
 from tests.fixtures.standard_v1_builder import build_standard_v1
+
+_JPEG_1X1 = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAGf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9k="
+)
 
 
 def _rewrite_part(path: Path, part_name: str, rewrite: Callable[[bytes], bytes]) -> None:
@@ -86,6 +92,8 @@ def test_rejects_anchor_when_either_axis_ends_before_start(anchor: Anchor) -> No
     "anchor",
     [
         Anchor(11, 1, 0, 0, 12, 3, 0, 0, "rId1"),
+        Anchor(11, 2, 1, 0, 12, 3, 0, 0, "rId1"),
+        Anchor(11, 2, 0, 1, 12, 3, 0, 0, "rId1"),
         Anchor(11, 2, 0, 0, 12, 3, 1, 0, "rId1"),
         Anchor(11, 2, 0, 0, 13, 3, 0, 0, "rId1"),
     ],
@@ -94,6 +102,22 @@ def test_rejects_product_images_with_wrong_column_or_ambiguous_span(anchor: Anch
     with pytest.raises(WorkbookError) as captured:
         classify_anchor(anchor, (12, 13))
     assert captured.value.code == "AMBIGUOUS_IMAGE"
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        lambda xml: xml.replace(b"<clientData/>", b"<clientData><grpSp/></clientData>", 1),
+        lambda xml: xml.replace(b"<col>2</col>", b'<col foo="1">2</col>', 1),
+        lambda xml: xml.replace(b"<clientData/>", b"<clientData>text</clientData>", 1),
+    ],
+)
+def test_rejects_invalid_anchor_subtrees(tmp_path: Path, rewrite: Callable[[bytes], bytes]) -> None:
+    path = tmp_path / "invalid-anchor-subtree.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    _rewrite_part(path, "xl/drawings/drawing1.xml", rewrite)
+
+    assert _drawing_error(path, "INVALID_DRAWING")
 
 
 def test_preserves_a_header_logo_as_fixed_but_rejects_fixed_image_crossing_products() -> None:
@@ -149,7 +173,7 @@ def test_supports_png_and_jpeg_images_when_content_type_and_magic_match(tmp_path
     )
     with ZipFile(path) as archive:
         parts = {name: archive.read(name) for name in archive.namelist()}
-    parts["xl/media/image1.jpg"] = b"\xff\xd8synthetic\xff\xd9"
+    parts["xl/media/image1.jpg"] = _JPEG_1X1
     parts.pop("xl/media/image1.png")
     parts["xl/drawings/_rels/drawing1.xml.rels"] = parts[
         "xl/drawings/_rels/drawing1.xml.rels"
@@ -425,10 +449,7 @@ def test_allows_media_referenced_by_another_drawing_part(tmp_path: Path) -> None
         b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image2.png"/>'
         b"</Relationships>"
     )
-    parts["xl/media/image2.png"] = (
-        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-        b"\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02"
-    )
+    parts["xl/media/image2.png"] = parts["xl/media/image1.png"]
     parts["xl/workbook.xml"] = parts["xl/workbook.xml"].replace(
         b"</sheets>", b'<sheet name="Other" sheetId="2" r:id="rId3"/></sheets>', 1
     )
@@ -447,6 +468,41 @@ def test_allows_media_referenced_by_another_drawing_part(tmp_path: Path) -> None
             archive.writestr(name, content)
 
     assert parse_workbook_drawings(path, parse_invoice_bundle(path)).product_images[0].source_row == 12
+
+
+def test_rejects_one_drawing_part_shared_by_multiple_worksheets(tmp_path: Path) -> None:
+    path = tmp_path / "shared-drawing.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    with ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["xl/worksheets/sheet2.xml"] = (
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        b'<drawing r:id="rId1"/></worksheet>'
+    )
+    parts["xl/worksheets/_rels/sheet2.xml.rels"] = (
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>'
+        b"</Relationships>"
+    )
+    parts["xl/workbook.xml"] = parts["xl/workbook.xml"].replace(
+        b"</sheets>", b'<sheet name="Other" sheetId="2" r:id="rId3"/></sheets>', 1
+    )
+    parts["xl/_rels/workbook.xml.rels"] = parts["xl/_rels/workbook.xml.rels"].replace(
+        b"</Relationships>",
+        b'<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>',
+        1,
+    )
+    parts["[Content_Types].xml"] = parts["[Content_Types].xml"].replace(
+        b"</Types>",
+        b'<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>',
+        1,
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    assert _drawing_error(path, "INVALID_DRAWING")
 
 
 def test_rejects_unreachable_drawing_image_relationship_from_masking_orphan_media(
@@ -550,6 +606,50 @@ def test_rejects_bad_png_magic_and_a_chart_anchor(tmp_path: Path) -> None:
     assert _drawing_error(chart, "UNSUPPORTED_DRAWING")
 
 
+def test_rejects_truncated_png_and_jpeg_payloads(tmp_path: Path) -> None:
+    png = tmp_path / "truncated-png.xlsx"
+    build_standard_v1(png, {"S1": 1}, [12])
+    _rewrite_part(
+        png,
+        "xl/media/image1.png",
+        lambda _: b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 17,
+    )
+    assert _drawing_error(png, "INVALID_DRAWING")
+
+    jpeg = tmp_path / "truncated-jpeg.xlsx"
+    build_standard_v1(jpeg, {"S1": 1}, [12])
+    _rewrite_part(jpeg, "xl/media/image1.png", lambda _: b"\xff\xd8\xff\xd9")
+    assert _drawing_error(jpeg, "INVALID_DRAWING")
+
+
+def test_content_types_are_read_once_and_rejected_after_package_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "content-type-cache.xlsx"
+    build_standard_v1(path, {"S1": 2}, [12, 13])
+    reads = 0
+    original_read_xml = SafePackage.read_xml
+
+    def counted_read_xml(package: SafePackage, part: str, max_bytes: int):
+        nonlocal reads
+        if part == "[Content_Types].xml":
+            reads += 1
+        return original_read_xml(package, part, max_bytes)
+
+    monkeypatch.setattr(SafePackage, "read_xml", counted_read_xml)
+    parsed_bundle = parse_invoice_bundle(path)
+    reads = 0
+    parse_workbook_drawings(path, parsed_bundle)
+    assert reads == 1
+
+    with SafePackage.open(path) as package:
+        package.content_type_for_part("xl/media/image1.png")
+        package.close()
+        with pytest.raises(WorkbookError) as captured:
+            package.content_type_for_part("xl/media/image1.png")
+        assert captured.value.code == "PACKAGE_CLOSED"
+
+
 def test_rejects_anchor_offsets_outside_the_supported_product_boundary(tmp_path: Path) -> None:
     path = tmp_path / "offset.xlsx"
     build_standard_v1(path, {"S1": 1}, [12])
@@ -564,3 +664,23 @@ def test_rejects_anchor_offsets_outside_the_supported_product_boundary(tmp_path:
     )
 
     assert _drawing_error(path, "AMBIGUOUS_IMAGE").location == "xl/drawings/drawing1.xml:rId1"
+
+
+def test_rejects_nonzero_offsets_on_fixed_images(tmp_path: Path) -> None:
+    path = tmp_path / "fixed-offset.xlsx"
+    build_standard_v1(path, {"S1": 1}, [12])
+    _rewrite_part(
+        path,
+        "xl/drawings/drawing1.xml",
+        lambda xml: xml.replace(
+            b"<from><col>2</col><colOff>0</colOff><row>11</row><rowOff>0</rowOff>",
+            b"<from><col>0</col><colOff>1</colOff><row>9</row><rowOff>0</rowOff>",
+            1,
+        ).replace(
+            b"<to><col>3</col><colOff>0</colOff><row>12</row><rowOff>0</rowOff>",
+            b"<to><col>1</col><colOff>0</colOff><row>11</row><rowOff>0</rowOff>",
+            1,
+        ),
+    )
+
+    assert _drawing_error(path, "INVALID_DRAWING")

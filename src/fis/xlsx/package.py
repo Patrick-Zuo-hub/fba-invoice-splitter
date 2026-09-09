@@ -5,10 +5,11 @@ from __future__ import annotations
 import re
 import struct
 import zlib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from lzma import LZMAError
 from pathlib import Path, PurePosixPath
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Self
 from urllib.parse import unquote_to_bytes, urlsplit
 from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
@@ -66,6 +67,10 @@ class SafePackage:
     archive: ZipFile
     _entries: dict[str, ZipInfo] = field(default_factory=dict, init=False, repr=False)
     _canonical_entries: dict[str, ZipInfo] = field(default_factory=dict, init=False, repr=False)
+    _content_types_cache: tuple[Mapping[str, str], Mapping[str, str]] | None = field(
+        default=None, init=False, repr=False
+    )
+    _content_types_valid: bool | None = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
 
     @classmethod
@@ -169,34 +174,9 @@ class SafePackage:
         """Return the canonical content type resolved from ``[Content_Types].xml``."""
 
         self._require_open()
-        root = self.read_xml("[Content_Types].xml", MAX_ENTRY)
-        if root.tag != f"{{{_CONTENT_TYPES_NAMESPACE}}}Types":
+        defaults, overrides = self._load_content_types()
+        if not self._content_types_valid:
             raise WorkbookError("INVALID_CONTENT_TYPES", "XLSX 内容类型部件无效", "[Content_Types].xml")
-        defaults: dict[str, str] = {}
-        overrides: dict[str, str] = {}
-        for element in root:
-            if element.tag == f"{{{_CONTENT_TYPES_NAMESPACE}}}Default":
-                extension = _ascii_lower(element.get("Extension") or "")
-                content_type = (element.get("ContentType") or "").lower()
-                if not extension or not content_type or extension in defaults:
-                    raise WorkbookError(
-                        "INVALID_CONTENT_TYPES", "XLSX 内容类型部件无效", "[Content_Types].xml"
-                    )
-                defaults[extension] = content_type
-            elif element.tag == f"{{{_CONTENT_TYPES_NAMESPACE}}}Override":
-                raw_part_name = element.get("PartName") or ""
-                raw_part_name = raw_part_name.removeprefix("/")
-                part_name = self._canonical_part_name(raw_part_name)
-                content_type = (element.get("ContentType") or "").lower()
-                if not content_type or part_name in overrides:
-                    raise WorkbookError(
-                        "INVALID_CONTENT_TYPES", "XLSX 内容类型部件无效", "[Content_Types].xml"
-                    )
-                overrides[part_name] = content_type
-            else:
-                raise WorkbookError(
-                    "INVALID_CONTENT_TYPES", "XLSX 内容类型部件无效", "[Content_Types].xml"
-                )
         canonical_part = self._canonical_part_name(part)
         suffix = PurePosixPath(canonical_part).suffix.removeprefix(".")
         return overrides.get(canonical_part, defaults.get(suffix))
@@ -361,7 +341,14 @@ class SafePackage:
             raise WorkbookError("ACTIVEX_UNSUPPORTED", "V1 不支持 ActiveX 控件", location)
 
     def _validate_content_types(self) -> None:
+        self._load_content_types()
+
+    def _load_content_types(self) -> tuple[Mapping[str, str], Mapping[str, str]]:
+        if self._content_types_cache is not None:
+            return self._content_types_cache
         root = self.read_xml("[Content_Types].xml", MAX_ENTRY)
+        defaults: dict[str, str] = {}
+        overrides: dict[str, str] = {}
         for element in root.iter():
             content_type = (element.get("ContentType") or "").lower()
             location = element.get("PartName") or "[Content_Types].xml"
@@ -371,6 +358,36 @@ class SafePackage:
                 raise WorkbookError("OLE_UNSUPPORTED", "V1 不支持 OLE 嵌入对象", location)
             if "activex" in content_type:
                 raise WorkbookError("ACTIVEX_UNSUPPORTED", "V1 不支持 ActiveX 控件", location)
+        # A few low-level SafePackage tests intentionally use a tiny unnamespaced
+        # ``<Types/>`` sentinel.  Keep that package-level validation compatible,
+        # while using strict OPC parsing for real namespaced content types.
+        canonical = root.tag == f"{{{_CONTENT_TYPES_NAMESPACE}}}Types"
+        if canonical:
+            for element in root:
+                if element.tag == f"{{{_CONTENT_TYPES_NAMESPACE}}}Default":
+                    extension = _ascii_lower(element.get("Extension") or "")
+                    content_type = (element.get("ContentType") or "").lower()
+                    if not extension or not content_type or extension in defaults:
+                        raise WorkbookError(
+                            "INVALID_CONTENT_TYPES", "XLSX 内容类型部件无效", "[Content_Types].xml"
+                        )
+                    defaults[extension] = content_type
+                elif element.tag == f"{{{_CONTENT_TYPES_NAMESPACE}}}Override":
+                    raw_part_name = (element.get("PartName") or "").removeprefix("/")
+                    part_name = self._canonical_part_name(raw_part_name)
+                    content_type = (element.get("ContentType") or "").lower()
+                    if not content_type or part_name in overrides:
+                        raise WorkbookError(
+                            "INVALID_CONTENT_TYPES", "XLSX 内容类型部件无效", "[Content_Types].xml"
+                        )
+                    overrides[part_name] = content_type
+                else:
+                    raise WorkbookError(
+                        "INVALID_CONTENT_TYPES", "XLSX 内容类型部件无效", "[Content_Types].xml"
+                    )
+        self._content_types_valid = canonical
+        self._content_types_cache = (MappingProxyType(defaults), MappingProxyType(overrides))
+        return self._content_types_cache
 
     def _validate_relationships(self) -> None:
         for part in self._entries:
