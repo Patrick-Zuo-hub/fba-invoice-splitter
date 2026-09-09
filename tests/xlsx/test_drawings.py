@@ -620,6 +620,20 @@ def test_rejects_duplicate_picture_ids_and_embeds(tmp_path: Path) -> None:
     assert _drawing_error(path, "INVALID_DRAWING")
 
 
+def test_allows_duplicate_picture_display_names_with_distinct_identities(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-display-names.xlsx"
+    build_standard_v1(path, {"S1": 2}, [12, 13])
+    _rewrite_part(
+        path,
+        "xl/drawings/drawing1.xml",
+        lambda xml: xml.replace(b'name="Synthetic image 2"', b'name="Synthetic image 1"'),
+    )
+
+    inventory = parse_workbook_drawings(path, parse_invoice_bundle(path))
+
+    assert [image.relationship_id for image in inventory.product_images] == ["rId1", "rId2"]
+
+
 def test_rejects_bad_png_magic_and_a_chart_anchor(tmp_path: Path) -> None:
     magic = tmp_path / "bad-magic.xlsx"
     build_standard_v1(magic, {"S1": 1}, [12])

@@ -919,7 +919,6 @@ def _parse_drawing_part(package: SafePackage, drawing_part: str) -> _ParsedDrawi
         relation_by_id[relationship_id] = relation
 
     picture_ids: set[str] = set()
-    picture_names: set[str] = set()
     embedded_ids: set[str] = set()
     parsed: list[tuple[Anchor, str, str]] = []
     for number, child in enumerate(drawing, start=1):
@@ -927,13 +926,10 @@ def _parse_drawing_part(package: SafePackage, drawing_part: str) -> _ParsedDrawi
             raise _drawing_error("UNSUPPORTED_DRAWING", f"{drawing_part}:anchor-{number}")
         anchor, picture_id, picture_name = _parse_anchor(child, drawing_part, number)
         if (
-            picture_id in picture_ids
-            or picture_name in picture_names
-            or anchor.relationship_id in embedded_ids
+            picture_id in picture_ids or anchor.relationship_id in embedded_ids
         ):
             raise _drawing_error("INVALID_DRAWING", f"{drawing_part}:{anchor.relationship_id}")
         picture_ids.add(picture_id)
-        picture_names.add(picture_name)
         embedded_ids.add(anchor.relationship_id)
         parsed.append((anchor, picture_id, picture_name))
     if set(relation_by_id) != embedded_ids:

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, localcontext
+from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 from lxml import etree
 
 from fis.xlsx.errors import WorkbookError
-from fis.xlsx.parser import ParsedBundle, ParsedItem, ParsedShipment
+from fis.xlsx.parser import ParsedBundle, ParsedItem, ParsedShipment, parse_invoice_bundle
 from fis.xlsx.transform import (
     DRAWING_NS,
     MAIN_NS,
@@ -15,11 +17,13 @@ from fis.xlsx.transform import (
     XDR_NS,
     build_row_map,
     compute_totals,
+    transform_comments_vml_xml,
     transform_comments_xml,
     transform_drawing_anchors_xml,
     transform_sheet_xml,
     transform_workbook_xml,
 )
+from tests.fixtures.standard_v1_builder import build_standard_v1
 
 
 def test_row_map_compacts_target_and_moves_footer() -> None:
@@ -56,6 +60,31 @@ def test_totals_reject_missing_or_non_exact_numbers(bad_value: object) -> None:
     assert caught.value.location == "N"
 
 
+def test_totals_are_exact_and_independent_of_global_decimal_context() -> None:
+    rows = [
+        {
+            "K": "123456789012345678901234567890.12345678901234567890",
+            "M": "0.00000000000000000000000000000000000000000000000009",
+            "N": "99999999999999999999999999999999999999999999999999",
+            "P": "1.00000000000000000000000000000000000000000000000001",
+        },
+        {
+            "K": "0.87654321098765432110",
+            "M": "0.00000000000000000000000000000000000000000000000002",
+            "N": "1",
+            "P": "2.00000000000000000000000000000000000000000000000002",
+        },
+    ]
+    with localcontext() as context:
+        context.prec = 3
+        totals = compute_totals(rows)
+
+    assert totals["K"] == Decimal(123456789012345678901234567891)
+    assert totals["M"] == Decimal("0.00000000000000000000000000000000000000000000000011")
+    assert totals["N"] == Decimal(100000000000000000000000000000000000000000000000000)
+    assert totals["P"] == Decimal("3.00000000000000000000000000000000000000000000000003")
+
+
 @pytest.mark.parametrize(
     ("products", "kept", "total"),
     [
@@ -66,6 +95,7 @@ def test_totals_reject_missing_or_non_exact_numbers(bad_value: object) -> None:
         ((12, 13), (12, 12), 15),
         ((12, 13), (12, 14), 15),
         ((12, 13), (True,), 15),
+        ((12, 13), ([12],), 15),
         ((12, 13), (12,), 14),
     ],
 )
@@ -88,7 +118,7 @@ def _cell(row: etree._Element, ref: str, value: str, *, style: str | None = None
 
 
 def _formula_cell(row: etree._Element, ref: str, formula: str) -> None:
-    cell = etree.SubElement(row, f"{{{MAIN_NS}}}c", r=ref)
+    cell = etree.SubElement(row, f"{{{MAIN_NS}}}c", r=ref, s="7")
     etree.SubElement(cell, f"{{{MAIN_NS}}}f").text = formula
     etree.SubElement(cell, f"{{{MAIN_NS}}}v").text = "#VALUE!"
 
@@ -126,10 +156,20 @@ def _worksheet(*, unsafe_formula: bool = False) -> bytes:
         )
         if number == 4:
             _cell(row, "C4", "old warehouse", style="7")
+        if number in {5, 6}:
+            _cell(row, f"C{number}", "old value", style="7")
+        if number in {8, 9}:
+            _cell(row, f"C{number}", "old date", style="7")
+            _cell(row, f"G{number}", "old summary", style="7")
+        if number == 10:
+            _cell(row, "C10", "old delivery warehouse", style="7")
+            _cell(row, "G10", "old summary", style="7")
         if number in range(12, 17):
             _cell(row, f"A{number}", f"source-{number}", style="3")
         if number == 18:
             _cell(row, "A18", "合计TOTAL")
+            for column in "KMNP":
+                _cell(row, f"{column}18", "old total", style="7")
         if number == 10:
             _formula_cell(row, "O10", "P18/N18")
             _formula_cell(row, "R10", "G9/G10")
@@ -198,6 +238,25 @@ def test_sheet_transform_compacts_rows_writes_values_and_preserves_styles() -> N
     assert root.xpath("string(./main:dimension/@ref)", namespaces={"main": MAIN_NS}) == "A1:Z17"
 
 
+def test_sheet_transform_accepts_the_official_anonymous_v1_fixture(tmp_path: Path) -> None:
+    path = tmp_path / "standard.xlsx"
+    build_standard_v1(path, {"S1": 2, "S2": 1}, [12, 13, 14])
+    parsed = parse_invoice_bundle(path)
+    with ZipFile(path) as archive:
+        worksheet = archive.read("xl/worksheets/sheet1.xml")
+
+    output = transform_sheet_xml(
+        worksheet,
+        parsed,
+        (12, 13),
+        {"warehouse_code": "ONT8"},
+    )
+
+    assert _parsed_xml(output).xpath(
+        "string(.//main:c[@r='O10']/main:f)", namespaces={"main": MAIN_NS}
+    ) == "P15/N15"
+
+
 def test_sheet_transform_rejects_an_unconfigured_affected_formula() -> None:
     with pytest.raises(WorkbookError) as caught:
         transform_sheet_xml(_worksheet(unsafe_formula=True), _bundle(), (13, 16), {})
@@ -232,6 +291,64 @@ def test_sheet_transform_rejects_zero_volume_before_writing_formula_cache() -> N
 
     assert caught.value.code == "INVALID_TOTAL_INPUT"
     assert caught.value.location == "N"
+
+
+@pytest.mark.parametrize("missing_ref", ["K18", "G8", "O10", "C4"])
+def test_sheet_transform_rejects_missing_configured_target_cells(missing_ref: str) -> None:
+    root = _parsed_xml(_worksheet())
+    cell = _cell_at(root, missing_ref)
+    cell.getparent().remove(cell)
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(
+            etree.tostring(root), _bundle(), (13, 16), {"warehouse_code": "ONT8"}
+        )
+
+    assert caught.value.code == "TEMPLATE_VERSION_MISMATCH"
+    assert caught.value.location == missing_ref
+
+
+def test_sheet_transform_rejects_missing_style_or_unexpected_baseline_formula() -> None:
+    missing_style = _parsed_xml(_worksheet())
+    _cell_at(missing_style, "G8").attrib.pop("s")
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(missing_style), _bundle(), (13, 16), {})
+    assert caught.value.code == "TEMPLATE_VERSION_MISMATCH"
+    assert caught.value.location == "G8"
+
+    wrong_formula = _parsed_xml(_worksheet())
+    _cell_at(wrong_formula, "O10").find(f"{{{MAIN_NS}}}f").text = "P17/N17"
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(wrong_formula), _bundle(), (13, 16), {})
+    assert caught.value.code == "UNSAFE_FORMULA_TRANSFORM"
+    assert caught.value.location == "O10"
+
+
+def test_sheet_transform_is_sheet_aware_and_blocks_current_sheet_whole_rows() -> None:
+    other_sheet = _parsed_xml(_worksheet())
+    _cell_at(other_sheet, "Q19").find(f"{{{MAIN_NS}}}f").text = "'Other Sheet'!A18"
+    transform_sheet_xml(etree.tostring(other_sheet), _bundle(), (13, 16), {})
+
+    current_rows = _parsed_xml(_worksheet())
+    _cell_at(current_rows, "Q19").find(f"{{{MAIN_NS}}}f").text = "SUM(12:16)"
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(current_rows), _bundle(), (13, 16), {})
+    assert caught.value.code == "UNSAFE_FORMULA_TRANSFORM"
+
+
+def test_sheet_transform_updates_conditional_format_and_auto_filter_ranges() -> None:
+    root = _parsed_xml(_worksheet())
+    etree.SubElement(root, f"{{{MAIN_NS}}}conditionalFormatting", sqref="$A$12:$Z$16")
+    etree.SubElement(root, f"{{{MAIN_NS}}}autoFilter", ref="A11:Z16")
+
+    output = _parsed_xml(transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {}))
+
+    assert output.xpath(
+        "string(./main:conditionalFormatting/@sqref)", namespaces={"main": MAIN_NS}
+    ) == "$A$12:$Z$13"
+    assert output.xpath(
+        "string(./main:autoFilter/@ref)", namespaces={"main": MAIN_NS}
+    ) == "A11:Z13"
 
 
 def test_sheet_transform_rejects_reference_to_removed_row() -> None:
@@ -272,6 +389,41 @@ def test_comments_move_and_reject_removed_row_references() -> None:
     assert caught.value.code == "UNSAFE_REFERENCE"
 
 
+def _comments_vml(*, row: str = "18", column: str = "0") -> bytes:
+    vml_ns = "urn:schemas-microsoft-com:vml"
+    excel_ns = "urn:schemas-microsoft-com:office:excel"
+    root = etree.Element(f"{{{vml_ns}}}xml", nsmap={"v": vml_ns, "x": excel_ns})
+    shape = etree.SubElement(root, f"{{{vml_ns}}}shape", id="_x0000_s1")
+    client = etree.SubElement(shape, f"{{{excel_ns}}}ClientData", ObjectType="Note")
+    etree.SubElement(client, f"{{{excel_ns}}}Row").text = row
+    etree.SubElement(client, f"{{{excel_ns}}}Column").text = column
+    return etree.tostring(root)
+
+
+def test_comments_vml_moves_zero_based_row_and_validates_comment_cell_alignment() -> None:
+    output = _parsed_xml(
+        transform_comments_vml_xml(
+            _comments_vml(),
+            _bundle(),
+            (13, 16),
+            comment_references=("A19",),
+        )
+    )
+    excel_ns = "urn:schemas-microsoft-com:office:excel"
+    assert output.xpath(
+        "string(.//x:ClientData/x:Row)", namespaces={"x": excel_ns}
+    ) == "15"
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_comments_vml_xml(
+            _comments_vml(column="1"),
+            _bundle(),
+            (13, 16),
+            comment_references=("A19",),
+        )
+    assert caught.value.code == "UNSAFE_REFERENCE"
+
+
 def test_workbook_moves_print_area_and_enables_full_recalculation() -> None:
     root = etree.Element(f"{{{MAIN_NS}}}workbook", nsmap={None: MAIN_NS})
     names = etree.SubElement(root, f"{{{MAIN_NS}}}definedNames")
@@ -290,6 +442,54 @@ def test_workbook_moves_print_area_and_enables_full_recalculation() -> None:
         "fullCalcOnLoad": "1",
         "forceFullCalc": "1",
     }
+
+
+def test_workbook_uses_sheet_order_local_id_and_moves_multi_area_print_ranges() -> None:
+    root = etree.Element(f"{{{MAIN_NS}}}workbook", nsmap={None: MAIN_NS})
+    sheets = etree.SubElement(root, f"{{{MAIN_NS}}}sheets")
+    etree.SubElement(sheets, f"{{{MAIN_NS}}}sheet", name="Other", sheetId="1")
+    etree.SubElement(sheets, f"{{{MAIN_NS}}}sheet", name="装箱单&发票 发货信息", sheetId="2")
+    names = etree.SubElement(root, f"{{{MAIN_NS}}}definedNames")
+    other = etree.SubElement(
+        names, f"{{{MAIN_NS}}}definedName", name="_xlnm.Print_Area", localSheetId="0"
+    )
+    other.text = "Other!$A$1:$Z$20"
+    target = etree.SubElement(
+        names, f"{{{MAIN_NS}}}definedName", name="_xlnm.Print_Area", localSheetId="1"
+    )
+    target.text = (
+        "'装箱单&发票 发货信息'!$A$1:$Z$18,"
+        "'装箱单&发票 发货信息'!$A$19:$Z$20"
+    )
+
+    output = _parsed_xml(transform_workbook_xml(etree.tostring(root), _bundle(), (13, 16)))
+    values = output.xpath(".//main:definedName/text()", namespaces={"main": MAIN_NS})
+
+    assert values == [
+        "Other!$A$1:$Z$20",
+        (
+            "'装箱单&发票 发货信息'!$A$1:$Z$15,"
+            "'装箱单&发票 发货信息'!$A$16:$Z$17"
+        ),
+    ]
+
+
+def test_workbook_preserves_other_sheet_defined_name_with_escaped_apostrophe() -> None:
+    root = etree.Element(f"{{{MAIN_NS}}}workbook", nsmap={None: MAIN_NS})
+    sheets = etree.SubElement(root, f"{{{MAIN_NS}}}sheets")
+    etree.SubElement(sheets, f"{{{MAIN_NS}}}sheet", name="装箱单&发票 发货信息", sheetId="1")
+    etree.SubElement(sheets, f"{{{MAIN_NS}}}sheet", name="Pat's Sheet", sheetId="2")
+    names = etree.SubElement(root, f"{{{MAIN_NS}}}definedNames")
+    name = etree.SubElement(
+        names, f"{{{MAIN_NS}}}definedName", name="OtherName", localSheetId="1"
+    )
+    name.text = "'Pat''s Sheet'!$A$18"
+
+    output = _parsed_xml(transform_workbook_xml(etree.tostring(root), _bundle(), (13, 16)))
+
+    assert output.xpath(
+        "string(.//main:definedName)", namespaces={"main": MAIN_NS}
+    ) == "'Pat''s Sheet'!$A$18"
 
 
 def _drawing() -> bytes:

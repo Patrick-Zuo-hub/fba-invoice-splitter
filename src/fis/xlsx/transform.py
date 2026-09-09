@@ -6,13 +6,13 @@ import copy
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from typing import cast
 
 from lxml import etree  # type: ignore[import-untyped]
 
 from fis.xlsx.errors import WorkbookError
-from fis.xlsx.parser import MAX_EXCEL_ROW, ParsedBundle
+from fis.xlsx.parser import MAX_EXCEL_COLUMN, MAX_EXCEL_ROW, ParsedBundle
 from fis.xlsx.template import STANDARD_V1
 
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -20,16 +20,24 @@ MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 XDR_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
 DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+VML_NS = "urn:schemas-microsoft-com:vml"
+EXCEL_NS = "urn:schemas-microsoft-com:office:excel"
 
 _CELL = re.compile(r"^(\$?)([A-Z]{1,3})(\$?)([1-9][0-9]{0,6})$", re.ASCII)
-_CELL_IN_FORMULA = re.compile(
-    r"(?<![A-Z0-9_.])(?:(?:'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_.]*)!)?"
-    r"\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6}(?![A-Z0-9_])",
+_FORMULA_REFERENCE = re.compile(
+    r"(?<![A-Z0-9_.])"
+    r"(?:(?P<sheet>'(?:[^']|'')+'|[A-Z_\u0080-\uffff][^!,:()+\-*/\s]*)!)?"
+    r"(?P<reference>"
+    r"\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6}(?::\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6})?"
+    r"|\$?[1-9][0-9]{0,6}:\$?[1-9][0-9]{0,6}"
+    r"|\$?[A-Z]{1,3}:\$?[A-Z]{1,3})"
+    r"(?![A-Z0-9_])",
     re.ASCII | re.IGNORECASE,
 )
 _SQREF_TOKEN = re.compile(
-    r"\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6}(?::\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6})?",
-    re.ASCII,
+    r"(?:\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6}(?::\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6})?"
+    r"|\$?[1-9][0-9]{0,6}:\$?[1-9][0-9]{0,6}|\$?[A-Z]{1,3}:\$?[A-Z]{1,3})",
+    re.ASCII | re.IGNORECASE,
 )
 _TOTAL_COLUMNS = ("K", "M", "N", "P")
 
@@ -51,10 +59,12 @@ def _validate_rows(
         raise _error("INVALID_ROW_SELECTION", "商品行范围无效", "product_rows")
     if total_row != product_rows[-1] + 2:
         raise _error("INVALID_ROW_SELECTION", "合计行位置无效", f"row {total_row}")
-    if not kept_rows or len(set(kept_rows)) != len(kept_rows):
-        raise _error("INVALID_ROW_SELECTION", "至少保留一个有效商品行", "kept_rows")
-    if any(isinstance(row, bool) or not isinstance(row, int) for row in kept_rows):
+    if not kept_rows or any(
+        isinstance(row, bool) or not isinstance(row, int) for row in kept_rows
+    ):
         raise _error("INVALID_ROW_SELECTION", "保留行不属于商品区域", "kept_rows")
+    if len(set(kept_rows)) != len(kept_rows):
+        raise _error("INVALID_ROW_SELECTION", "至少保留一个有效商品行", "kept_rows")
     positions = {row: index for index, row in enumerate(product_rows)}
     try:
         kept_positions = tuple(positions[row] for row in kept_rows)
@@ -102,15 +112,43 @@ def _decimal(value: object, column: str) -> Decimal:
 def compute_totals(rows: Iterable[Mapping[str, object]]) -> dict[str, Decimal]:
     """Sum required invoice columns exactly, rejecting all implicit coercions."""
 
-    result = {column: Decimal(0) for column in _TOTAL_COLUMNS}
+    values: dict[str, list[Decimal]] = {column: [] for column in _TOTAL_COLUMNS}
     for row in rows:
         for column in _TOTAL_COLUMNS:
             try:
                 value = row[column]
             except (KeyError, TypeError) as exc:
                 raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column) from exc
-            result[column] += _decimal(value, column)
-    return result
+            values[column].append(_decimal(value, column))
+    return {column: _sum_decimals_exact(items) for column, items in values.items()}
+
+
+def _sum_decimals_exact(values: Sequence[Decimal]) -> Decimal:
+    """Add finite Decimals without consulting or mutating the process context."""
+
+    if not values:
+        return Decimal(0)
+    exponent = min(cast(int, value.as_tuple().exponent) for value in values)
+    total = 0
+    for value in values:
+        parts = value.as_tuple()
+        coefficient = 0
+        for digit in parts.digits:
+            coefficient = coefficient * 10 + digit
+        if parts.sign:
+            coefficient = -coefficient
+        total += coefficient * 10 ** (cast(int, parts.exponent) - exponent)
+    sign = 1 if total < 0 else 0
+    digits = tuple(int(character) for character in str(abs(total)))
+    return Decimal((sign, digits, exponent))
+
+
+def _divide_for_cache(numerator: Decimal, denominator: Decimal) -> Decimal:
+    """Produce deterministic cached arithmetic independent of global Decimal settings."""
+
+    with localcontext() as context:
+        context.prec = 28
+        return numerator / denominator
 
 
 class _RowTransform:
@@ -159,7 +197,7 @@ def _parse_cell_ref(reference: str, location: str) -> tuple[str, str, str, int]:
         raise _error("UNSAFE_REFERENCE", "单元格引用无法安全转换", location)
     col_abs, column, row_abs, row_text = match.groups()
     row = int(row_text)
-    if row > MAX_EXCEL_ROW:
+    if row > MAX_EXCEL_ROW or _column_number(column) > MAX_EXCEL_COLUMN:
         raise _error("UNSAFE_REFERENCE", "单元格引用无法安全转换", location)
     return col_abs, column, row_abs, row
 
@@ -179,6 +217,41 @@ def _translate_range(
     *,
     allow_product_compaction: bool = False,
 ) -> str:
+    if re.fullmatch(r"\$?[A-Z]{1,3}:\$?[A-Z]{1,3}", reference, re.IGNORECASE):
+        for column in reference.replace("$", "").split(":"):
+            if _column_number(column.upper()) > MAX_EXCEL_COLUMN:
+                raise _error("UNSAFE_REFERENCE", "整列引用无法安全转换", location)
+        return reference
+    row_range = re.fullmatch(
+        r"(?P<left_abs>\$?)(?P<left>[1-9][0-9]{0,6}):"
+        r"(?P<right_abs>\$?)(?P<right>[1-9][0-9]{0,6})",
+        reference,
+    )
+    if row_range is not None:
+        left_row = int(row_range.group("left"))
+        right_row = int(row_range.group("right"))
+        if left_row > MAX_EXCEL_ROW or right_row > MAX_EXCEL_ROW:
+            raise _error("UNSAFE_REFERENCE", "整行引用无法安全转换", location)
+        low, high = sorted((left_row, right_row))
+        deleted = transform.removed_rows.intersection(range(low, high + 1))
+        if deleted and not (
+            allow_product_compaction
+            and low <= transform.product_rows[0]
+            and high >= transform.product_rows[-1]
+        ):
+            raise _error("UNSAFE_REFERENCE", "整行引用包含已删除的商品行", location)
+        new_left = transform.row(left_row)
+        new_right = transform.row(right_row)
+        if new_left is None:
+            new_left = transform.row(transform.kept_rows[0])
+        if new_right is None:
+            new_right = transform.row(transform.kept_rows[-1])
+        if new_left is None or new_right is None:
+            raise _error("UNSAFE_REFERENCE", "整行引用无法安全转换", location)
+        return (
+            f"{row_range.group('left_abs')}{new_left}:"
+            f"{row_range.group('right_abs')}{new_right}"
+        )
     parts = reference.split(":")
     if len(parts) not in {1, 2}:
         raise _error("UNSAFE_REFERENCE", "区域引用无法安全转换", location)
@@ -239,15 +312,37 @@ def _formula_without_strings(formula: str) -> str:
     return "".join(result)
 
 
-def _assert_formula_unaffected(formula: str, transform: _RowTransform, location: str) -> None:
+def _sheet_name(value: str) -> str:
+    if value.startswith("'") and value.endswith("'"):
+        return value[1:-1].replace("''", "'")
+    return value
+
+
+def _assert_formula_unaffected(
+    formula: str,
+    transform: _RowTransform,
+    location: str,
+    *,
+    current_sheet: str = STANDARD_V1.sheet_name,
+) -> None:
     inspected = _formula_without_strings(formula)
-    for match in _CELL_IN_FORMULA.finditer(inspected):
-        token = match.group(0).rsplit("!", 1)[-1].upper()
-        _ca, _column, _ra, old_row = _parse_cell_ref(token, location)
-        if transform.row(old_row) != old_row:
+    if "[" in inspected or "]" in inspected:
+        raise _error("UNSAFE_FORMULA_TRANSFORM", "公式引用结构不受支持", location)
+    for match in _FORMULA_REFERENCE.finditer(inspected):
+        sheet = match.group("sheet")
+        if sheet is not None and _sheet_name(sheet) != current_sheet:
+            continue
+        reference = match.group("reference").upper()
+        if re.fullmatch(r"\$?[A-Z]{1,3}:\$?[A-Z]{1,3}", reference):
+            continue
+        try:
+            translated = _translate_range(reference, transform, location)
+        except WorkbookError as exc:
             raise _error(
                 "UNSAFE_FORMULA_TRANSFORM", "公式引用受商品行转换影响", location
-            )
+            ) from exc
+        if translated != reference:
+            raise _error("UNSAFE_FORMULA_TRANSFORM", "公式引用受商品行转换影响", location)
 
 
 def _decimal_text(value: Decimal) -> str:
@@ -259,24 +354,11 @@ def _decimal_text(value: Decimal) -> str:
     return "0" if text in {"", "-0"} else text
 
 
-def _find_or_create_cell(row: etree._Element, reference: str) -> etree._Element:
+def _find_cell(row: etree._Element, reference: str) -> etree._Element | None:
     for cell in row.findall(f"{{{MAIN_NS}}}c"):
         if cell.get("r") == reference:
             return cell
-    cell = etree.Element(f"{{{MAIN_NS}}}c", r=reference)
-    target_column = _parse_cell_ref(reference, reference)[1]
-    target_number = _column_number(target_column)
-    inserted = False
-    for index, existing in enumerate(row.findall(f"{{{MAIN_NS}}}c")):
-        existing_ref = existing.get("r") or ""
-        existing_column = _parse_cell_ref(existing_ref, existing_ref)[1]
-        if _column_number(existing_column) > target_number:
-            row.insert(index, cell)
-            inserted = True
-            break
-    if not inserted:
-        row.append(cell)
-    return cell
+    return None
 
 
 def _column_number(column: str) -> int:
@@ -284,6 +366,47 @@ def _column_number(column: str) -> int:
     for char in column:
         result = result * 26 + ord(char) - ord("A") + 1
     return result
+
+
+def _require_styled_cell(rows: Mapping[int, etree._Element], reference: str) -> etree._Element:
+    row_number = _parse_cell_ref(reference, reference)[3]
+    row = rows.get(row_number)
+    cell = None if row is None else _find_cell(row, reference)
+    style = None if cell is None else cell.get("s")
+    if cell is None or style is None or not style.isascii() or not style.isdigit():
+        raise _error(
+            "TEMPLATE_VERSION_MISMATCH", "模板写入目标缺失或样式无效", reference
+        )
+    return cell
+
+
+def _validate_formula_target(
+    rows: Mapping[int, etree._Element], reference: str, expected_formula: str
+) -> None:
+    cell = _require_styled_cell(rows, reference)
+    formulas = cell.findall(f"{{{MAIN_NS}}}f")
+    if (
+        len(formulas) != 1
+        or formulas[0].attrib
+        or "".join((formulas[0].text or "").split()).replace("$", "").upper()
+        != expected_formula.upper()
+    ):
+        raise _error(
+            "UNSAFE_FORMULA_TRANSFORM", "模板公式与 V1 基线不一致", reference
+        )
+
+
+def _validate_configured_targets(
+    rows: Mapping[int, etree._Element], parsed: ParsedBundle
+) -> None:
+    for column in _TOTAL_COLUMNS:
+        _require_styled_cell(rows, f"{column}{parsed.total_row}")
+    for reference in ("G8", "G9", "G10"):
+        _require_styled_cell(rows, reference)
+    for value_range in STANDARD_V1.value_ranges.values():
+        _require_styled_cell(rows, value_range.split(":", 1)[0])
+    _validate_formula_target(rows, "O10", f"P{parsed.total_row}/N{parsed.total_row}")
+    _validate_formula_target(rows, "R10", "G9/G10")
 
 
 def _clear_value_children(cell: etree._Element) -> None:
@@ -363,6 +486,8 @@ def transform_sheet_xml(
     parsed: ParsedBundle,
     kept_rows: Sequence[int],
     output_values: Mapping[str, object],
+    *,
+    sheet_name: str = STANDARD_V1.sheet_name,
 ) -> bytes:
     """Return transformed worksheet XML without mutating the parsed snapshot."""
 
@@ -376,6 +501,7 @@ def transform_sheet_xml(
         raise _error("TEMPLATE_VERSION_MISMATCH", "工作表缺少数据区域", "sheetData")
     source_rows = _row_elements(sheet_data)
     _required_rows(parsed, source_rows)
+    _validate_configured_targets(source_rows, parsed)
 
     new_rows: list[tuple[int, etree._Element]] = []
     for old, original in source_rows.items():
@@ -409,7 +535,10 @@ def transform_sheet_xml(
         raise AssertionError("total row is always mapped")
     total_element = rows[total_row]
     for column in _TOTAL_COLUMNS:
-        _write_number(_find_or_create_cell(total_element, f"{column}{total_row}"), totals[column])
+        total_cell = _find_cell(total_element, f"{column}{total_row}")
+        if total_cell is None:
+            raise AssertionError("validated total cell was lost during row transformation")
+        _write_number(total_cell, totals[column])
 
     for cell_ref, summary_value in (
         ("G8", totals["K"]),
@@ -419,16 +548,18 @@ def transform_sheet_xml(
         row_number = _parse_cell_ref(cell_ref, cell_ref)[3]
         if row_number not in rows:
             raise _error("TEMPLATE_VERSION_MISMATCH", "工作表缺少汇总行", cell_ref)
-        _write_number(_find_or_create_cell(rows[row_number], cell_ref), summary_value)
+        _write_number(_require_styled_cell(rows, cell_ref), summary_value)
     if totals["N"] == 0:
         raise _error("INVALID_TOTAL_INPUT", "体积合计不能为零", "N")
     _write_formula(
-        _find_or_create_cell(rows[10], "O10"),
+        _require_styled_cell(rows, "O10"),
         f"P{total_row}/N{total_row}",
-        totals["P"] / totals["N"],
+        _divide_for_cache(totals["P"], totals["N"]),
     )
     _write_formula(
-        _find_or_create_cell(rows[10], "R10"), "G9/G10", totals["M"] / totals["N"]
+        _require_styled_cell(rows, "R10"),
+        "G9/G10",
+        _divide_for_cache(totals["M"], totals["N"]),
     )
 
     unknown_fields = set(output_values).difference(STANDARD_V1.value_ranges)
@@ -440,7 +571,7 @@ def transform_sheet_xml(
         row_number = _parse_cell_ref(top_left, top_left)[3]
         if row_number not in rows:
             raise _error("TEMPLATE_VERSION_MISMATCH", "工作表缺少输出字段", top_left)
-        _write_inline(_find_or_create_cell(rows[row_number], top_left), value)
+        _write_inline(_require_styled_cell(rows, top_left), value)
 
     for merge in root.xpath("./main:mergeCells/main:mergeCell", namespaces={"main": MAIN_NS}):
         reference = merge.get("ref")
@@ -456,7 +587,10 @@ def transform_sheet_xml(
         validation.set("sqref", _translate_sqref(sqref, transform, sqref))
         for formula in validation.xpath("./main:formula1 | ./main:formula2", namespaces={"main": MAIN_NS}):
             _assert_formula_unaffected(
-                formula.text or "", transform, f"dataValidation {sqref}"
+                formula.text or "",
+                transform,
+                f"dataValidation {sqref}",
+                current_sheet=sheet_name,
             )
     for hyperlink in root.xpath(
         "./main:hyperlinks/main:hyperlink", namespaces={"main": MAIN_NS}
@@ -465,6 +599,56 @@ def transform_sheet_xml(
         if reference is None:
             raise _error("UNSAFE_REFERENCE", "超链接缺少引用", "hyperlink")
         hyperlink.set("ref", _translate_range(reference, transform, reference))
+    for conditional in root.xpath(
+        "./main:conditionalFormatting", namespaces={"main": MAIN_NS}
+    ):
+        sqref = conditional.get("sqref")
+        if sqref is None:
+            raise _error("UNSAFE_REFERENCE", "条件格式缺少引用", "conditionalFormatting")
+        conditional.set("sqref", _translate_sqref(sqref, transform, sqref))
+        for formula in conditional.xpath(
+            ".//main:cfRule/main:formula", namespaces={"main": MAIN_NS}
+        ):
+            _assert_formula_unaffected(
+                formula.text or "",
+                transform,
+                f"conditionalFormatting {sqref}",
+                current_sheet=sheet_name,
+            )
+    for element in root.xpath(
+        "./main:autoFilter | .//main:sortState | .//main:sortCondition",
+        namespaces={"main": MAIN_NS},
+    ):
+        reference = element.get("ref")
+        if reference is None:
+            raise _error("UNSAFE_REFERENCE", "筛选或排序区域缺少引用", "autoFilter")
+        element.set(
+            "ref",
+            _translate_range(
+                reference, transform, reference, allow_product_compaction=True
+            ),
+        )
+    for element in root.xpath(
+        "./main:ignoredErrors/main:ignoredError | ./main:protectedRanges/main:protectedRange",
+        namespaces={"main": MAIN_NS},
+    ):
+        sqref = element.get("sqref")
+        if sqref is None:
+            raise _error("UNSAFE_REFERENCE", "工作表区域缺少引用", "sqref")
+        element.set("sqref", _translate_sqref(sqref, transform, sqref))
+    for pane in root.xpath("./main:sheetViews/main:sheetView/main:pane", namespaces={"main": MAIN_NS}):
+        top_left = pane.get("topLeftCell")
+        if top_left:
+            pane.set("topLeftCell", _translate_cell(top_left, transform, top_left))
+    for selection in root.xpath(
+        "./main:sheetViews/main:sheetView/main:selection", namespaces={"main": MAIN_NS}
+    ):
+        active = selection.get("activeCell")
+        if active:
+            selection.set("activeCell", _translate_cell(active, transform, active))
+        sqref = selection.get("sqref")
+        if sqref:
+            selection.set("sqref", _translate_sqref(sqref, transform, sqref))
     dimension = root.find(f"{{{MAIN_NS}}}dimension")
     if dimension is not None and dimension.get("ref"):
         dimension.set(
@@ -473,6 +657,25 @@ def transform_sheet_xml(
                 dimension.get("ref") or "", transform, "dimension", allow_product_compaction=True
             ),
         )
+    known_reference_nodes = {
+        "autoFilter",
+        "conditionalFormatting",
+        "dataValidation",
+        "dimension",
+        "hyperlink",
+        "ignoredError",
+        "mergeCell",
+        "protectedRange",
+        "selection",
+        "sortCondition",
+        "sortState",
+    }
+    for element in root.xpath(".//*[@ref or @sqref]"):
+        local_name = etree.QName(element).localname
+        if local_name not in known_reference_nodes:
+            raise _error(
+                "UNSAFE_REFERENCE", "工作表包含未支持的引用结构", local_name
+            )
     return _serialize(root)
 
 
@@ -492,6 +695,63 @@ def transform_comments_xml(
         if reference is None:
             raise _error("UNSAFE_REFERENCE", "批注缺少引用", "comment")
         comment.set("ref", _translate_cell(reference, transform, reference))
+    return _serialize(root)
+
+
+def transform_comments_vml_xml(
+    vml_xml: bytes,
+    parsed: ParsedBundle,
+    kept_rows: Sequence[int],
+    *,
+    comment_references: Sequence[str],
+) -> bytes:
+    """Move legacy note VML rows and verify each shape against its comment cell."""
+
+    transform = _RowTransform(parsed, tuple(kept_rows))
+    root = _xml_root(vml_xml, "comments-vml")
+    root_name = etree.QName(root)
+    if root_name.localname != "xml" or root_name.namespace not in {None, VML_NS}:
+        raise _error("INVALID_XML", "批注 VML 根节点无效", "comments-vml")
+    clients = root.xpath(".//x:ClientData", namespaces={"x": EXCEL_NS})
+    if len(clients) != len(comment_references):
+        raise _error("UNSAFE_REFERENCE", "批注与 VML 形状数量不一致", "comments-vml")
+    expected: dict[tuple[int, int], str] = {}
+    for reference in comment_references:
+        _ca, column, _ra, old_row = _parse_cell_ref(reference, reference)
+        coordinate = (old_row - 1, _column_number(column) - 1)
+        if coordinate in expected:
+            raise _error("UNSAFE_REFERENCE", "批注引用重复", reference)
+        expected[coordinate] = reference
+    seen: set[tuple[int, int]] = set()
+    for client in clients:
+        if client.get("ObjectType") != "Note":
+            raise _error("UNSAFE_REFERENCE", "VML 包含非批注对象", "comments-vml")
+        parent = client.getparent()
+        if parent is None or parent.tag != f"{{{VML_NS}}}shape":
+            raise _error("UNSAFE_REFERENCE", "VML 批注形状结构无效", "comments-vml")
+        row_nodes = client.findall(f"{{{EXCEL_NS}}}Row")
+        column_nodes = client.findall(f"{{{EXCEL_NS}}}Column")
+        if len(row_nodes) != 1 or len(column_nodes) != 1:
+            raise _error("UNSAFE_REFERENCE", "VML 批注缺少行列定位", "comments-vml")
+        try:
+            vml_row = int(row_nodes[0].text or "")
+            vml_column = int(column_nodes[0].text or "")
+        except ValueError as exc:
+            raise _error("UNSAFE_REFERENCE", "VML 批注行列定位无效", "comments-vml") from exc
+        coordinate = (vml_row, vml_column)
+        matched_reference = expected.get(coordinate)
+        if matched_reference is None or coordinate in seen:
+            raise _error("UNSAFE_REFERENCE", "批注与 VML 行列不一致", "comments-vml")
+        seen.add(coordinate)
+        old_row = vml_row + 1
+        new_row = transform.row(old_row)
+        if new_row is None:
+            raise _error(
+                "UNSAFE_REFERENCE", "批注指向已删除的商品行", matched_reference
+            )
+        row_nodes[0].text = str(new_row - 1)
+    if seen != set(expected):
+        raise _error("UNSAFE_REFERENCE", "批注与 VML 行列不一致", "comments-vml")
     return _serialize(root)
 
 
@@ -545,6 +805,65 @@ def transform_drawing_anchors_xml(
     return _serialize(root)
 
 
+def _split_print_areas(formula: str, location: str) -> tuple[str, ...]:
+    areas: list[str] = []
+    start = 0
+    index = 0
+    quoted = False
+    while index < len(formula):
+        character = formula[index]
+        if character == "'":
+            if quoted and index + 1 < len(formula) and formula[index + 1] == "'":
+                index += 2
+                continue
+            quoted = not quoted
+        elif character == "," and not quoted:
+            area = formula[start:index].strip()
+            if not area:
+                raise _error("UNSAFE_REFERENCE", "打印区域无法安全转换", location)
+            areas.append(area)
+            start = index + 1
+        index += 1
+    if quoted:
+        raise _error("UNSAFE_REFERENCE", "打印区域无法安全转换", location)
+    area = formula[start:].strip()
+    if not area:
+        raise _error("UNSAFE_REFERENCE", "打印区域无法安全转换", location)
+    areas.append(area)
+    return tuple(areas)
+
+
+def _split_sheet_qualified_reference(
+    area: str, location: str
+) -> tuple[str | None, str]:
+    if "[" in area or "]" in area:
+        raise _error("UNSAFE_REFERENCE", "外部工作簿引用不受支持", location)
+    quoted = False
+    separator = -1
+    index = 0
+    while index < len(area):
+        character = area[index]
+        if character == "'":
+            if quoted and index + 1 < len(area) and area[index + 1] == "'":
+                index += 2
+                continue
+            quoted = not quoted
+        elif character == "!" and not quoted:
+            separator = index
+        index += 1
+    if quoted:
+        raise _error("UNSAFE_REFERENCE", "工作表限定引用无效", location)
+    if separator < 0:
+        return None, area
+    prefix = area[:separator]
+    reference = area[separator + 1 :]
+    if not prefix or not reference:
+        raise _error("UNSAFE_REFERENCE", "工作表限定引用无效", location)
+    if ":" in prefix:
+        raise _error("UNSAFE_REFERENCE", "三维工作表引用不受支持", location)
+    return prefix, reference
+
+
 def transform_workbook_xml(
     workbook_xml: bytes,
     parsed: ParsedBundle,
@@ -558,27 +877,54 @@ def transform_workbook_xml(
     root = _xml_root(workbook_xml, "workbook")
     if root.tag != f"{{{MAIN_NS}}}workbook":
         raise _error("INVALID_XML", "工作簿 XML 根节点无效", "workbook")
+    sheets = root.xpath("./main:sheets/main:sheet", namespaces={"main": MAIN_NS})
+    sheet_names = [sheet.get("name") for sheet in sheets]
+    if any(not name for name in sheet_names) or len(set(sheet_names)) != len(sheet_names):
+        raise _error("UNSAFE_REFERENCE", "工作簿工作表顺序无效", "sheets")
+    target_indices = [index for index, name in enumerate(sheet_names) if name == sheet_name]
+    if sheets and len(target_indices) != 1:
+        raise _error("UNSAFE_REFERENCE", "目标工作表无法唯一识别", sheet_name)
+    target_index = target_indices[0] if target_indices else None
+
     for defined_name in root.xpath(
         "./main:definedNames/main:definedName", namespaces={"main": MAIN_NS}
     ):
         formula = defined_name.text or ""
         name = defined_name.get("name") or ""
+        local_text = defined_name.get("localSheetId")
+        local_index: int | None = None
+        if local_text is not None:
+            if not local_text.isascii() or not local_text.isdigit() or not sheets:
+                raise _error("UNSAFE_REFERENCE", "名称作用域无效", name or "definedName")
+            local_index = int(local_text)
+            if local_index >= len(sheets):
+                raise _error("UNSAFE_REFERENCE", "名称作用域无效", name or "definedName")
+            if target_index is not None and local_index != target_index:
+                continue
         if name == "_xlnm.Print_Area":
-            prefix, separator, reference = formula.rpartition("!")
-            expected = f"'{sheet_name.replace("'", "''")}'"
-            if not separator or prefix not in {sheet_name, expected}:
-                raise _error("UNSAFE_REFERENCE", "打印区域无法安全转换", name)
-            defined_name.text = (
-                f"{prefix}!"
-                + _translate_range(
-                    reference,
-                    transform,
-                    name,
-                    allow_product_compaction=True,
+            transformed: list[str] = []
+            for area in _split_print_areas(formula, name):
+                prefix, reference = _split_sheet_qualified_reference(area, name)
+                applies_to_target = prefix is not None and _sheet_name(prefix) == sheet_name
+                if prefix is None:
+                    if local_index is None or target_index is None:
+                        raise _error("UNSAFE_REFERENCE", "打印区域缺少工作表限定", name)
+                    applies_to_target = local_index == target_index
+                if not applies_to_target:
+                    transformed.append(area)
+                    continue
+                translated = _translate_range(
+                    reference, transform, name, allow_product_compaction=True
                 )
-            )
+                transformed.append(f"{prefix}!{translated}" if prefix is not None else translated)
+            defined_name.text = ",".join(transformed)
         else:
-            _assert_formula_unaffected(formula, transform, name or "definedName")
+            _assert_formula_unaffected(
+                formula,
+                transform,
+                name or "definedName",
+                current_sheet=sheet_name,
+            )
     calc_pr = root.find(f"{{{MAIN_NS}}}calcPr")
     if calc_pr is None:
         calc_pr = etree.SubElement(root, f"{{{MAIN_NS}}}calcPr")

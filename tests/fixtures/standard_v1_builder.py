@@ -40,17 +40,29 @@ def _element(parent: etree._Element, tag_name: str, **attributes: str) -> etree.
     return child
 
 
-def _inline_cell(row: etree._Element, ref: str, value: str) -> None:
-    cell = _element(row, "c", r=ref, t="inlineStr")
+def _inline_cell(row: etree._Element, ref: str, value: str, *, style: str | None = None) -> None:
+    attributes = {"r": ref, "t": "inlineStr"}
+    if style is not None:
+        attributes["s"] = style
+    cell = _element(row, "c", **attributes)
     inline = _element(cell, "is")
     text = _element(inline, "t")
     text.text = value
 
 
-def _value_cell(row: etree._Element, ref: str, value: str) -> None:
-    cell = _element(row, "c", r=ref)
+def _value_cell(row: etree._Element, ref: str, value: str, *, style: str | None = None) -> None:
+    attributes = {"r": ref}
+    if style is not None:
+        attributes["s"] = style
+    cell = _element(row, "c", **attributes)
     value_element = _element(cell, "v")
     value_element.text = value
+
+
+def _formula_cell(row: etree._Element, ref: str, formula: str, cached: str) -> None:
+    cell = _element(row, "c", r=ref, s="0")
+    _element(cell, "f").text = formula
+    _element(cell, "v").text = cached
 
 
 def _normalize_shipments(shipments: Mapping[str, Any] | Iterable[Any]) -> list[tuple[str, int]]:
@@ -184,13 +196,17 @@ def _worksheet(shipment_rows: list[tuple[int, str, int]], total_row: int) -> byt
     for row_number in range(1, 11):
         row = _element(sheet_data, "row", r=str(row_number))
         if row_number == 4:
-            _inline_cell(row, "C4", "SYNTHETIC-WAREHOUSE")
+            _inline_cell(row, "C4", "SYNTHETIC-WAREHOUSE", style="0")
         elif row_number == 5:
-            _inline_cell(row, "C5", "SYNTHETIC-ADDRESS")
+            _inline_cell(row, "C5", "SYNTHETIC-ADDRESS", style="0")
         elif row_number == 6:
-            _inline_cell(row, "C6", "SYNTHETIC-CHANNEL")
+            _inline_cell(row, "C6", "SYNTHETIC-CHANNEL", style="0")
         elif row_number in {8, 9, 10}:
-            _inline_cell(row, f"C{row_number}", "SYNTHETIC-VALUE")
+            _inline_cell(row, f"C{row_number}", "SYNTHETIC-VALUE", style="0")
+            _value_cell(row, f"G{row_number}", "0", style="0")
+            if row_number == 10:
+                _formula_cell(row, "O10", f"P{total_row}/N{total_row}", "0")
+                _formula_cell(row, "R10", "G9/G10", "0")
 
     header_row = _element(sheet_data, "row", r="11")
     for column in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
@@ -227,10 +243,10 @@ def _worksheet(shipment_rows: list[tuple[int, str, int]], total_row: int) -> byt
     _element(sheet_data, "row", r=str(total_row - 1))
     total = _element(sheet_data, "row", r=str(total_row))
     _inline_cell(total, f"A{total_row}", "合计TOTAL")
-    _value_cell(total, f"K{total_row}", str(len(shipment_rows)))
-    _value_cell(total, f"M{total_row}", str(len(shipment_rows)))
-    _value_cell(total, f"N{total_row}", f"{len(shipment_rows) * 0.001:g}")
-    _value_cell(total, f"P{total_row}", str(len(shipment_rows) * 10))
+    _value_cell(total, f"K{total_row}", str(len(shipment_rows)), style="0")
+    _value_cell(total, f"M{total_row}", str(len(shipment_rows)), style="0")
+    _value_cell(total, f"N{total_row}", f"{len(shipment_rows) * 0.001:g}", style="0")
+    _value_cell(total, f"P{total_row}", str(len(shipment_rows) * 10), style="0")
 
     merge_cells = _element(root, "mergeCells", count=str(len(STANDARD_V1.value_ranges)))
     for cell_range in STANDARD_V1.value_ranges.values():
