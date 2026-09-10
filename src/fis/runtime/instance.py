@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import json
+import ntpath
 import os
+import re
 import secrets
 import stat
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import Path
-from typing import Final, Self, cast
+from pathlib import Path, PureWindowsPath
+from typing import Final, Protocol, Self, cast
 from urllib.request import ProxyHandler, build_opener
 
 if os.name != "nt":
@@ -22,6 +25,35 @@ LOCK_NAME: Final = "instance.lock"
 type Probe = Callable[[int], bool]
 type OperationHook = Callable[[str], None]
 type FileIdentity = tuple[int, int]
+
+
+@dataclass(frozen=True)
+class _WindowsFileInfo:
+    identity: FileIdentity
+    final_path: str
+    is_directory: bool
+    is_reparse: bool
+    link_count: int
+    size: int
+    acl_safe: bool
+
+
+class _WindowsApi(Protocol):
+    def validate_local_path(self, path: Path) -> Path: ...
+    def create_directory(self, path: Path) -> None: ...
+    def open_directory(self, path: Path) -> tuple[int, _WindowsFileInfo]: ...
+    def open_file(
+        self, path: Path, *, access: str, creation: str
+    ) -> tuple[int, _WindowsFileInfo]: ...
+    def info(self, handle: int) -> _WindowsFileInfo: ...
+    def read(self, handle: int, limit: int) -> bytes: ...
+    def write(self, handle: int, payload: bytes) -> None: ...
+    def flush(self, handle: int) -> None: ...
+    def replace(self, source: Path, target: Path) -> None: ...
+    def delete(self, path: Path, expected: FileIdentity, expected_parent: str) -> None: ...
+    def lock(self, handle: int) -> bool: ...
+    def unlock(self, handle: int) -> None: ...
+    def close(self, handle: int) -> None: ...
 
 
 class InvalidInstanceRecord(ValueError):
@@ -278,9 +310,7 @@ class _PosixRuntimeDirectory:
 
     def _existing_record_is_safe(self) -> None:
         try:
-            descriptor, _ = self._open_child(
-                RECORD_NAME, os.O_RDONLY, label="instance record"
-            )
+            descriptor, _ = self._open_child(RECORD_NAME, os.O_RDONLY, label="instance record")
         except FileNotFoundError:
             return
         os.close(descriptor)
@@ -351,9 +381,7 @@ class _PosixRuntimeDirectory:
         return True
 
     def remove_record(self, expected: FileIdentity | None = None) -> None:
-        descriptor, details = self._open_child(
-            RECORD_NAME, os.O_RDONLY, label="instance record"
-        )
+        descriptor, details = self._open_child(RECORD_NAME, os.O_RDONLY, label="instance record")
         os.close(descriptor)
         if expected is not None and _identity(details) != expected:
             return
@@ -396,6 +424,22 @@ class _PosixRuntimeDirectory:
             raise StartupError("实例锁文件不可信") from exc
         return descriptor
 
+    @staticmethod
+    def lock(handle: int) -> bool:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    @staticmethod
+    def unlock(handle: int) -> None:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
+    @staticmethod
+    def close_lock(handle: int) -> None:
+        os.close(handle)
+
     def close(self) -> None:
         if self._closed:
             return
@@ -404,11 +448,788 @@ class _PosixRuntimeDirectory:
         self._closed = True
 
 
+def _windows_normalize_final_path(value: str) -> str:
+    normalized = value
+    if normalized.startswith("\\\\?\\UNC\\"):
+        normalized = "\\\\" + normalized[8:]
+    elif normalized.startswith("\\\\?\\"):
+        normalized = normalized[4:]
+    return ntpath.normcase(ntpath.normpath(normalized))
+
+
+class _WindowsRuntimeDirectory:
+    def __init__(
+        self,
+        runtime_dir: Path,
+        directory_handle: int,
+        directory_info: _WindowsFileInfo,
+        operation_hook: OperationHook | None,
+        api: _WindowsApi,
+    ) -> None:
+        self.path = runtime_dir
+        self._directory_handle = directory_handle
+        self._directory_identity = directory_info.identity
+        self._final_path = _windows_normalize_final_path(directory_info.final_path)
+        self._operation_hook = operation_hook
+        self._api = api
+        self._closed = False
+
+    @classmethod
+    def open(
+        cls,
+        runtime_dir: Path,
+        operation_hook: OperationHook | None,
+        *,
+        create: bool,
+        api: _WindowsApi | None = None,
+    ) -> _WindowsRuntimeDirectory:
+        windows = api or _CtypesWindowsApi()
+        safe_path = windows.validate_local_path(runtime_dir)
+        if create:
+            windows.create_directory(safe_path)
+        handle = -1
+        try:
+            handle, info = windows.open_directory(safe_path)
+            if info.is_reparse or not info.is_directory:
+                raise StartupError("Windows 运行目录是 reparse point 或非目录对象")
+            if not info.acl_safe:
+                raise StartupError("Windows 运行目录权限不是当前用户专用")
+            if _windows_normalize_final_path(info.final_path) != _windows_normalize_final_path(
+                str(safe_path)
+            ):
+                raise StartupError("Windows 运行目录路径已被重定向")
+            directory = cls(safe_path, handle, info, operation_hook, windows)
+            handle = -1
+            directory.verify_identity()
+            return directory
+        finally:
+            if handle >= 0:
+                windows.close(handle)
+
+    def _hook(self, stage: str) -> None:
+        if self._operation_hook is not None:
+            self._operation_hook(stage)
+
+    def verify_identity(self) -> None:
+        opened = self._api.info(self._directory_handle)
+        named_handle = -1
+        try:
+            named_handle, named = self._api.open_directory(self.path)
+            if (
+                opened.identity != self._directory_identity
+                or named.identity != self._directory_identity
+                or opened.is_reparse
+                or named.is_reparse
+                or not opened.is_directory
+                or not named.is_directory
+            ):
+                raise StartupError("运行目录已被替换")
+            if not opened.acl_safe or not named.acl_safe:
+                raise StartupError("Windows 运行目录权限不是当前用户专用")
+            if (
+                _windows_normalize_final_path(opened.final_path) != self._final_path
+                or _windows_normalize_final_path(named.final_path) != self._final_path
+            ):
+                raise StartupError("运行目录已被替换")
+        except StartupError:
+            raise
+        except OSError as exc:
+            raise StartupError("运行目录已被替换") from exc
+        finally:
+            if named_handle >= 0:
+                self._api.close(named_handle)
+
+    def _validate_child(self, info: _WindowsFileInfo, label: str) -> None:
+        if info.is_reparse:
+            raise _UnsafeInstanceFile(f"{label} must not be a reparse point")
+        if info.is_directory:
+            raise _UnsafeInstanceFile(f"{label} must not be a directory")
+        if info.link_count != 1:
+            raise _UnsafeInstanceFile(f"{label} must not be a hard link")
+        if not info.acl_safe:
+            raise _UnsafeInstanceFile(f"{label}权限不是当前用户专用")
+        child_parent = _windows_normalize_final_path(ntpath.dirname(info.final_path))
+        if child_parent != self._final_path:
+            raise _UnsafeInstanceFile(f"{label}不属于同一运行目录")
+
+    def _open_child(
+        self,
+        name: str,
+        *,
+        access: str,
+        creation: str,
+        label: str,
+        hook_stage: str | None = None,
+    ) -> tuple[int, _WindowsFileInfo]:
+        if hook_stage is not None:
+            self._hook(hook_stage)
+        self.verify_identity()
+        handle = -1
+        try:
+            handle, info = self._api.open_file(self.path / name, access=access, creation=creation)
+            self._validate_child(info, label)
+            return handle, info
+        except Exception:
+            if handle >= 0:
+                self._api.close(handle)
+            raise
+
+    def read_record(self) -> tuple[InstanceRecord, FileIdentity]:
+        handle, info = self._open_child(
+            RECORD_NAME,
+            access="read",
+            creation="open_existing",
+            label="instance record",
+            hook_stage="before_record_open",
+        )
+        try:
+            if info.size > MAX_RECORD_BYTES:
+                raise InvalidInstanceRecord("instance record is too large")
+            raw = self._api.read(handle, MAX_RECORD_BYTES + 1)
+            if len(raw) > MAX_RECORD_BYTES:
+                raise InvalidInstanceRecord("instance record is too large")
+            return _parse_record(raw), info.identity
+        finally:
+            self._api.close(handle)
+
+    def _existing_record_is_safe(self) -> None:
+        try:
+            handle, _ = self._open_child(
+                RECORD_NAME, access="read", creation="open_existing", label="instance record"
+            )
+        except FileNotFoundError:
+            return
+        self._api.close(handle)
+
+    def write_record(self, record: InstanceRecord) -> FileIdentity:
+        self._existing_record_is_safe()
+        payload = json.dumps(asdict(record), ensure_ascii=True, separators=(",", ":")).encode()
+        temporary_name = f".instance-{secrets.token_hex(16)}"
+        temporary_path = self.path / temporary_name
+        handle = -1
+        published = False
+        temporary_identity: FileIdentity | None = None
+        try:
+            handle, temporary_info = self._open_child(
+                temporary_name,
+                access="write",
+                creation="create_new",
+                label="temporary instance record",
+            )
+            temporary_identity = temporary_info.identity
+            self._api.write(handle, payload)
+            self._api.flush(handle)
+            self._hook("before_record_publish")
+            self.verify_identity()
+            current = self._api.info(handle)
+            self._validate_child(current, "temporary instance record")
+            if current.identity != temporary_identity:
+                raise StartupError("临时实例记录在发布时被替换")
+            source_handle, source_info = self._open_child(
+                temporary_name,
+                access="read",
+                creation="open_existing",
+                label="temporary instance record",
+            )
+            self._api.close(source_handle)
+            if source_info.identity != temporary_identity:
+                raise StartupError("临时实例记录在发布时被替换")
+            self._api.close(handle)
+            handle = -1
+            self._api.replace(temporary_path, self.path / RECORD_NAME)
+            published = True
+            self.verify_identity()
+            final_handle, final_info = self._open_child(
+                RECORD_NAME, access="read", creation="open_existing", label="instance record"
+            )
+            self._api.close(final_handle)
+            if final_info.identity != temporary_identity:
+                raise StartupError("实例记录在发布时被替换")
+            return final_info.identity
+        finally:
+            if handle >= 0:
+                self._api.close(handle)
+            if not published and temporary_identity is not None:
+                try:
+                    self._api.delete(temporary_path, temporary_identity, self._final_path)
+                except (FileNotFoundError, OSError, StartupError):
+                    pass
+
+    def record_exists(self) -> bool:
+        self.verify_identity()
+        try:
+            handle, _ = self._open_child(
+                RECORD_NAME, access="read", creation="open_existing", label="instance record"
+            )
+        except FileNotFoundError:
+            return False
+        self._api.close(handle)
+        return True
+
+    def remove_record(self, expected: FileIdentity | None = None) -> None:
+        handle, info = self._open_child(
+            RECORD_NAME, access="read", creation="open_existing", label="instance record"
+        )
+        self._api.close(handle)
+        if expected is not None and info.identity != expected:
+            return
+        self._hook("before_record_cleanup")
+        self.verify_identity()
+        check_handle, check = self._open_child(
+            RECORD_NAME, access="read", creation="open_existing", label="instance record"
+        )
+        self._api.close(check_handle)
+        if check.identity != info.identity:
+            raise StartupError("实例记录在清理时被替换")
+        self._api.delete(self.path / RECORD_NAME, info.identity, self._final_path)
+        self.verify_identity()
+
+    def open_lock(self) -> int:
+        try:
+            handle, _ = self._open_child(
+                LOCK_NAME,
+                access="lock",
+                creation="open_always",
+                label="实例锁文件",
+                hook_stage="before_lock_open",
+            )
+            return handle
+        except InvalidInstanceRecord as exc:
+            raise StartupError("实例锁文件不可信") from exc
+
+    def lock(self, handle: int) -> bool:
+        return self._api.lock(handle)
+
+    def unlock(self, handle: int) -> None:
+        self._api.unlock(handle)
+
+    def close_lock(self, handle: int) -> None:
+        self._api.close(handle)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._api.close(self._directory_handle)
+        self._closed = True
+
+
+class _WinByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("attributes", ctypes.c_ulong),
+        ("creation_time_low", ctypes.c_ulong),
+        ("creation_time_high", ctypes.c_ulong),
+        ("access_time_low", ctypes.c_ulong),
+        ("access_time_high", ctypes.c_ulong),
+        ("write_time_low", ctypes.c_ulong),
+        ("write_time_high", ctypes.c_ulong),
+        ("volume_serial", ctypes.c_ulong),
+        ("size_high", ctypes.c_ulong),
+        ("size_low", ctypes.c_ulong),
+        ("link_count", ctypes.c_ulong),
+        ("file_index_high", ctypes.c_ulong),
+        ("file_index_low", ctypes.c_ulong),
+    ]
+
+
+class _WinFileAttributeTagInfo(ctypes.Structure):
+    _fields_ = [("attributes", ctypes.c_ulong), ("reparse_tag", ctypes.c_ulong)]
+
+
+class _WinOverlapped(ctypes.Structure):
+    _fields_ = [
+        ("internal", ctypes.c_void_p),
+        ("internal_high", ctypes.c_void_p),
+        ("offset", ctypes.c_ulong),
+        ("offset_high", ctypes.c_ulong),
+        ("event", ctypes.c_void_p),
+    ]
+
+
+class _WinSecurityAttributes(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_ulong),
+        ("security_descriptor", ctypes.c_void_p),
+        ("inherit_handle", ctypes.c_int),
+    ]
+
+
+class _WinFileDispositionInfoEx(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_ulong)]
+
+
+class _CtypesWindowsApi:
+    _FILE_ATTRIBUTE_DIRECTORY = 0x10
+    _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+    _FILE_ATTRIBUTE_TAG_INFO = 9
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_READ_ATTRIBUTES = 0x80
+    _FILE_LIST_DIRECTORY = 0x1
+    _READ_CONTROL = 0x00020000
+    _DELETE = 0x00010000
+    _GENERIC_READ = 0x80000000
+    _GENERIC_WRITE = 0x40000000
+    _FILE_SHARE_READ = 0x1
+    _FILE_SHARE_WRITE = 0x2
+    _FILE_SHARE_DELETE = 0x4
+    _CREATE_NEW = 1
+    _OPEN_EXISTING = 3
+    _OPEN_ALWAYS = 4
+    _MOVEFILE_REPLACE_EXISTING = 0x1
+    _MOVEFILE_WRITE_THROUGH = 0x8
+    _LOCKFILE_FAIL_IMMEDIATELY = 0x1
+    _LOCKFILE_EXCLUSIVE_LOCK = 0x2
+    _ERROR_LOCK_VIOLATION = 33
+    _ERROR_SHARING_VIOLATION = 32
+    _ERROR_ALREADY_EXISTS = 183
+    _FILE_DISPOSITION_INFO_EX = 21
+    _FILE_DISPOSITION_FLAG_DELETE = 1
+    _DRIVE_FIXED = 3
+    _INVALID_HANDLE_VALUE = int(ctypes.c_void_p(-1).value or -1)
+    _OWNER_SECURITY_INFORMATION = 0x1
+    _DACL_SECURITY_INFORMATION = 0x4
+    _SDDL_REVISION_1 = 1
+
+    def __init__(self) -> None:
+        if os.name != "nt" or not hasattr(ctypes, "WinDLL"):
+            raise StartupError("Windows 安全 API 不可用，已拒绝启动")
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        self._configure_api()
+        self._security_descriptor, self._expected_sddl = self._make_security_descriptor()
+
+    def _configure_api(self) -> None:
+        void_p = ctypes.c_void_p
+        ulong_p = ctypes.POINTER(ctypes.c_ulong)
+        self._kernel32.GetCurrentProcess.restype = void_p
+        self._kernel32.CloseHandle.argtypes = [void_p]
+        self._kernel32.CreateDirectoryW.argtypes = [ctypes.c_wchar_p, void_p]
+        self._kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            void_p,
+        ]
+        self._kernel32.CreateFileW.restype = void_p
+        self._kernel32.GetFileInformationByHandle.argtypes = [void_p, void_p]
+        self._kernel32.GetFileInformationByHandleEx.argtypes = [
+            void_p,
+            ctypes.c_int,
+            void_p,
+            ctypes.c_ulong,
+        ]
+        self._kernel32.GetFinalPathNameByHandleW.argtypes = [
+            void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
+        self._kernel32.GetFinalPathNameByHandleW.restype = ctypes.c_ulong
+        self._kernel32.ReadFile.argtypes = [void_p, void_p, ctypes.c_ulong, ulong_p, void_p]
+        self._kernel32.WriteFile.argtypes = [void_p, void_p, ctypes.c_ulong, ulong_p, void_p]
+        self._kernel32.SetFilePointerEx.argtypes = [
+            void_p,
+            ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_longlong),
+            ctypes.c_ulong,
+        ]
+        self._kernel32.SetEndOfFile.argtypes = [void_p]
+        self._kernel32.FlushFileBuffers.argtypes = [void_p]
+        self._kernel32.MoveFileExW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_ulong,
+        ]
+        self._kernel32.SetFileInformationByHandle.argtypes = [
+            void_p,
+            ctypes.c_int,
+            void_p,
+            ctypes.c_ulong,
+        ]
+        self._kernel32.LockFileEx.argtypes = [
+            void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            void_p,
+        ]
+        self._kernel32.UnlockFileEx.argtypes = [
+            void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            void_p,
+        ]
+        self._kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+        self._kernel32.GetDriveTypeW.restype = ctypes.c_uint
+        self._kernel32.LocalFree.argtypes = [void_p]
+        self._kernel32.LocalFree.restype = void_p
+        self._advapi32.OpenProcessToken.argtypes = [void_p, ctypes.c_ulong, void_p]
+        self._advapi32.GetTokenInformation.argtypes = [
+            void_p,
+            ctypes.c_int,
+            void_p,
+            ctypes.c_ulong,
+            ulong_p,
+        ]
+        self._advapi32.ConvertSidToStringSidW.argtypes = [void_p, void_p]
+        self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_ulong,
+            void_p,
+            ulong_p,
+        ]
+        self._advapi32.GetKernelObjectSecurity.argtypes = [
+            void_p,
+            ctypes.c_ulong,
+            void_p,
+            ctypes.c_ulong,
+            ulong_p,
+        ]
+        self._advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+            void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            void_p,
+            ulong_p,
+        ]
+
+    @staticmethod
+    def _value(handle: object) -> int:
+        value = getattr(handle, "value", handle)
+        return int(cast(int, value)) if value is not None else -1
+
+    @staticmethod
+    def _error(context: str, code: int | None = None) -> OSError:
+        number = ctypes.get_last_error() if code is None else code  # type: ignore[attr-defined]
+        error = cast(OSError, ctypes.WinError(number))  # type: ignore[attr-defined]
+        error.args = (number, f"{context}: {error.strerror}")
+        return error
+
+    @staticmethod
+    def _long_path(path: Path) -> str:
+        absolute = ntpath.abspath(str(path))
+        if absolute.startswith("\\\\?\\"):
+            return absolute
+        if absolute.startswith("\\\\"):
+            return "\\\\?\\UNC\\" + absolute[2:]
+        return "\\\\?\\" + absolute
+
+    def _current_user_sid(self) -> str:
+        token = ctypes.c_void_p()
+        if not self._advapi32.OpenProcessToken(
+            self._kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)
+        ):
+            raise self._error("OpenProcessToken failed")
+        try:
+            needed = ctypes.c_ulong()
+            self._advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
+            buffer = ctypes.create_string_buffer(needed.value)
+            if not self._advapi32.GetTokenInformation(
+                token, 1, buffer, needed, ctypes.byref(needed)
+            ):
+                raise self._error("GetTokenInformation failed")
+            sid_pointer = ctypes.c_void_p.from_buffer(buffer).value
+            sid_text = ctypes.c_wchar_p()
+            if not self._advapi32.ConvertSidToStringSidW(sid_pointer, ctypes.byref(sid_text)):
+                raise self._error("ConvertSidToStringSidW failed")
+            try:
+                if sid_text.value is None:
+                    raise StartupError("无法确定当前 Windows 用户 SID")
+                return sid_text.value
+            finally:
+                self._kernel32.LocalFree(sid_text)
+        finally:
+            self.close(self._value(token))
+
+    def _make_security_descriptor(self) -> tuple[ctypes.c_void_p, str]:
+        sid = self._current_user_sid()
+        sddl = f"O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)"
+        descriptor = ctypes.c_void_p()
+        if not self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, self._SDDL_REVISION_1, ctypes.byref(descriptor), None
+        ):
+            raise self._error("ConvertStringSecurityDescriptorToSecurityDescriptorW failed")
+        return descriptor, sddl
+
+    def __del__(self) -> None:
+        descriptor = getattr(self, "_security_descriptor", None)
+        if descriptor:
+            self._kernel32.LocalFree(descriptor)
+
+    def _security_attributes(self) -> _WinSecurityAttributes:
+        return _WinSecurityAttributes(
+            ctypes.sizeof(_WinSecurityAttributes), self._security_descriptor, 0
+        )
+
+    def _acl_safe(self, handle: int) -> bool:
+        requested = self._OWNER_SECURITY_INFORMATION | self._DACL_SECURITY_INFORMATION
+        needed = ctypes.c_ulong()
+        self._advapi32.GetKernelObjectSecurity(handle, requested, None, 0, ctypes.byref(needed))
+        if not needed.value:
+            raise self._error("GetKernelObjectSecurity failed")
+        buffer = ctypes.create_string_buffer(needed.value)
+        if not self._advapi32.GetKernelObjectSecurity(
+            handle, requested, buffer, needed, ctypes.byref(needed)
+        ):
+            raise self._error("GetKernelObjectSecurity failed")
+        text = ctypes.c_wchar_p()
+        if not self._advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            buffer, self._SDDL_REVISION_1, requested, ctypes.byref(text), None
+        ):
+            raise self._error("ConvertSecurityDescriptorToStringSecurityDescriptorW failed")
+        try:
+            rendered = text.value or ""
+            expected_owner, expected_dacl = self._expected_sddl.split("D:P", 1)
+            if not rendered.startswith(expected_owner) or "D:P" not in rendered:
+                return False
+            rendered_dacl = rendered.split("D:P", 1)[1]
+            return sorted(re.findall(r"\([^)]*\)", rendered_dacl)) == sorted(
+                re.findall(r"\([^)]*\)", expected_dacl)
+            )
+        finally:
+            self._kernel32.LocalFree(text)
+
+    def validate_local_path(self, path: Path) -> Path:
+        raw = str(path)
+        if raw.startswith(("\\\\", "//")):
+            raise StartupError("Windows 运行目录必须位于本机固定磁盘，不能使用 UNC/network 路径")
+        absolute = Path(ntpath.abspath(raw))
+        drive = ntpath.splitdrive(str(absolute))[0]
+        if not drive or self._kernel32.GetDriveTypeW(f"{drive}\\") != self._DRIVE_FIXED:
+            raise StartupError("Windows 运行目录必须位于本机固定磁盘")
+        # Open every existing ancestor without following its reparse point.
+        parts = PureWindowsPath(str(absolute)).parts
+        current = Path(parts[0])
+        for component in parts[1:-1]:
+            current /= component
+            try:
+                handle, info = self.open_directory(current)
+            except FileNotFoundError:
+                continue
+            try:
+                if info.is_reparse:
+                    raise StartupError("Windows 运行目录路径包含 reparse point/junction")
+            finally:
+                self.close(handle)
+        return absolute
+
+    def create_directory(self, path: Path) -> None:
+        parts = PureWindowsPath(str(path)).parts
+        current = Path(parts[0])
+        attributes = self._security_attributes()
+        for component in parts[1:]:
+            current /= component
+            created = bool(
+                self._kernel32.CreateDirectoryW(self._long_path(current), ctypes.byref(attributes))
+            )
+            if not created:
+                code = ctypes.get_last_error()  # type: ignore[attr-defined]
+                if code != self._ERROR_ALREADY_EXISTS:
+                    raise self._error(f"CreateDirectoryW failed for {current}", code)
+            handle, info = self.open_directory(current)
+            try:
+                if info.is_reparse or not info.is_directory:
+                    raise StartupError("Windows 运行目录路径包含 reparse point/junction")
+                if created and not info.acl_safe:
+                    raise StartupError("新建 Windows 运行目录权限不是当前用户专用")
+            finally:
+                self.close(handle)
+
+    def _create_file(
+        self,
+        path: Path,
+        access: int,
+        creation: int,
+        *,
+        directory: bool,
+        share_delete: bool,
+    ) -> tuple[int, _WindowsFileInfo]:
+        attributes = self._security_attributes()
+        flags = self._FILE_FLAG_OPEN_REPARSE_POINT
+        if directory:
+            flags |= self._FILE_FLAG_BACKUP_SEMANTICS
+        ctypes.set_last_error(0)  # type: ignore[attr-defined]
+        share_mode = self._FILE_SHARE_READ | self._FILE_SHARE_WRITE
+        if share_delete:
+            share_mode |= self._FILE_SHARE_DELETE
+        raw_handle = self._kernel32.CreateFileW(
+            self._long_path(path),
+            access | self._FILE_READ_ATTRIBUTES | self._READ_CONTROL,
+            share_mode,
+            ctypes.byref(attributes),
+            creation,
+            flags,
+            None,
+        )
+        handle = self._value(raw_handle)
+        if handle in {-1, self._INVALID_HANDLE_VALUE}:
+            code = ctypes.get_last_error()  # type: ignore[attr-defined]
+            if code in {2, 3}:
+                raise FileNotFoundError(path)
+            if code == 80:
+                raise FileExistsError(path)
+            raise self._error(f"CreateFileW failed for {path}", code)
+        try:
+            return handle, self.info(handle)
+        except Exception:
+            self.close(handle)
+            raise
+
+    def open_directory(self, path: Path) -> tuple[int, _WindowsFileInfo]:
+        return self._create_file(
+            path,
+            self._FILE_LIST_DIRECTORY,
+            self._OPEN_EXISTING,
+            directory=True,
+            share_delete=False,
+        )
+
+    def open_file(self, path: Path, *, access: str, creation: str) -> tuple[int, _WindowsFileInfo]:
+        desired = {
+            "read": self._GENERIC_READ,
+            "write": self._GENERIC_WRITE | self._GENERIC_READ,
+            "lock": self._GENERIC_READ | self._GENERIC_WRITE,
+        }[access]
+        disposition = {
+            "open_existing": self._OPEN_EXISTING,
+            "create_new": self._CREATE_NEW,
+            "open_always": self._OPEN_ALWAYS,
+        }[creation]
+        return self._create_file(
+            path, desired, disposition, directory=False, share_delete=True
+        )
+
+    def info(self, handle: int) -> _WindowsFileInfo:
+        basic = _WinByHandleFileInformation()
+        if not self._kernel32.GetFileInformationByHandle(handle, ctypes.byref(basic)):
+            raise self._error("GetFileInformationByHandle failed")
+        tag = _WinFileAttributeTagInfo()
+        if not self._kernel32.GetFileInformationByHandleEx(
+            handle, self._FILE_ATTRIBUTE_TAG_INFO, ctypes.byref(tag), ctypes.sizeof(tag)
+        ):
+            raise self._error("GetFileInformationByHandleEx failed")
+        needed = self._kernel32.GetFinalPathNameByHandleW(handle, None, 0, 0)
+        if not needed:
+            raise self._error("GetFinalPathNameByHandleW failed")
+        final_buffer = ctypes.create_unicode_buffer(needed + 1)
+        if not self._kernel32.GetFinalPathNameByHandleW(handle, final_buffer, len(final_buffer), 0):
+            raise self._error("GetFinalPathNameByHandleW failed")
+        return _WindowsFileInfo(
+            identity=(
+                int(basic.volume_serial),
+                (int(basic.file_index_high) << 32) | int(basic.file_index_low),
+            ),
+            final_path=final_buffer.value,
+            is_directory=bool(tag.attributes & self._FILE_ATTRIBUTE_DIRECTORY),
+            is_reparse=bool(tag.attributes & self._FILE_ATTRIBUTE_REPARSE_POINT),
+            link_count=int(basic.link_count),
+            size=(int(basic.size_high) << 32) | int(basic.size_low),
+            acl_safe=self._acl_safe(handle),
+        )
+
+    def read(self, handle: int, limit: int) -> bytes:
+        buffer = ctypes.create_string_buffer(limit)
+        read = ctypes.c_ulong()
+        if not self._kernel32.ReadFile(handle, buffer, limit, ctypes.byref(read), None):
+            raise self._error("ReadFile failed")
+        return bytes(buffer.raw[: read.value])
+
+    def write(self, handle: int, payload: bytes) -> None:
+        position = ctypes.c_longlong()
+        if not self._kernel32.SetFilePointerEx(handle, 0, ctypes.byref(position), 0):
+            raise self._error("SetFilePointerEx failed")
+        if not self._kernel32.SetEndOfFile(handle):
+            raise self._error("SetEndOfFile failed")
+        offset = 0
+        while offset < len(payload):
+            written = ctypes.c_ulong()
+            chunk = payload[offset:]
+            buffer = ctypes.create_string_buffer(chunk)
+            if not self._kernel32.WriteFile(
+                handle, buffer, len(chunk), ctypes.byref(written), None
+            ):
+                raise self._error("WriteFile failed")
+            if written.value == 0:
+                raise OSError("WriteFile returned a short write")
+            offset += written.value
+
+    def flush(self, handle: int) -> None:
+        if not self._kernel32.FlushFileBuffers(handle):
+            raise self._error("FlushFileBuffers failed")
+
+    def replace(self, source: Path, target: Path) -> None:
+        source_text, target_text = self._long_path(source), self._long_path(target)
+        if not self._kernel32.MoveFileExW(
+            source_text,
+            target_text,
+            self._MOVEFILE_REPLACE_EXISTING | self._MOVEFILE_WRITE_THROUGH,
+        ):
+            raise self._error("MoveFileExW failed")
+
+    def delete(self, path: Path, expected: FileIdentity, expected_parent: str) -> None:
+        handle, info = self._create_file(
+            path,
+            self._DELETE | self._GENERIC_READ,
+            self._OPEN_EXISTING,
+            directory=False,
+            share_delete=True,
+        )
+        try:
+            if (
+                info.identity != expected
+                or info.is_reparse
+                or info.is_directory
+                or info.link_count != 1
+                or _windows_normalize_final_path(ntpath.dirname(info.final_path)) != expected_parent
+            ):
+                raise StartupError("实例记录在清理时被替换")
+            disposition = _WinFileDispositionInfoEx(self._FILE_DISPOSITION_FLAG_DELETE)
+            if not self._kernel32.SetFileInformationByHandle(
+                handle,
+                self._FILE_DISPOSITION_INFO_EX,
+                ctypes.byref(disposition),
+                ctypes.sizeof(disposition),
+            ):
+                raise self._error("SetFileInformationByHandle delete failed")
+        finally:
+            self.close(handle)
+
+    def lock(self, handle: int) -> bool:
+        overlapped = _WinOverlapped()
+        if self._kernel32.LockFileEx(
+            handle,
+            self._LOCKFILE_EXCLUSIVE_LOCK | self._LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            ctypes.byref(overlapped),
+        ):
+            return True
+        code = ctypes.get_last_error()  # type: ignore[attr-defined]
+        if code in {self._ERROR_LOCK_VIOLATION, self._ERROR_SHARING_VIOLATION}:
+            return False
+        raise self._error("LockFileEx failed", code)
+
+    def unlock(self, handle: int) -> None:
+        overlapped = _WinOverlapped()
+        if not self._kernel32.UnlockFileEx(handle, 0, 1, 0, ctypes.byref(overlapped)):
+            raise self._error("UnlockFileEx failed")
+
+    def close(self, handle: int) -> None:
+        if not self._kernel32.CloseHandle(handle):
+            raise self._error("CloseHandle failed")
+
+
 def _open_runtime_directory(
     runtime_dir: Path, operation_hook: OperationHook | None, *, create: bool
-) -> _PosixRuntimeDirectory:
+) -> _PosixRuntimeDirectory | _WindowsRuntimeDirectory:
     if os.name == "nt":
-        raise StartupError("Windows 安全运行目录句柄与 ACL 无法证明，已拒绝启动")
+        return _WindowsRuntimeDirectory.open(runtime_dir, operation_hook, create=create)
     return _PosixRuntimeDirectory.open(runtime_dir, operation_hook, create=create)
 
 
@@ -454,7 +1275,11 @@ def probe_fis(port: int, *, timeout: float = 0.35) -> bool:
 
 
 class InstanceLease:
-    def __init__(self, directory: _PosixRuntimeDirectory, lock_descriptor: int) -> None:
+    def __init__(
+        self,
+        directory: _PosixRuntimeDirectory | _WindowsRuntimeDirectory,
+        lock_descriptor: int,
+    ) -> None:
         self.runtime_dir = directory.path
         self._directory = directory
         self._lock_descriptor = lock_descriptor
@@ -478,10 +1303,14 @@ class InstanceLease:
                     self._directory.remove_record(self._owned_identity)
             except (FileNotFoundError, InvalidInstanceRecord, OSError, StartupError):
                 pass
-        fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
-        os.close(self._lock_descriptor)
-        self._directory.close()
-        self._closed = True
+        try:
+            self._directory.unlock(self._lock_descriptor)
+        finally:
+            try:
+                self._directory.close_lock(self._lock_descriptor)
+            finally:
+                self._directory.close()
+                self._closed = True
 
     def __enter__(self) -> Self:
         return self
@@ -496,21 +1325,21 @@ def acquire_instance(
     probe: Probe = probe_fis,
     _operation_hook: OperationHook | None = None,
 ) -> InstanceLease | ExistingInstance:
+    if os.name == "nt":
+        return _acquire_windows_instance(runtime_dir, probe=probe, _operation_hook=_operation_hook)
     directory = _open_runtime_directory(runtime_dir, _operation_hook, create=True)
     lock_descriptor = -1
     keep_resources = False
     try:
         lock_descriptor = directory.open_lock()
-        try:
-            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+        if not directory.lock(lock_descriptor):
             try:
                 record, _ = directory.read_record()
             except (FileNotFoundError, InvalidInstanceRecord) as record_exc:
                 raise StartupError("另一个实例持有锁，但无法确认其健康状态") from record_exc
             if probe(record.port):
                 return ExistingInstance(record.port)
-            raise StartupError("另一个实例持有锁，但无法确认其为健康的 FIS 实例") from exc
+            raise StartupError("另一个实例持有锁，但无法确认其为健康的 FIS 实例")
 
         lease = InstanceLease(directory, lock_descriptor)
         if directory.record_exists():
@@ -531,6 +1360,51 @@ def acquire_instance(
     finally:
         if not keep_resources:
             if lock_descriptor >= 0:
-                os.close(lock_descriptor)
+                directory.close_lock(lock_descriptor)
+            if not directory._closed:
+                directory.close()
+
+
+def _acquire_windows_instance(
+    runtime_dir: Path,
+    *,
+    probe: Probe,
+    _operation_hook: OperationHook | None = None,
+    api: _WindowsApi | None = None,
+) -> InstanceLease | ExistingInstance:
+    directory = _WindowsRuntimeDirectory.open(runtime_dir, _operation_hook, create=True, api=api)
+    lock_handle = -1
+    keep_resources = False
+    try:
+        lock_handle = directory.open_lock()
+        if not directory.lock(lock_handle):
+            try:
+                record, _ = directory.read_record()
+            except (FileNotFoundError, InvalidInstanceRecord) as exc:
+                raise StartupError("另一个实例持有锁，但无法确认其健康状态") from exc
+            if probe(record.port):
+                return ExistingInstance(record.port)
+            raise StartupError("另一个实例持有锁，但无法确认其为健康的 FIS 实例")
+
+        lease = InstanceLease(directory, lock_handle)
+        if directory.record_exists():
+            try:
+                record, identity = directory.read_record()
+            except _UnsafeInstanceFile as exc:
+                raise StartupError("旧实例记录不可信，无法安全清理") from exc
+            except InvalidInstanceRecord:
+                directory.remove_record()
+            else:
+                if probe(record.port):
+                    lease.close()
+                    lock_handle = -1
+                    return ExistingInstance(record.port)
+                directory.remove_record(identity)
+        keep_resources = True
+        return lease
+    finally:
+        if not keep_resources:
+            if lock_handle >= 0:
+                directory.close_lock(lock_handle)
             if not directory._closed:
                 directory.close()

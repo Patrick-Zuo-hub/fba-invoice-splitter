@@ -361,7 +361,10 @@ def test_windows_runtime_rejects_reparse_directory(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     runtime = tmp_path / "runtime"
-    runtime.symlink_to(outside, target_is_directory=True)
+    try:
+        runtime.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"creating a Windows reparse point is not permitted: {exc}")
 
     with pytest.raises(StartupError, match="reparse|junction|安全"):
         write_instance_record(runtime, _record())
