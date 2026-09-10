@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from fastapi import Response
 from fastapi.testclient import TestClient
 
 from fis.config import Settings
@@ -10,6 +11,22 @@ HOST = "127.0.0.1:8765"
 
 def _client(tmp_path: Path) -> TestClient:
     return TestClient(create_app(Settings(data_root=tmp_path / "data"), bound_port=8765))
+
+
+def _assert_security_headers(response: Response) -> None:
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["content-security-policy"] == (
+        "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
+        "form-action 'self'; object-src 'none'"
+    )
+    assert response.headers["cross-origin-resource-policy"] == "same-origin"
+    assert response.headers["permissions-policy"]
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert not any(
+        name.lower().startswith("access-control-allow-") for name in response.headers
+    )
 
 
 def test_app_records_settings_and_actual_bound_port(tmp_path: Path) -> None:
@@ -71,17 +88,21 @@ def test_security_headers_are_applied_to_success_rejection_and_not_found(
         client.get("/health", headers={"host": "attacker.example"}),
         client.get("/missing", headers={"host": HOST}),
     ):
-        assert response.headers["cache-control"] == "no-store"
-        assert response.headers["content-security-policy"] == (
-            "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
-            "form-action 'self'; object-src 'none'"
-        )
-        assert response.headers["cross-origin-resource-policy"] == "same-origin"
-        assert response.headers["permissions-policy"]
-        assert response.headers["referrer-policy"] == "no-referrer"
-        assert response.headers["x-content-type-options"] == "nosniff"
-        assert response.headers["x-frame-options"] == "DENY"
-        assert not any(
-            name.lower().startswith("access-control-allow-")
-            for name in response.headers
-        )
+        _assert_security_headers(response)
+
+
+def test_unhandled_exception_returns_generic_secured_500(tmp_path: Path) -> None:
+    app = create_app(Settings(data_root=tmp_path / "data"), bound_port=8765)
+
+    @app.get("/_test/error")
+    def error_route() -> None:
+        raise RuntimeError("sensitive-customer-value")
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/_test/error", headers={"host": HOST}
+    )
+
+    assert response.status_code == 500
+    assert response.text == "内部服务器错误"
+    assert "sensitive-customer-value" not in response.text
+    _assert_security_headers(response)

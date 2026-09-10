@@ -62,7 +62,7 @@ def _require_exact_header(
         raise _RejectedRequest(status_code)
 
 
-def _secure_headers(response: Response) -> Response:
+def secure_response(response: Response) -> Response:
     response.headers["Cache-Control"] = "no-store"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
@@ -113,4 +113,4 @@ class LocalRequestMiddleware(BaseHTTPMiddleware):
         except _RejectedRequest as exc:
             message = "请求无效" if exc.status_code == 400 else "禁止访问"
             response = PlainTextResponse(message, status_code=exc.status_code)
-        return _secure_headers(response)
+        return secure_response(response)
