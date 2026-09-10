@@ -267,6 +267,9 @@ def _worksheet(shipment_rows: list[tuple[int, str, int]], total_row: int) -> byt
         validations,
         "dataValidation",
         type="list",
+        allowBlank="1",
+        showInputMessage="1",
+        showErrorMessage="1",
         sqref="O4:P4 R5:S5",
     )
     _element(broken_list, "formula1").text = "#REF!"

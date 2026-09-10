@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal, localcontext
+from decimal import ROUND_DOWN, ROUND_UP, Decimal, localcontext
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -376,6 +376,28 @@ def test_sheet_transform_rejects_formula_cache_overflow() -> None:
     assert caught.value.location == "N"
 
 
+def test_formula_cache_bytes_do_not_inherit_global_decimal_rounding() -> None:
+    parsed = _bundle()
+    replacements = {
+        13: ParsedItem("S1", 13, {"K": "1", "M": "0.5", "N": "3", "P": "0.5"}),
+        16: ParsedItem("S1", 16, {"K": "1", "M": "0.5", "N": "3", "P": "0.5"}),
+    }
+    bundle = ParsedBundle(
+        (ParsedShipment("S1", tuple(replacements.values())),),
+        parsed.product_rows,
+        parsed.separator_row,
+        parsed.total_row,
+    )
+    outputs = []
+    for rounding in (ROUND_DOWN, ROUND_UP):
+        with localcontext() as context:
+            context.prec = 3
+            context.rounding = rounding
+            outputs.append(transform_sheet_xml(_worksheet(), bundle, (13, 16), {}))
+
+    assert outputs[0] == outputs[1]
+
+
 @pytest.mark.parametrize("missing_ref", ["K18", "G8", "O10", "C4"])
 def test_sheet_transform_rejects_missing_configured_target_cells(missing_ref: str) -> None:
     root = _parsed_xml(_worksheet())
@@ -507,6 +529,53 @@ def test_sheet_transform_discards_stale_ui_view_references_for_each_shipment(
     assert output.xpath("./main:sheetViews//@sqref", namespaces={"main": MAIN_NS}) == []
 
 
+@pytest.mark.parametrize("node_kind", ["main", "foreign", "comment", "pi"])
+def test_sheet_data_rejects_every_non_row_child_instead_of_dropping_it(node_kind: str) -> None:
+    root = _parsed_xml(_worksheet())
+    sheet_data = root.find(f"{{{MAIN_NS}}}sheetData")
+    assert sheet_data is not None
+    if node_kind == "main":
+        sheet_data.append(etree.Element(f"{{{MAIN_NS}}}unexpected"))
+    elif node_kind == "foreign":
+        sheet_data.append(etree.Element("{urn:evil}row"))
+    elif node_kind == "comment":
+        sheet_data.append(etree.Comment("synthetic"))
+    else:
+        sheet_data.append(etree.ProcessingInstruction("synthetic", "value"))
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "UNSAFE_REFERENCE"
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        'INDIRECT("A18")',
+        ' _xlfn.INDIRECT ("\'Other Sheet\'!A18")',
+        'INDIRECT.EXT("[book.xlsx]Other!A18")',
+        "OFFSET(A11, 7, 0)",
+        "_xlfn.OFFSET (A11,7,0)",
+    ],
+)
+def test_sheet_transform_blocks_dynamic_reference_functions(formula: str) -> None:
+    root = _parsed_xml(_worksheet())
+    _cell_at(root, "Q19").find(f"{{{MAIN_NS}}}f").text = formula
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "UNSAFE_FORMULA_TRANSFORM"
+
+
+def test_dynamic_reference_function_names_inside_string_constants_are_not_blocked() -> None:
+    root = _parsed_xml(_worksheet())
+    _cell_at(root, "Q19").find(f"{{{MAIN_NS}}}f").text = 'IF(A1="INDIRECT( OFFSET(",1,0)'
+
+    transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+
 def test_sheet_transform_updates_conditional_format_and_auto_filter_ranges() -> None:
     root = _parsed_xml(_worksheet())
     etree.SubElement(root, f"{{{MAIN_NS}}}conditionalFormatting", sqref="$A$12:$Z$16")
@@ -530,6 +599,9 @@ def test_sheet_transform_preserves_only_the_exact_v1_broken_list_validation() ->
         validations,
         f"{{{MAIN_NS}}}dataValidation",
         type="list",
+        allowBlank="1",
+        showInputMessage="1",
+        showErrorMessage="1",
         sqref="O4:P4 R5:S5",
     )
     etree.SubElement(anomaly, f"{{{MAIN_NS}}}formula1").text = "#REF!"
@@ -571,6 +643,28 @@ def test_v1_broken_validation_allowlist_is_exact_and_narrow(
         transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
 
     assert caught.value.code in {"UNSAFE_FORMULA_TRANSFORM", "UNSAFE_REFERENCE"}
+
+
+def test_v1_broken_validation_rejects_any_attribute_outside_exact_baseline() -> None:
+    root = _parsed_xml(_worksheet())
+    validations = root.find(f"{{{MAIN_NS}}}dataValidations")
+    assert validations is not None
+    anomaly = etree.SubElement(
+        validations,
+        f"{{{MAIN_NS}}}dataValidation",
+        type="list",
+        allowBlank="1",
+        showInputMessage="1",
+        showErrorMessage="1",
+        operator="between",
+        sqref="O4:P4 R5:S5",
+    )
+    etree.SubElement(anomaly, f"{{{MAIN_NS}}}formula1").text = "#REF!"
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "UNSAFE_FORMULA_TRANSFORM"
 
 
 @pytest.mark.parametrize("misplaced_tag", ["mergeCell", "hyperlink", "dataValidation"])
@@ -638,6 +732,26 @@ def test_comments_move_and_reject_removed_row_references() -> None:
     comment_list[-1].set("ref", "A14")
     with pytest.raises(WorkbookError) as caught:
         transform_comments_xml(etree.tostring(root), _bundle(), (13, 16))
+    assert caught.value.code == "UNSAFE_REFERENCE"
+
+
+@pytest.mark.parametrize("invalid_kind", ["wrong_path", "foreign_comment", "namespaced_ref"])
+def test_comments_reject_every_reference_not_actually_processed(invalid_kind: str) -> None:
+    root = etree.Element(f"{{{MAIN_NS}}}comments", nsmap={None: MAIN_NS, "e": "urn:evil"})
+    comment_list = etree.SubElement(root, f"{{{MAIN_NS}}}commentList")
+    if invalid_kind == "wrong_path":
+        extensions = etree.SubElement(root, f"{{{MAIN_NS}}}extLst")
+        extension = etree.SubElement(extensions, f"{{{MAIN_NS}}}ext", uri="synthetic")
+        etree.SubElement(extension, f"{{{MAIN_NS}}}comment", ref="A14")
+    elif invalid_kind == "foreign_comment":
+        etree.SubElement(comment_list, "{urn:evil}comment", ref="A14")
+    else:
+        comment = etree.SubElement(comment_list, f"{{{MAIN_NS}}}comment", ref="L11")
+        comment.set("{urn:evil}ref", "A14")
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_comments_xml(etree.tostring(root), _bundle(), (13, 16))
+
     assert caught.value.code == "UNSAFE_REFERENCE"
 
 
@@ -742,6 +856,23 @@ def test_workbook_preserves_other_sheet_defined_name_with_escaped_apostrophe() -
     assert output.xpath(
         "string(.//main:definedName)", namespaces={"main": MAIN_NS}
     ) == "'Pat''s Sheet'!$A$18"
+
+
+def test_other_sheet_local_name_cannot_hide_explicit_target_sheet_references() -> None:
+    root = etree.Element(f"{{{MAIN_NS}}}workbook", nsmap={None: MAIN_NS})
+    sheets = etree.SubElement(root, f"{{{MAIN_NS}}}sheets")
+    etree.SubElement(sheets, f"{{{MAIN_NS}}}sheet", name="装箱单&发票 发货信息", sheetId="1")
+    etree.SubElement(sheets, f"{{{MAIN_NS}}}sheet", name="Pat's Sheet", sheetId="2")
+    names = etree.SubElement(root, f"{{{MAIN_NS}}}definedNames")
+    name = etree.SubElement(
+        names, f"{{{MAIN_NS}}}definedName", name="ConflictingScope", localSheetId="1"
+    )
+    name.text = "'Pat''s Sheet'!$A$18,'装箱单&发票 发货信息'!$A$18"
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_workbook_xml(etree.tostring(root), _bundle(), (13, 16))
+
+    assert caught.value.code == "UNSAFE_FORMULA_TRANSFORM"
 
 
 def _drawing() -> bytes:

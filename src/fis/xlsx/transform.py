@@ -6,7 +6,16 @@ import copy
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime
-from decimal import Decimal, DecimalException, InvalidOperation, Overflow, Underflow, localcontext
+from decimal import (
+    ROUND_HALF_EVEN,
+    Context,
+    Decimal,
+    DecimalException,
+    DivisionByZero,
+    InvalidOperation,
+    Overflow,
+    Underflow,
+)
 from typing import cast
 
 from lxml import etree  # type: ignore[import-untyped]
@@ -45,6 +54,17 @@ _MAX_SIGNIFICANT_DIGITS = 15
 _MIN_EXCEL_EXPONENT = -307
 _MAX_EXCEL_EXPONENT = 307
 _ALLOWLISTED_BROKEN_VALIDATION_SQREF = "O4:P4 R5:S5"
+_ALLOWLISTED_BROKEN_VALIDATION_ATTRIBUTES = {
+    "type": "list",
+    "allowBlank": "1",
+    "showInputMessage": "1",
+    "showErrorMessage": "1",
+    "sqref": _ALLOWLISTED_BROKEN_VALIDATION_SQREF,
+}
+_DYNAMIC_REFERENCE_FUNCTION = re.compile(
+    r"(?<![A-Z0-9_.])(?:_XLFN\.)?(?:INDIRECT(?:\.EXT)?|OFFSET)\s*\(",
+    re.ASCII | re.IGNORECASE,
+)
 
 
 def _error(code: str, message: str, location: str | None = None) -> WorkbookError:
@@ -178,16 +198,21 @@ def _sum_decimals_exact(values: Sequence[Decimal]) -> Decimal:
 def _divide_for_cache(numerator: Decimal, denominator: Decimal, column: str) -> Decimal:
     """Produce deterministic cached arithmetic independent of global Decimal settings."""
 
-    with localcontext() as context:
-        context.prec = _MAX_SIGNIFICANT_DIGITS
-        context.Emin = _MIN_EXCEL_EXPONENT
-        context.Emax = _MAX_EXCEL_EXPONENT
-        context.traps[Overflow] = True
-        context.traps[Underflow] = True
-        try:
-            result = numerator / denominator
-        except DecimalException as exc:
-            raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column) from exc
+    context = Context(
+        prec=_MAX_SIGNIFICANT_DIGITS,
+        rounding=ROUND_HALF_EVEN,
+        Emin=_MIN_EXCEL_EXPONENT,
+        Emax=_MAX_EXCEL_EXPONENT,
+        capitals=1,
+        clamp=0,
+    )
+    for signal in context.traps:
+        context.traps[signal] = signal in {DivisionByZero, InvalidOperation, Overflow, Underflow}
+    context.clear_flags()
+    try:
+        result = context.divide(numerator, denominator)
+    except DecimalException as exc:
+        raise _error("INVALID_TOTAL_INPUT", "合计字段不是有效数字", column) from exc
     if not result.is_finite() or (
         not result.is_zero()
         and (result.adjusted() < _MIN_EXCEL_EXPONENT or result.adjusted() > _MAX_EXCEL_EXPONENT)
@@ -369,8 +394,13 @@ def _assert_formula_unaffected(
     location: str,
     *,
     current_sheet: str = STANDARD_V1.sheet_name,
+    unqualified_sheet: str | None = None,
 ) -> None:
     inspected = _formula_without_strings(formula)
+    if _DYNAMIC_REFERENCE_FUNCTION.search(inspected):
+        raise _error(
+            "UNSAFE_FORMULA_TRANSFORM", "动态公式引用不支持安全行转换", location
+        )
     if "[" in inspected or "]" in inspected:
         raise _error("UNSAFE_FORMULA_TRANSFORM", "公式引用结构不受支持", location)
     if re.search(
@@ -389,6 +419,8 @@ def _assert_formula_unaffected(
             consumed_bangs.add(bang)
             if _sheet_name(sheet) != current_sheet:
                 continue
+        elif unqualified_sheet is not None and unqualified_sheet != current_sheet:
+            continue
         reference = match.group("reference").upper()
         if re.fullmatch(r"\$?[A-Z]{1,3}:\$?[A-Z]{1,3}", reference):
             continue
@@ -630,8 +662,14 @@ def _write_inline(cell: etree._Element, value: object) -> None:
 
 
 def _row_elements(sheet_data: etree._Element) -> dict[int, etree._Element]:
+    if sheet_data.text and sheet_data.text.strip():
+        raise _error("UNSAFE_REFERENCE", "工作表数据区域包含不支持的内容", "sheetData")
     result: dict[int, etree._Element] = {}
-    for row in sheet_data.findall(f"{{{MAIN_NS}}}row"):
+    for row in sheet_data:
+        if not isinstance(row.tag, str) or row.tag != f"{{{MAIN_NS}}}row":
+            raise _error("UNSAFE_REFERENCE", "工作表数据区域包含不支持的节点", "sheetData")
+        if row.tail and row.tail.strip():
+            raise _error("UNSAFE_REFERENCE", "工作表数据区域包含不支持的内容", "sheetData")
         value = row.get("r")
         if value is None or not value.isascii() or not value.isdigit():
             raise _error("UNSAFE_REFERENCE", "工作表行号无法安全转换", value)
@@ -666,8 +704,7 @@ def _required_rows(parsed: ParsedBundle, rows: Mapping[int, etree._Element]) -> 
 def _is_allowlisted_broken_validation(validation: etree._Element) -> bool:
     children = list(validation)
     return (
-        validation.get("type") == "list"
-        and validation.get("sqref") == _ALLOWLISTED_BROKEN_VALIDATION_SQREF
+        validation.attrib == _ALLOWLISTED_BROKEN_VALIDATION_ATTRIBUTES
         and len(children) == 1
         and children[0].tag == f"{{{MAIN_NS}}}formula1"
         and not children[0].attrib
@@ -904,12 +941,40 @@ def transform_comments_xml(
     root = _xml_root(comments_xml, "comments")
     if root.tag != f"{{{MAIN_NS}}}comments":
         raise _error("INVALID_XML", "批注 XML 根节点无效", "comments")
+    processed: set[etree._Element] = set()
+    _validate_comment_reference_nodes(root)
     for comment in root.xpath("./main:commentList/main:comment", namespaces={"main": MAIN_NS}):
         reference = comment.get("ref")
         if reference is None:
             raise _error("UNSAFE_REFERENCE", "批注缺少引用", "comment")
         comment.set("ref", _translate_cell(reference, transform, reference))
+        processed.add(comment)
+    _validate_comment_reference_nodes(root, processed)
     return _serialize(root)
+
+
+def _validate_comment_reference_nodes(
+    root: etree._Element, processed: set[etree._Element] | None = None
+) -> None:
+    """Ensure every comment reference has the exact supported QName and parent path."""
+
+    for element in root.iter():
+        for attribute in element.attrib:
+            attribute_name = etree.QName(attribute)
+            if attribute_name.localname != "ref":
+                continue
+            parent = element.getparent()
+            grandparent = parent.getparent() if parent is not None else None
+            supported = (
+                attribute_name.namespace is None
+                and element.tag == f"{{{MAIN_NS}}}comment"
+                and parent is not None
+                and parent.tag == f"{{{MAIN_NS}}}commentList"
+                and grandparent is root
+                and (processed is None or element in processed)
+            )
+            if not supported:
+                raise _error("UNSAFE_REFERENCE", "批注引用结构不受支持", "comments")
 
 
 def transform_comments_vml_xml(
@@ -1113,8 +1178,6 @@ def transform_workbook_xml(
             local_index = int(local_text)
             if local_index >= len(sheets):
                 raise _error("UNSAFE_REFERENCE", "名称作用域无效", name or "definedName")
-            if target_index is not None and local_index != target_index:
-                continue
         if name == "_xlnm.Print_Area":
             transformed: list[str] = []
             for area in _split_print_areas(formula, name):
@@ -1138,6 +1201,11 @@ def transform_workbook_xml(
                 transform,
                 name or "definedName",
                 current_sheet=sheet_name,
+                unqualified_sheet=(
+                    cast(str, sheet_names[local_index])
+                    if local_index is not None
+                    else sheet_name
+                ),
             )
     calc_pr = root.find(f"{{{MAIN_NS}}}calcPr")
     if calc_pr is None:
