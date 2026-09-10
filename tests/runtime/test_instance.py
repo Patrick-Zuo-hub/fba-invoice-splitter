@@ -7,10 +7,12 @@ from typing import Self
 
 import pytest
 
+import fis.runtime.instance as instance_module
 from fis.runtime.instance import (
     ExistingInstance,
     InstanceRecord,
     InvalidInstanceRecord,
+    StartupError,
     acquire_instance,
     probe_fis,
     read_instance_record,
@@ -34,6 +36,15 @@ def test_record_round_trip_is_private_and_exact(tmp_path: Path) -> None:
         "port",
         "started_at",
     }
+
+
+def test_reading_missing_record_does_not_create_runtime_directory(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+
+    with pytest.raises(FileNotFoundError):
+        read_instance_record(runtime)
+
+    assert not runtime.exists()
 
 
 @pytest.mark.parametrize(
@@ -108,6 +119,7 @@ def test_held_lock_with_healthy_fis_returns_existing_instance(tmp_path: Path) ->
     owner = acquire_instance(runtime, probe=lambda port: False)
     owner.write_record(_record())
     try:
+        assert (runtime / "instance.lock").stat().st_mode & 0o077 == 0
         result = acquire_instance(runtime, probe=lambda port: port == 8768)
         assert result == ExistingInstance(port=8768)
     finally:
@@ -159,3 +171,197 @@ def test_cleanup_only_removes_record_owned_by_lease(tmp_path: Path) -> None:
     lease.close()
 
     assert read_instance_record(runtime) == _record(pid=os.getpid() + 1)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd race injection")
+def test_directory_swap_during_publish_cannot_write_outside(tmp_path: Path) -> None:
+    runtime = tmp_path / "data" / "runtime"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    retained = tmp_path / "retained-runtime"
+
+    def swap_directory(stage: str) -> None:
+        if stage != "before_record_publish":
+            return
+        runtime.rename(retained)
+        runtime.symlink_to(outside, target_is_directory=True)
+        for temporary in retained.glob(".instance-*"):
+            (outside / temporary.name).write_text("outside sentinel")
+
+    with pytest.raises(StartupError, match="运行目录"):
+        write_instance_record(runtime, _record(), _operation_hook=swap_directory)
+
+    assert not (outside / "instance.json").exists()
+    assert all(path.read_text() == "outside sentinel" for path in outside.iterdir())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission race injection")
+def test_directory_permission_change_during_publish_is_fail_closed(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+
+    def broaden_directory(stage: str) -> None:
+        if stage == "before_record_publish":
+            runtime.chmod(0o755)
+
+    with pytest.raises(StartupError, match="权限"):
+        write_instance_record(runtime, _record(), _operation_hook=broaden_directory)
+
+    assert not (runtime / "instance.json").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX openat race injection")
+def test_record_swap_before_open_never_reads_symlink_target(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    write_instance_record(runtime, _record())
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({**json.loads((runtime / "instance.json").read_text()), "pid": 999}))
+
+    def swap_record(stage: str) -> None:
+        if stage == "before_record_open":
+            (runtime / "instance.json").unlink()
+            (runtime / "instance.json").symlink_to(outside)
+
+    with pytest.raises(InvalidInstanceRecord):
+        read_instance_record(runtime, _operation_hook=swap_record)
+
+    assert json.loads(outside.read_text())["pid"] == 999
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link semantics")
+def test_record_hardlink_is_rejected_without_touching_external_link(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"pid": 123, "port": 8768, "started_at": "2026-09-10T09:00:00Z"}))
+    os.chmod(outside, 0o600)
+    os.link(outside, runtime / "instance.json")
+
+    with pytest.raises(InvalidInstanceRecord, match="hard link"):
+        read_instance_record(runtime)
+
+    assert outside.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX openat cleanup semantics")
+def test_acquire_rejects_symlink_record_without_deleting_target(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    outside = tmp_path / "outside.json"
+    outside.write_text("outside sentinel")
+    (runtime / "instance.json").symlink_to(outside)
+
+    with pytest.raises(StartupError, match="旧实例记录不可信"):
+        acquire_instance(runtime, probe=lambda port: False)
+
+    assert outside.read_text() == "outside sentinel"
+    assert (runtime / "instance.json").is_symlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link semantics")
+def test_lock_hardlink_is_rejected_without_locking_target(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    outside = tmp_path / "outside.lock"
+    outside.write_text("keep")
+    os.chmod(outside, 0o600)
+    os.link(outside, runtime / "instance.lock")
+
+    with pytest.raises(StartupError, match="锁"):
+        acquire_instance(runtime, probe=lambda port: False)
+
+    assert outside.read_text() == "keep"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX openat lock injection")
+def test_lock_swap_to_symlink_is_rejected_without_locking_target(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    outside = tmp_path / "outside.lock"
+    outside.write_text("keep")
+
+    def install_lock_symlink(stage: str) -> None:
+        if stage == "before_lock_open":
+            (runtime / "instance.lock").symlink_to(outside)
+
+    with pytest.raises(StartupError, match="锁"):
+        acquire_instance(runtime, probe=lambda port: False, _operation_hook=install_lock_symlink)
+
+    assert outside.read_text() == "keep"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX fchmod injection")
+def test_permission_tightening_failure_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o755)
+
+    def fail_chmod(_fd: int, _mode: int) -> None:
+        raise OSError("denied")
+
+    monkeypatch.setattr(instance_module.os, "fchmod", fail_chmod)
+
+    with pytest.raises(StartupError, match="权限"):
+        write_instance_record(runtime, _record())
+
+    assert not (runtime / "instance.json").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX openat race injection")
+def test_temporary_record_swap_during_publish_is_not_accepted(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    outside = tmp_path / "outside.json"
+    outside.write_text("outside sentinel")
+
+    def swap_temporary(stage: str) -> None:
+        if stage != "before_record_publish":
+            return
+        temporary = next(runtime.glob(".instance-*"))
+        temporary.unlink()
+        temporary.symlink_to(outside)
+
+    with pytest.raises(StartupError, match="发布"):
+        write_instance_record(runtime, _record(), _operation_hook=swap_temporary)
+
+    assert outside.read_text() == "outside sentinel"
+    assert not (runtime / "instance.json").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX openat race injection")
+def test_record_swap_during_cleanup_does_not_delete_replacement(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    write_instance_record(runtime, _record())
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text(json.dumps({"pid": 999, "port": 8768, "started_at": "2026-09-10T09:00:00Z"}))
+    os.chmod(replacement, 0o600)
+
+    def swap_record(stage: str) -> None:
+        if stage != "before_record_cleanup":
+            return
+        (runtime / "instance.json").unlink()
+        replacement.rename(runtime / "instance.json")
+
+    with pytest.raises(StartupError, match="清理"):
+        acquire_instance(runtime, probe=lambda port: False, _operation_hook=swap_record)
+
+    assert json.loads((runtime / "instance.json").read_text())["pid"] == 999
+
+
+def test_windows_backend_fails_closed_when_handle_security_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(instance_module.os, "name", "nt")
+
+    with pytest.raises(StartupError, match="Windows.*安全.*拒绝"):
+        write_instance_record(tmp_path / "runtime", _record())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle and ACL validation")
+def test_windows_runtime_rejects_reparse_directory(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(StartupError, match="reparse|junction|安全"):
+        write_instance_record(runtime, _record())
