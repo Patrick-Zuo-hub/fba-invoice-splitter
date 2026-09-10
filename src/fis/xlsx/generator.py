@@ -69,6 +69,9 @@ class _GeneratedPayload:
     expected_cols_xml: bytes | None
     expected_fixed_media: tuple[str, ...]
     expected_fixed_anchors: tuple[tuple[int, int, int, int, int, int, int, int], ...]
+    expected_cell_styles: Mapping[str, str | None]
+    expected_merge_refs: tuple[str, ...]
+    expected_print_areas: tuple[tuple[str, str], ...]
 
 
 def safe_filename(request: ShipmentOutput) -> str:
@@ -119,6 +122,9 @@ def generate_shipment_workbook(
             expected_cols_xml=generated.expected_cols_xml,
             expected_fixed_media=generated.expected_fixed_media,
             expected_fixed_anchors=generated.expected_fixed_anchors,
+            expected_cell_styles=generated.expected_cell_styles,
+            expected_merge_refs=generated.expected_merge_refs,
+            expected_print_areas=generated.expected_print_areas,
             expected_values=_request_values(request),
             expected_unchanged_parts=generated.expected_unchanged_parts,
         )
@@ -270,6 +276,8 @@ def _generate_payload(source: Path, request: ShipmentOutput) -> _GeneratedPayloa
         row_map = build_row_map(parsed.product_rows, kept_rows, parsed.total_row)
         shift = len(parsed.product_rows) - len(kept_rows)
         expected_row_attributes: dict[int, Mapping[str, str]] = {}
+        expected_cell_styles: dict[str, str | None] = {}
+        removed_rows = set(parsed.product_rows).difference(kept_rows)
         for row in source_sheet_root.xpath("./main:sheetData/main:row", namespaces={"main": MAIN_NS}):
             old_number = int(row.get("r") or "0")
             new_number = row_map.get(old_number)
@@ -280,6 +288,54 @@ def _generate_payload(source: Path, request: ShipmentOutput) -> _GeneratedPayloa
             expected_row_attributes[new_number] = {
                 key: value for key, value in row.attrib.items() if key != "r"
             }
+            for cell in row:
+                if cell.tag != f"{{{MAIN_NS}}}c" or not cell.get("r"):
+                    continue
+                reference = cell.get("r") or ""
+                column = "".join(character for character in reference if character.isalpha())
+                if old_number in removed_rows:
+                    continue
+                expected_cell_styles[f"{column}{new_number}"] = cell.get("s")
+        transformed_sheet_root = etree.fromstring(transformed[worksheet_part])
+        expected_merge_refs = tuple(
+            merge.get("ref") or ""
+            for merge in transformed_sheet_root.xpath(
+                "./main:mergeCells/main:mergeCell", namespaces={"main": MAIN_NS}
+            )
+        )
+        transformed_workbook_root = etree.fromstring(transformed["xl/workbook.xml"])
+        expected_print_areas = tuple(
+            (item.get("localSheetId") or "", item.text or "")
+            for item in transformed_workbook_root.xpath(
+                "./main:definedNames/main:definedName[@name='_xlnm.Print_Area']",
+                namespaces={"main": MAIN_NS},
+            )
+        )
+        def map_nonremoved_row(old: int) -> int | None:
+            if old in removed_rows:
+                return None
+            if old in row_map:
+                return row_map[old]
+            return old - shift if old > parsed.total_row else old
+
+        fixed_anchors: list[tuple[int, int, int, int, int, int, int, int]] = []
+        for image in inventory.fixed_images:
+            new_from = map_nonremoved_row(image.anchor.from_row + 1)
+            new_to = map_nonremoved_row(image.anchor.to_row + 1)
+            if new_from is None or new_to is None:
+                raise WorkbookError("UNSAFE_REFERENCE", "固定图片锚点指向已删除行", image.relationship_id)
+            fixed_anchors.append(
+                (
+                    new_from - 1,
+                    image.anchor.from_col,
+                    image.anchor.from_row_off,
+                    image.anchor.from_col_off,
+                    new_to - 1,
+                    image.anchor.to_col,
+                    image.anchor.to_row_off,
+                    image.anchor.to_col_off,
+                )
+            )
         transformed_lower = {name.lower() for name in transformed}
         removed_media_lower = {part.lower() for part in removed_media}
         unchanged = {
@@ -305,18 +361,11 @@ def _generate_payload(source: Path, request: ShipmentOutput) -> _GeneratedPayloa
             ),
             expected_fixed_media=tuple(image.media_part for image in inventory.fixed_images),
             expected_fixed_anchors=tuple(
-                (
-                    image.anchor.from_row,
-                    image.anchor.from_col,
-                    image.anchor.from_row_off,
-                    image.anchor.from_col_off,
-                    image.anchor.to_row,
-                    image.anchor.to_col,
-                    image.anchor.to_row_off,
-                    image.anchor.to_col_off,
-                )
-                for image in inventory.fixed_images
+                fixed_anchors
             ),
+            expected_cell_styles=expected_cell_styles,
+            expected_merge_refs=expected_merge_refs,
+            expected_print_areas=expected_print_areas,
         )
 
 
@@ -336,6 +385,9 @@ def _validated_payload(generated: _GeneratedPayload, request: ShipmentOutput) ->
             expected_cols_xml=generated.expected_cols_xml,
             expected_fixed_media=generated.expected_fixed_media,
             expected_fixed_anchors=generated.expected_fixed_anchors,
+            expected_cell_styles=generated.expected_cell_styles,
+            expected_merge_refs=generated.expected_merge_refs,
+            expected_print_areas=generated.expected_print_areas,
             expected_values=_request_values(request),
             expected_unchanged_parts=generated.expected_unchanged_parts,
         )

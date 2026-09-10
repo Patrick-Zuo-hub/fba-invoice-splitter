@@ -46,6 +46,9 @@ def validate_generated_workbook(
     expected_cols_xml: bytes | None = None,
     expected_fixed_media: tuple[str, ...] | None = None,
     expected_fixed_anchors: tuple[tuple[int, int, int, int, int, int, int, int], ...] | None = None,
+    expected_cell_styles: Mapping[str, str | None] | None = None,
+    expected_merge_refs: tuple[str, ...] | None = None,
+    expected_print_areas: tuple[tuple[str, str], ...] | None = None,
 ) -> ValidationReport:
     """Reopen a generated package and verify independent business invariants."""
 
@@ -71,6 +74,9 @@ def validate_generated_workbook(
                 package,
                 expected_row_attributes,
                 expected_cols_xml,
+                expected_cell_styles,
+                expected_merge_refs,
+                expected_print_areas,
             )
             _validate_unchanged_parts(package, expected_unchanged_parts or {})
         inventory = parse_workbook_drawings(path, parsed)
@@ -220,6 +226,9 @@ def _validate_layout(
     package: SafePackage,
     expected_row_attributes: Mapping[int, Mapping[str, str]] | None,
     expected_cols_xml: bytes | None,
+    expected_cell_styles: Mapping[str, str | None] | None,
+    expected_merge_refs: tuple[str, ...] | None,
+    expected_print_areas: tuple[tuple[str, str], ...] | None,
 ) -> None:
     merges = root.xpath("./main:mergeCells/main:mergeCell", namespaces={"main": MAIN_NS})
     if expected_merge_count is not None and len(merges) != expected_merge_count:
@@ -229,6 +238,8 @@ def _validate_layout(
     actual_ranges = {merge.get("ref") for merge in merges}
     if not required_ranges.issubset(actual_ranges):
         raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", "输出工作簿配置合并区域不完整", "mergeCells")
+    if expected_merge_refs is not None and tuple(sorted(actual_ranges)) != tuple(sorted(expected_merge_refs)):
+        raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", "输出工作簿合并区域与模板不一致", "mergeCells")
     if expected_row_attributes is not None:
         for number, expected in expected_row_attributes.items():
             rows = root.xpath(
@@ -241,11 +252,51 @@ def _validate_layout(
         actual = etree.tostring(cols, encoding="UTF-8") if cols is not None else None
         if actual != expected_cols_xml:
             raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", "输出工作簿列宽发生变化", "cols")
+    if expected_cell_styles is not None:
+        actual_styles: dict[str, str | None] = {}
+        for cell in root.xpath("./main:sheetData/main:row/main:c", namespaces={"main": MAIN_NS}):
+            reference = cell.get("r")
+            if reference:
+                actual_styles[reference] = cell.get("s")
+        if actual_styles != dict(expected_cell_styles):
+            raise WorkbookError("OUTPUT_STYLE_MISMATCH", "输出工作簿单元格样式发生变化", "sheetData")
+        _validate_style_indices(package, actual_styles)
     if expected_print_area is not None:
         workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
         names = workbook.xpath("./main:definedNames/main:definedName[@name='_xlnm.Print_Area']", namespaces={"main": MAIN_NS})
         if bool(names) != expected_print_area:
             raise WorkbookError("OUTPUT_PRINT_MISMATCH", "输出工作簿打印区域不完整", "definedNames")
+    if expected_print_areas is not None:
+        workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
+        actual_areas = tuple(
+            (
+                item.get("localSheetId") or "",
+                item.text or "",
+            )
+            for item in workbook.xpath(
+                "./main:definedNames/main:definedName[@name='_xlnm.Print_Area']",
+                namespaces={"main": MAIN_NS},
+            )
+        )
+        if actual_areas != expected_print_areas:
+            raise WorkbookError("OUTPUT_PRINT_MISMATCH", "输出工作簿打印区域引用发生变化", "definedNames")
+
+
+def _validate_style_indices(package: SafePackage, styles: Mapping[str, str | None]) -> None:
+    styles_root = package.read_xml("xl/styles.xml", MAX_ENTRY)
+    cell_xfs = styles_root.find(f"{{{MAIN_NS}}}cellXfs")
+    if cell_xfs is None:
+        raise WorkbookError("OUTPUT_STYLE_MISMATCH", "输出工作簿缺少单元格样式定义", "styles.xml")
+    count = len(cell_xfs)
+    for reference, style in styles.items():
+        if style is None:
+            continue
+        try:
+            index = int(style)
+        except ValueError as exc:
+            raise WorkbookError("OUTPUT_STYLE_MISMATCH", "输出单元格样式索引无效", reference) from exc
+        if index < 0 or index >= count:
+            raise WorkbookError("OUTPUT_STYLE_MISMATCH", "输出单元格样式索引越界", reference)
 
 
 def _assert_non_overlapping_merges(merges: list[etree._Element]) -> None:

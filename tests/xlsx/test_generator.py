@@ -84,3 +84,26 @@ def test_validation_resolves_shared_string_total_label(tmp_path: Path) -> None:
     etree.SubElement(cell, f"{{{main}}}v").text = "0"
     assert _cell_text(cell, ("合计TOTAL",)) == "合计TOTAL"
     assert payload
+
+
+def test_generated_validation_rejects_style_and_merge_mutations(tmp_path: Path) -> None:
+    source = tmp_path / "source.xlsx"
+    build_standard_v1(source, {"S1": 2, "S2": 1}, [12, 13, 14])
+    output = generate_shipment_workbook(source, _request(), tmp_path / "out")
+    with ZipFile(output) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    from lxml import etree
+
+    main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    root = etree.fromstring(parts["xl/worksheets/sheet1.xml"])
+    total = root.xpath(".//main:c[@r='K15']", namespaces={"main": main})[0]
+    total.set("s", "999")
+    merges = root.xpath("./main:mergeCells/main:mergeCell", namespaces={"main": main})
+    merges[-1].getparent().remove(merges[-1])
+    mutated = tmp_path / "mutated.xlsx"
+    parts["xl/worksheets/sheet1.xml"] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with ZipFile(mutated, "w") as archive:
+        for name, value in parts.items():
+            archive.writestr(name, value)
+    report = validate_generated_workbook(mutated, expected_shipment="S1", expected_rows=2, expected_images=2)
+    assert not report.ok
