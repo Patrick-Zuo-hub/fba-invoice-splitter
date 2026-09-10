@@ -26,7 +26,8 @@ def create_app(settings: Settings, *, bound_port: int) -> FastAPI:
     app.mount("/static", StaticFiles(directory=_WEB_ROOT / "static"), name="static")
 
     @app.get("/health")
-    def health() -> dict[str, str]:
+    def health(response: Response) -> dict[str, str]:
+        response.headers["X-FIS-Product"] = "fba-invoice-splitter"
         return {"status": "ok"}
 
     @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)

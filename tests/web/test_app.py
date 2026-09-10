@@ -62,6 +62,7 @@ def test_health_returns_only_ok_status(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+    assert response.headers["x-fis-product"] == "fba-invoice-splitter"
 
 
 def test_static_content_is_available_with_exact_host(tmp_path: Path) -> None:
