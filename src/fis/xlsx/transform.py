@@ -62,7 +62,9 @@ _ALLOWLISTED_BROKEN_VALIDATION_ATTRIBUTES = {
     "sqref": _ALLOWLISTED_BROKEN_VALIDATION_SQREF,
 }
 _DYNAMIC_REFERENCE_FUNCTION = re.compile(
-    r"(?<![A-Z0-9_.])(?:_XLFN\.)?(?:INDIRECT(?:\.EXT)?|OFFSET)\s*\(",
+    r"(?<![A-Z0-9_.])(?:_XLFN\.)?(?:"
+    r"INDIRECT(?:\.EXT)?|OFFSET|INDEX|CHOOSE|CHOOSEROWS|CHOOSECOLS|TAKE|DROP"
+    r")\s*\(",
     re.ASCII | re.IGNORECASE,
 )
 
@@ -229,6 +231,7 @@ class _RowTransform:
             )
         self.product_rows = parsed.product_rows
         self.kept_rows = kept_rows
+        self.kept_set = frozenset(kept_rows)
         self.total_row = parsed.total_row
         self.row_map = build_row_map(parsed.product_rows, kept_rows, parsed.total_row)
         self.removed_rows = frozenset(parsed.product_rows).difference(kept_rows)
@@ -575,8 +578,15 @@ def _validate_configured_merges(root: etree._Element) -> None:
         not count.isascii() or not count.isdigit() or int(count) != len(merges)
     ):
         raise _error("TEMPLATE_VERSION_MISMATCH", "模板合并区域数量无效", "mergeCells")
+    rectangles: list[tuple[str, tuple[int, int, int, int]]] = []
     for reference in safe_references:
         rectangle = _range_rectangle(reference)
+        for previous_reference, previous_rectangle in rectangles:
+            if _rectangles_overlap(rectangle, previous_rectangle):
+                raise _error(
+                    "TEMPLATE_VERSION_MISMATCH", "模板合并区域存在重复或重叠", reference
+                )
+        rectangles.append((reference, rectangle))
         for configured_reference, configured_rectangle in configured_rectangles.items():
             if reference != configured_reference and _rectangles_overlap(
                 rectangle, configured_rectangle
@@ -788,7 +798,7 @@ def transform_sheet_xml(
         item
         for shipment in parsed.shipments
         for item in shipment.items
-        if item.source_row in kept
+        if item.source_row in transform.kept_set
     ]
     selected_items = {item.source_row: item for item in selected_item_list}
     if len(selected_items) != len(selected_item_list) or set(selected_items) != set(kept):
@@ -843,6 +853,8 @@ def transform_sheet_xml(
             raise _error("UNSAFE_REFERENCE", "合并区域缺少引用", "mergeCell")
         merge.set("ref", _translate_range(reference, transform, reference))
         processed_reference_nodes.add(merge)
+    # Row compaction must not create duplicate or overlapping merge rectangles.
+    _validate_configured_merges(root)
     for validation in root.xpath(
         "./main:dataValidations/main:dataValidation", namespaces={"main": MAIN_NS}
     ):
@@ -1242,9 +1254,18 @@ def transform_workbook_xml(
                     else sheet_name
                 ),
             )
-    calc_pr = root.find(f"{{{MAIN_NS}}}calcPr")
+    calc_pr_nodes = root.findall(f"{{{MAIN_NS}}}calcPr")
+    if len(calc_pr_nodes) > 1:
+        raise _error("TEMPLATE_VERSION_MISMATCH", "工作簿计算属性重复", "calcPr")
+    calc_pr = calc_pr_nodes[0] if calc_pr_nodes else None
     if calc_pr is None:
-        calc_pr = etree.SubElement(root, f"{{{MAIN_NS}}}calcPr")
+        calc_pr = etree.Element(f"{{{MAIN_NS}}}calcPr")
+        # calcPr precedes extLst in the SpreadsheetML workbook sequence.
+        ext_lst = root.find(f"{{{MAIN_NS}}}extLst")
+        if ext_lst is None:
+            root.append(calc_pr)
+        else:
+            root.insert(root.index(ext_lst), calc_pr)
     calc_pr.set("calcMode", "auto")
     calc_pr.set("fullCalcOnLoad", "1")
     calc_pr.set("forceFullCalc", "1")

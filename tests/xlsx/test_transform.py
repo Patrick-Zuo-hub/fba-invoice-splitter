@@ -459,6 +459,23 @@ def test_sheet_transform_rejects_duplicate_or_overlapping_configured_merges(
     assert caught.value.code == "TEMPLATE_VERSION_MISMATCH"
 
 
+@pytest.mark.parametrize("extra_refs", [("A19:B19",), ("A19:B19", "B19:C19")])
+def test_sheet_transform_rejects_duplicate_or_overlapping_any_merges(
+    extra_refs: tuple[str, ...],
+) -> None:
+    root = _parsed_xml(_worksheet())
+    merges = root.find(f"{{{MAIN_NS}}}mergeCells")
+    assert merges is not None
+    for reference in extra_refs:
+        etree.SubElement(merges, f"{{{MAIN_NS}}}mergeCell", ref=reference)
+    merges.set("count", str(len(merges)))
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "TEMPLATE_VERSION_MISMATCH"
+
+
 def test_sheet_transform_is_sheet_aware_and_blocks_current_sheet_whole_rows() -> None:
     other_sheet = _parsed_xml(_worksheet())
     _cell_at(other_sheet, "Q19").find(f"{{{MAIN_NS}}}f").text = (
@@ -557,6 +574,14 @@ def test_sheet_data_rejects_every_non_row_child_instead_of_dropping_it(node_kind
         'INDIRECT.EXT("[book.xlsx]Other!A18")',
         "OFFSET(A11, 7, 0)",
         "_xlfn.OFFSET (A11,7,0)",
+        "INDEX(A:A,18)",
+        "_xlfn.INDEX( A:A , 18 )",
+        "CHOOSE(1,A18)",
+        "_xlfn.CHOOSEROWS(A12:A18,2)",
+        "CHOOSECOLS(A12:C18,2)",
+        "TAKE(A12:A18,1)",
+        "DROP(A12:A18,1)",
+        "IF(INDEX(A:A,18)>0,OFFSET(A11,7,0),A1)",
     ],
 )
 def test_sheet_transform_blocks_dynamic_reference_functions(formula: str) -> None:
@@ -902,6 +927,28 @@ def test_workbook_moves_print_area_and_enables_full_recalculation() -> None:
         "fullCalcOnLoad": "1",
         "forceFullCalc": "1",
     }
+
+
+def test_workbook_inserts_calcpr_before_extlst_when_missing() -> None:
+    root = etree.Element(f"{{{MAIN_NS}}}workbook", nsmap={None: MAIN_NS})
+    etree.SubElement(root, f"{{{MAIN_NS}}}definedNames")
+    ext = etree.SubElement(root, f"{{{MAIN_NS}}}extLst")
+    etree.SubElement(ext, f"{{{MAIN_NS}}}ext", uri="urn:test")
+
+    output = _parsed_xml(transform_workbook_xml(etree.tostring(root), _bundle(), (13, 16)))
+    tags = [etree.QName(child).localname for child in output]
+    assert tags.index("calcPr") < tags.index("extLst")
+
+
+def test_workbook_rejects_duplicate_calcpr() -> None:
+    root = etree.Element(f"{{{MAIN_NS}}}workbook", nsmap={None: MAIN_NS})
+    etree.SubElement(root, f"{{{MAIN_NS}}}calcPr")
+    etree.SubElement(root, f"{{{MAIN_NS}}}calcPr")
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_workbook_xml(etree.tostring(root), _bundle(), (13, 16))
+
+    assert caught.value.code == "TEMPLATE_VERSION_MISMATCH"
 
 
 def test_workbook_uses_sheet_order_local_id_and_moves_multi_area_print_ranges() -> None:
