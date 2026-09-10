@@ -4,7 +4,7 @@
 
 **Goal:** Deliver a one-page, no-login local browser tool that starts on ports 8765–8775, persists local reference/history data, generates invoices into a user-selected folder, and exits automatically when use ends.
 
-**Architecture:** Keep the completed XLSX engine independent and place a small FastAPI application-service layer above it. The launcher owns single-instance coordination, loopback socket binding, browser opening, native folder selection, page-heartbeat shutdown, and cleanup; the HTTP layer enforces exact local Host/Origin/request-header rules without sessions or CSRF tokens.
+**Architecture:** Keep the completed XLSX engine independent and place a small FastAPI application-service layer above it. The launcher owns single-instance coordination, loopback socket binding, browser opening, native folder selection, page-heartbeat shutdown, and cleanup; the HTTP layer enforces exact parsed-ASGI Host/Origin/request-header rules without sessions or CSRF tokens. Uvicorn/h11 owns raw HTTP parsing, including legal OWS normalization and malformed-request rejection.
 
 **Tech Stack:** Python 3.12, FastAPI, Uvicorn, Jinja2, minimal browser JavaScript, SQLite, filelock, pytest, HTTPX, Playwright
 
@@ -140,13 +140,15 @@ def create_app(settings: Settings, *, bound_port: int) -> FastAPI:
 
 Delete launch-secret exchange, session-cookie parsing, per-process session state, CSRF token parsing, `/launch`, and CSRF meta markup. Retain no-store, CSP, frame denial, MIME sniffing denial, referrer policy, and permissions policy response headers.
 
-Reject duplicate or non-ASCII Host/Origin/FIS headers, `localhost`, missing ports, trailing dots, comma-joined values, userinfo, IPv6 authorities, and all `Forwarded` or `X-Forwarded-*` headers. OPTIONS receives no CORS approval.
+Reject duplicate or non-ASCII Host/Origin/FIS headers at the ASGI boundary, `localhost`, missing ports, trailing dots, comma-joined values, userinfo, IPv6 authorities, and all `Forwarded` or `X-Forwarded-*` headers. Match the Host authority exactly as delivered by ASGI; do not claim access to pre-parser whitespace. Legal HTTP OWS is normalized by Uvicorn/h11, and malformed raw requests are rejected by that server layer. OPTIONS receives no CORS approval.
+
+Install a pure ASGI error wrapper as the outermost user middleware. It catches `Exception`, but not `BaseException`, emits a fixed diagnostic code without exception text or traceback, returns a generic 500 with the complete security-header set when no response has started, and never sends a second response after `http.response.start`.
 
 - [ ] **Step 4: Run request-boundary and regression tests**
 
 Run: `python -m pytest tests/web/test_app.py tests/web/test_security.py -v`
 
-Expected: PASS for exact Host, exact unsafe-request Origin/header, no cookie/token/launch route, static assets, health, security headers, ambiguous-header rejection, no CORS, and disabled docs.
+Expected: PASS for exact parsed-ASGI Host, exact unsafe-request Origin/header, no cookie/token/launch route, static assets, health, secured and sanitized 500 responses, ambiguous-header rejection, no CORS, and disabled docs. At least one real Uvicorn/raw-socket test must verify legal Host OWS normalization and missing, duplicate, or malformed Host rejection instead of relying exclusively on TestClient.
 
 Run: `python -m pytest -q`
 

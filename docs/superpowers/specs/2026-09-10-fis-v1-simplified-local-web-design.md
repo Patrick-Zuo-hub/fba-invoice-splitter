@@ -97,7 +97,7 @@ POST, PUT, PATCH, and DELETE requests must satisfy all of the following:
 
 The application sends no permissive CORS response. A normal external web page cannot add the custom header without a cross-origin preflight, and FIS does not approve that preflight.
 
-Requests with duplicate, ambiguous, malformed, forwarded, or proxy-derived Host/Origin values are rejected. FIS does not trust `X-Forwarded-*` headers.
+At the ASGI boundary, the parsed Host authority must exactly equal `127.0.0.1:<bound-port>`; FIS does not normalize or reinterpret that parsed value. Legal HTTP optional whitespace around a field value is normalized by Uvicorn/h11 before ASGI delivery, while malformed raw HTTP is rejected by Uvicorn/h11. Requests with duplicate, ambiguous, malformed, forwarded, or proxy-derived Host/Origin values are rejected by the HTTP server or application as appropriate. FIS does not trust `Forwarded` or `X-Forwarded-*` headers.
 
 This boundary is designed to stop ordinary browser-origin attacks. It does not claim to defend against malware already executing as the same operating-system user.
 
@@ -151,7 +151,7 @@ The web layer calls the XLSX engine through typed application services. XLSX cod
 - Invalid output directory: block generation and explain the path problem.
 - Batch failure: publish no partial batch and record a failed history entry without retaining the uploaded workbook.
 - Browser closes during generation: finish the active atomic job, then shut down.
-- Unexpected internal error: show a generic local error, record a sanitized diagnostic locally, and avoid exposing stack traces in the browser.
+- Unexpected internal error: show a generic local error with the standard security headers, record only a fixed sanitized diagnostic code locally, and expose neither exception text nor stack traces in the browser or server logs. If a streaming response has already started, do not attempt to send a second HTTP response.
 
 ## 9. Verification strategy
 
@@ -159,7 +159,7 @@ Automated verification must cover:
 
 - exact loopback binding and ordered port fallback;
 - existing-instance and stale-lock behavior;
-- exact Host, Origin, and `X-FIS-Request` enforcement;
+- exact parsed-ASGI Host authority, Origin, and `X-FIS-Request` enforcement, plus real Uvicorn/raw-socket coverage of Host whitespace normalization and malformed requests;
 - absence of login, session cookie, launch secret, CSRF token, CORS, and API docs;
 - GET/HEAD mutation prohibition;
 - single-page import-to-generation flow;
@@ -183,4 +183,3 @@ The revised plan will:
 - combine the former three-step browser flow into one page;
 - retain upload, mapping, generation, History, and Master Data capabilities in the reduced interface;
 - preserve the completed XLSX engine without modification unless integration testing exposes a defect.
-

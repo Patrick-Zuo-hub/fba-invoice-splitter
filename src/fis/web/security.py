@@ -1,14 +1,29 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": (
+        "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
+        "form-action 'self'; object-src 'none'"
+    ),
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,18 +77,36 @@ def _require_exact_header(
         raise _RejectedRequest(status_code)
 
 
-def secure_response(response: Response) -> Response:
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
-        "form-action 'self'; object-src 'none'"
-    )
-    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    return response
+class SanitizedErrorMiddleware:
+    """Keep unhandled HTTP failures out of both responses and server logs."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        response_started = False
+
+        async def send_secured(message: Message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+                headers = MutableHeaders(scope=message)
+                for name, value in _SECURITY_HEADERS.items():
+                    headers[name] = value
+            await send(message)
+
+        try:
+            await self._app(scope, receive, send_secured)
+        except Exception:  # noqa: BLE001 - BaseException must reach the server runtime.
+            _LOGGER.error("FIS_WEB_UNHANDLED")
+            if response_started:
+                return
+            response = PlainTextResponse("内部服务器错误", status_code=500)
+            await response(scope, receive, send_secured)
 
 
 class LocalRequestMiddleware(BaseHTTPMiddleware):
@@ -113,4 +146,4 @@ class LocalRequestMiddleware(BaseHTTPMiddleware):
         except _RejectedRequest as exc:
             message = "请求无效" if exc.status_code == 400 else "禁止访问"
             response = PlainTextResponse(message, status_code=exc.status_code)
-        return secure_response(response)
+        return response
