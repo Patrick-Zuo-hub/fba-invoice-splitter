@@ -706,6 +706,61 @@ def test_v1_special_validation_sqref_never_falls_back_to_ordinary_handling(
     assert caught.value.code == "UNSAFE_FORMULA_TRANSFORM"
 
 
+@pytest.mark.parametrize(
+    ("sqref", "formula1"),
+    [
+        ("O4:P4  R5:S5", None),
+        ("O4:P4  R5:S5", "#REF!"),
+        ("O4:P4\tR5:S5", "1"),
+        ("O4:P4\nR5:S5", '"#REF!"'),
+        ("$O$4:$P$4 $R$5:$S$5", "1"),
+        ("R5:S5 O4:P4", None),
+        ("O4 P4 R5 S5", "1"),
+        ("P4:O4 S5:R5", None),
+    ],
+)
+def test_semantically_equivalent_special_sqrefs_cannot_bypass_exact_gate(
+    sqref: str, formula1: str | None
+) -> None:
+    root = _parsed_xml(_worksheet())
+    validations = root.find(f"{{{MAIN_NS}}}dataValidations")
+    assert validations is not None
+    anomaly = etree.SubElement(
+        validations,
+        f"{{{MAIN_NS}}}dataValidation",
+        type="list",
+        allowBlank="1",
+        showInputMessage="1",
+        showErrorMessage="1",
+        sqref=sqref,
+    )
+    if formula1 is not None:
+        etree.SubElement(anomaly, f"{{{MAIN_NS}}}formula1").text = formula1
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "UNSAFE_FORMULA_TRANSFORM"
+
+
+def test_other_validation_target_sets_continue_through_normal_safe_handling() -> None:
+    root = _parsed_xml(_worksheet())
+    validations = root.find(f"{{{MAIN_NS}}}dataValidations")
+    assert validations is not None
+    ordinary = etree.SubElement(
+        validations,
+        f"{{{MAIN_NS}}}dataValidation",
+        type="list",
+        allowBlank="1",
+        showInputMessage="1",
+        showErrorMessage="1",
+        sqref="O4:P4",
+    )
+    etree.SubElement(ordinary, f"{{{MAIN_NS}}}formula1").text = "1"
+
+    transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+
 @pytest.mark.parametrize("misplaced_tag", ["mergeCell", "hyperlink", "dataValidation"])
 def test_known_reference_qname_is_blocked_outside_its_supported_structure_path(
     misplaced_tag: str,

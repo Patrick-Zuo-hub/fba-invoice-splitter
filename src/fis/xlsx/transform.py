@@ -459,6 +459,35 @@ def _column_number(column: str) -> int:
     return result
 
 
+def _targets_special_validation_cells(sqref: str) -> bool:
+    """Match the V1 anomaly by addressed cells, independent of sqref spelling."""
+
+    expected = frozenset({(15, 4), (16, 4), (18, 5), (19, 5)})
+    addressed: set[tuple[int, int]] = set()
+    tokens = sqref.split()
+    if not tokens:
+        return False
+    for token in tokens:
+        parts = token.split(":")
+        if len(parts) not in {1, 2} or any(_CELL.fullmatch(part) is None for part in parts):
+            return False
+        left = _parse_cell_ref(parts[0], sqref)
+        right = _parse_cell_ref(parts[-1], sqref)
+        first_column, last_column = sorted(
+            (_column_number(left[1]), _column_number(right[1]))
+        )
+        first_row, last_row = sorted((left[3], right[3]))
+        if (last_column - first_column + 1) * (last_row - first_row + 1) > len(expected):
+            return False
+        for column in range(first_column, last_column + 1):
+            for row in range(first_row, last_row + 1):
+                coordinate = (column, row)
+                if coordinate not in expected:
+                    return False
+                addressed.add(coordinate)
+    return addressed == expected
+
+
 def _require_styled_cell(rows: Mapping[int, etree._Element], reference: str) -> etree._Element:
     row_number = _parse_cell_ref(reference, reference)[3]
     row = rows.get(row_number)
@@ -821,10 +850,7 @@ def transform_sheet_xml(
         if sqref is None:
             raise _error("UNSAFE_REFERENCE", "数据验证缺少引用", "dataValidation")
         allowlisted_broken_formula = _is_allowlisted_broken_validation(validation)
-        if (
-            sqref == _ALLOWLISTED_BROKEN_VALIDATION_SQREF
-            and not allowlisted_broken_formula
-        ):
+        if _targets_special_validation_cells(sqref) and not allowlisted_broken_formula:
             raise _error(
                 "UNSAFE_FORMULA_TRANSFORM",
                 "V1 特殊数据验证与基线不匹配",
