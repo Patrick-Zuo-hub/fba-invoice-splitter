@@ -821,6 +821,15 @@ def transform_sheet_xml(
         if sqref is None:
             raise _error("UNSAFE_REFERENCE", "数据验证缺少引用", "dataValidation")
         allowlisted_broken_formula = _is_allowlisted_broken_validation(validation)
+        if (
+            sqref == _ALLOWLISTED_BROKEN_VALIDATION_SQREF
+            and not allowlisted_broken_formula
+        ):
+            raise _error(
+                "UNSAFE_FORMULA_TRANSFORM",
+                "V1 特殊数据验证与基线不匹配",
+                sqref,
+            )
         formula_children = list(validation)
         allowed_formula_tags = {f"{{{MAIN_NS}}}formula1", f"{{{MAIN_NS}}}formula2"}
         if (

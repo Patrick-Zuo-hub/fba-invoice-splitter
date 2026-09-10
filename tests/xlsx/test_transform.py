@@ -667,6 +667,45 @@ def test_v1_broken_validation_rejects_any_attribute_outside_exact_baseline() -> 
     assert caught.value.code == "UNSAFE_FORMULA_TRANSFORM"
 
 
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "missing_formula",
+        "ordinary_formula",
+        "string_literal",
+        "missing_attribute",
+        "changed_attribute",
+    ],
+)
+def test_v1_special_validation_sqref_never_falls_back_to_ordinary_handling(
+    variant: str,
+) -> None:
+    root = _parsed_xml(_worksheet())
+    validations = root.find(f"{{{MAIN_NS}}}dataValidations")
+    assert validations is not None
+    anomaly = etree.SubElement(
+        validations,
+        f"{{{MAIN_NS}}}dataValidation",
+        type="list",
+        allowBlank="1",
+        showInputMessage="1",
+        showErrorMessage="1",
+        sqref="O4:P4 R5:S5",
+    )
+    if variant != "missing_formula":
+        formula = etree.SubElement(anomaly, f"{{{MAIN_NS}}}formula1")
+        formula.text = '"#REF!"' if variant == "string_literal" else "1"
+    if variant == "missing_attribute":
+        anomaly.attrib.pop("allowBlank")
+    elif variant == "changed_attribute":
+        anomaly.set("showErrorMessage", "0")
+
+    with pytest.raises(WorkbookError) as caught:
+        transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert caught.value.code == "UNSAFE_FORMULA_TRANSFORM"
+
+
 @pytest.mark.parametrize("misplaced_tag", ["mergeCell", "hyperlink", "dataValidation"])
 def test_known_reference_qname_is_blocked_outside_its_supported_structure_path(
     misplaced_tag: str,
