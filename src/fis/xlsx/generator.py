@@ -15,16 +15,21 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from lxml import etree  # type: ignore[import-untyped]
 
-from fis.xlsx.drawings import parse_workbook_drawings
+from fis.xlsx.drawings import parse_workbook_drawings_package
 from fis.xlsx.errors import WorkbookError
 from fis.xlsx.package import MAX_ENTRY, SafePackage
 from fis.xlsx.parser import (
     _workbook_relationships,
     _worksheet_part,
-    parse_invoice_bundle,
+    parse_invoice_bundle_package,
 )
 from fis.xlsx.template import STANDARD_V1
 from fis.xlsx.transform import (
+    _RowTransform,
+    _sheet_name,
+    _split_print_areas,
+    _split_sheet_qualified_reference,
+    _translate_range,
     build_row_map,
     transform_comments_vml_xml,
     transform_comments_xml,
@@ -94,9 +99,17 @@ def generate_shipment_workbook(
 
     source_path = Path(source)
     destination = Path(output_dir)
+    if destination.exists() and destination.is_dir() and destination.suffix.lower() == ".xlsx":
+        raise WorkbookError("OUTPUT_PATH_INVALID", "输出路径是目录而非文件", str(destination))
+    if destination.exists() and destination.is_file() and destination.suffix.lower() != ".xlsx":
+        raise WorkbookError("OUTPUT_PATH_INVALID", "输出目录路径不是目录", str(destination))
     output_path = destination if destination.suffix.lower() == ".xlsx" else destination / safe_filename(request)
     if _same_path(source_path, output_path):
         raise WorkbookError("OUTPUT_PATH_CONFLICT", "输出文件不能覆盖源工作簿", str(output_path))
+    if output_path.exists():
+        if output_path.is_dir():
+            raise WorkbookError("OUTPUT_PATH_INVALID", "输出路径是目录而非文件", str(output_path))
+        raise WorkbookError("OUTPUT_EXISTS", "输出文件已存在", str(output_path))
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     generated = _generate_payload(source_path, request)
@@ -161,10 +174,19 @@ def generate_shipment_workbooks(
     names = [safe_filename(request) for request in requests]
     if len({name.casefold() for name in names}) != len(names):
         raise WorkbookError("DUPLICATE_OUTPUT_FILENAME", "多个货件生成了相同的文件名", "output")
-    return tuple(
-        generate_shipment_workbook(source, request, output_dir)
-        for request in requests
-    )
+    generated: list[Path] = []
+    try:
+        for request in requests:
+            path = generate_shipment_workbook(source, request, output_dir)
+            generated.append(path)
+        return tuple(generated)
+    except Exception:
+        for path in generated:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
 
 
 def _same_path(source: Path, output: Path) -> bool:
@@ -188,13 +210,13 @@ def _request_values(request: ShipmentOutput) -> dict[str, str]:
 def _generate_payload(source: Path, request: ShipmentOutput) -> _GeneratedPayload:
     if source.suffix.lower() != ".xlsx" or not source.is_file():
         raise WorkbookError("INVALID_PATH", "请选择存在的 .xlsx 工作簿文件")
-    parsed = parse_invoice_bundle(source)
-    target = next((item for item in parsed.shipments if item.shipment_id == request.shipment_id), None)
-    if target is None:
-        raise WorkbookError("SHIPMENT_NOT_FOUND", "未找到指定的货件", request.shipment_id)
-    kept_rows = tuple(item.source_row for item in target.items)
     with SafePackage.open(source) as package:
-        inventory = parse_workbook_drawings(source, parsed)
+        parsed = parse_invoice_bundle_package(package)
+        target = next((item for item in parsed.shipments if item.shipment_id == request.shipment_id), None)
+        if target is None:
+            raise WorkbookError("SHIPMENT_NOT_FOUND", "未找到指定的货件", request.shipment_id)
+        kept_rows = tuple(item.source_row for item in target.items)
+        inventory = parse_workbook_drawings_package(package, parsed)
         relationships = _workbook_relationships(package)
         worksheet_part, _worksheet = _worksheet_part(package, relationships)
         worksheet_rel_part = _relationship_part(worksheet_part)
@@ -255,11 +277,11 @@ def _generate_payload(source: Path, request: ShipmentOutput) -> _GeneratedPayloa
                 resolved = package.resolve_relationship_target(worksheet_part, target_part)
             except WorkbookError:
                 continue
-            if relation_type == COMMENTS_REL_TYPE.lower():
+            if relation_type.endswith("/comments"):
                 refs = _comment_references(package, resolved)
                 transformed[resolved] = transform_comments_xml(package.read(resolved, MAX_ENTRY), parsed, kept_rows)
                 vml_relation = next(
-                    (r for r in worksheet_relations if (r.get("Type") or "").lower() == VML_REL_TYPE.lower()), None
+                    (r for r in worksheet_relations if (r.get("Type") or "").lower().endswith("/vmldrawing")), None
                 )
                 if vml_relation is None:
                     raise WorkbookError("UNSAFE_REFERENCE", "批注缺少对应 VML", worksheet_rel_part)
@@ -296,21 +318,16 @@ def _generate_payload(source: Path, request: ShipmentOutput) -> _GeneratedPayloa
                 if old_number in removed_rows:
                     continue
                 expected_cell_styles[f"{column}{new_number}"] = cell.get("s")
-        transformed_sheet_root = etree.fromstring(transformed[worksheet_part])
+        row_transform = _RowTransform(parsed, kept_rows)
         expected_merge_refs = tuple(
-            merge.get("ref") or ""
-            for merge in transformed_sheet_root.xpath(
+            _translate_range(
+                merge.get("ref") or "", row_transform, "mergeCell", allow_product_compaction=True
+            )
+            for merge in source_sheet_root.xpath(
                 "./main:mergeCells/main:mergeCell", namespaces={"main": MAIN_NS}
             )
         )
-        transformed_workbook_root = etree.fromstring(transformed["xl/workbook.xml"])
-        expected_print_areas = tuple(
-            (item.get("localSheetId") or "", item.text or "")
-            for item in transformed_workbook_root.xpath(
-                "./main:definedNames/main:definedName[@name='_xlnm.Print_Area']",
-                namespaces={"main": MAIN_NS},
-            )
-        )
+        expected_print_areas = _expected_print_areas(source_workbook_root, row_transform)
         def map_nonremoved_row(old: int) -> int | None:
             if old in removed_rows:
                 return None
@@ -394,6 +411,38 @@ def _validated_payload(generated: _GeneratedPayload, request: ShipmentOutput) ->
         if not report.ok:
             raise WorkbookError("OUTPUT_VALIDATION_FAILED", report.error or "生成工作簿校验失败")
     return generated.payload
+
+
+def _expected_print_areas(
+    workbook_root: etree._Element, row_transform: _RowTransform
+) -> tuple[tuple[str, str], ...]:
+    """Derive Print_Area expectations from source XML and the immutable row map."""
+
+    sheets = workbook_root.xpath("./main:sheets/main:sheet", namespaces={"main": MAIN_NS})
+    sheet_names = [sheet.get("name") or "" for sheet in sheets]
+    target_index = sheet_names.index(STANDARD_V1.sheet_name) if STANDARD_V1.sheet_name in sheet_names else None
+    result: list[tuple[str, str]] = []
+    for defined_name in workbook_root.xpath(
+        "./main:definedNames/main:definedName[@name='_xlnm.Print_Area']",
+        namespaces={"main": MAIN_NS},
+    ):
+        local_id = defined_name.get("localSheetId") or ""
+        local_index = int(local_id) if local_id.isdigit() else None
+        transformed: list[str] = []
+        for area in _split_print_areas(defined_name.text or "", "Print_Area"):
+            prefix, reference = _split_sheet_qualified_reference(area, "Print_Area")
+            applies = prefix is not None and _sheet_name(prefix) == STANDARD_V1.sheet_name
+            if prefix is None:
+                applies = target_index is not None and local_index == target_index
+            if applies:
+                reference = _translate_range(
+                    reference, row_transform, "Print_Area", allow_product_compaction=True
+                )
+                transformed.append(f"{prefix}!{reference}" if prefix is not None else reference)
+            else:
+                transformed.append(area)
+        result.append((local_id, ",".join(transformed)))
+    return tuple(result)
 
 
 def _relationship_part(source_part: str) -> str:

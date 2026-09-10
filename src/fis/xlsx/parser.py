@@ -314,11 +314,17 @@ def parse_invoice_bundle(path: Path | str) -> ParsedBundle:
     """Return the immutable product rows from one validated FIS V1 workbook."""
 
     with SafePackage.open(path) as package:
-        relationships = _workbook_relationships(package)
-        worksheet_part, worksheet = _worksheet_part(package, relationships)
-        rows, max_row = _rows_from_worksheet(
-            worksheet, _parse_shared_strings(package, relationships), worksheet_part
-        )
+        return parse_invoice_bundle_package(package)
+
+
+def parse_invoice_bundle_package(package: SafePackage) -> ParsedBundle:
+    """Parse a caller-owned safe package without reopening its source path."""
+
+    relationships = _workbook_relationships(package)
+    worksheet_part, worksheet = _worksheet_part(package, relationships)
+    rows, max_row = _rows_from_worksheet(
+        worksheet, _parse_shared_strings(package, relationships), worksheet_part
+    )
 
     _validate_headers(rows)
     start = STANDARD_V1.product_start_row

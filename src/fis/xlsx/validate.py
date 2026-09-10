@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal
-from pathlib import Path
+from decimal import Decimal, DecimalException, InvalidOperation, localcontext
+from pathlib import Path, PurePosixPath
 
 from lxml import etree  # type: ignore[import-untyped]
 
@@ -21,7 +21,11 @@ from fis.xlsx.parser import (
     parse_invoice_bundle,
 )
 from fis.xlsx.template import STANDARD_V1
-from fis.xlsx.transform import compute_totals
+from fis.xlsx.transform import (
+    _range_rectangle,
+    _validate_non_overlapping_rectangles,
+    compute_totals,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,12 +65,13 @@ def validate_generated_workbook(
             raise WorkbookError("OUTPUT_ROW_MISMATCH", "输出工作簿商品行数量不正确", expected_shipment)
 
         with SafePackage.open(path) as package:
-            root = _worksheet_root(package)
+            root, worksheet_part = _worksheet_root(package)
             strings = _shared_strings(package)
             _validate_values(root, expected_values or {}, strings)
-            _validate_comments(package)
+            _validate_comments(package, worksheet_part)
             _validate_totals(root, shipment.items, strings)
-            _validate_formula_caches(package, root)
+            totals = _validate_totals(root, shipment.items, strings)
+            _validate_formula_caches(package, root, totals)
             _validate_layout(
                 root,
                 expected_merge_count,
@@ -99,7 +104,7 @@ def validate_generated_workbook(
         return ValidationReport(ok=False, error="生成工作簿结构校验失败", location=str(path))
 
 
-def _worksheet_root(package: SafePackage) -> etree._Element:
+def _worksheet_root(package: SafePackage) -> tuple[etree._Element, str]:
     workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
     sheet = workbook.xpath(
         "./main:sheets/main:sheet[@name=$name]", name=STANDARD_V1.sheet_name, namespaces={"main": MAIN_NS}
@@ -114,7 +119,7 @@ def _worksheet_root(package: SafePackage) -> etree._Element:
     if len(matches) != 1 or not matches[0].get("Target"):
         raise WorkbookError("OUTPUT_TEMPLATE_MISMATCH", "输出工作表关系缺失", relation_id)
     worksheet_part = package.resolve_relationship_target("xl/workbook.xml", matches[0].get("Target") or "")
-    return package.read_xml(worksheet_part, MAX_ENTRY)
+    return package.read_xml(worksheet_part, MAX_ENTRY), worksheet_part
 
 
 def _cell(root: etree._Element, reference: str) -> etree._Element:
@@ -159,17 +164,35 @@ def _validate_values(root: etree._Element, values: Mapping[str, str], shared_str
             raise WorkbookError("OUTPUT_VALUE_MISMATCH", "输出物流字段不正确", reference)
 
 
-def _validate_comments(package: SafePackage) -> None:
-    comments = [name for name in package.names if name.lower().startswith("xl/comments") and name.lower().endswith(".xml")]
-    if not comments:
-        raise WorkbookError("OUTPUT_COMMENTS_MISSING", "输出工作簿缺少表头批注", "comments")
-    root = package.read_xml(comments[0], MAX_ENTRY)
+def _validate_comments(package: SafePackage, worksheet_part: str) -> None:
+    relation_part = str(PurePosixPath(worksheet_part).parent / "_rels" / f"{PurePosixPath(worksheet_part).name}.rels")
+    relations = package.read_xml(relation_part, MAX_ENTRY)
+    comment_relations = [
+        relation
+        for relation in relations
+        if (relation.get("Type") or "").lower().endswith("/comments")
+    ]
+    if len(comment_relations) != 1 or not comment_relations[0].get("Target"):
+        raise WorkbookError("OUTPUT_COMMENTS_MISSING", "目标工作表批注关系无效", relation_part)
+    comments_part = package.resolve_relationship_target(worksheet_part, comment_relations[0].get("Target") or "")
+    root = package.read_xml(comments_part, MAX_ENTRY)
     refs = {item.get("ref") for item in root.xpath("./main:commentList/main:comment", namespaces={"main": MAIN_NS})}
     if not {"L11", "N11", "P11"}.issubset(refs):
-        raise WorkbookError("OUTPUT_COMMENTS_MISSING", "输出工作簿表头批注不完整", "comments")
+        raise WorkbookError("OUTPUT_COMMENTS_MISSING", "目标工作表表头批注不完整", comments_part)
+    vml_relations = [
+        relation
+        for relation in relations
+        if (relation.get("Type") or "").lower().endswith("/vmldrawing")
+    ]
+    if len(vml_relations) != 1 or not vml_relations[0].get("Target"):
+        raise WorkbookError("OUTPUT_COMMENTS_MISSING", "目标工作表批注 VML 关系无效", relation_part)
+    vml_part = package.resolve_relationship_target(worksheet_part, vml_relations[0].get("Target") or "")
+    package.read(vml_part, MAX_ENTRY)
 
 
-def _validate_formula_caches(package: SafePackage, root: etree._Element) -> None:
+def _validate_formula_caches(
+    package: SafePackage, root: etree._Element, totals: Mapping[str, Decimal]
+) -> None:
     workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
     calc_pr = workbook.find(f"{{{MAIN_NS}}}calcPr")
     if calc_pr is None or any(calc_pr.get(name) != "1" for name in ("fullCalcOnLoad", "forceFullCalc")):
@@ -194,9 +217,26 @@ def _validate_formula_caches(package: SafePackage, root: etree._Element) -> None
         cached = cell.find(f"{{{MAIN_NS}}}v")
         if formula != expected_formula or cached is None or not (cached.text or "").strip():
             raise WorkbookError("OUTPUT_CALCULATION_MISMATCH", "输出公式或缓存值不正确", reference)
+        try:
+            actual = Decimal((cached.text or "").strip())
+        except (InvalidOperation, ValueError) as exc:
+            raise WorkbookError("OUTPUT_CALCULATION_MISMATCH", "输出公式缓存不是有效数字", reference) from exc
+        if not actual.is_finite():
+            raise WorkbookError("OUTPUT_CALCULATION_MISMATCH", "输出公式缓存不是有限数字", reference)
+        denominator = totals["N"]
+        numerator = totals["P"] if reference == "O10" else totals["M"]
+        try:
+            with localcontext() as context:
+                context.prec = 28
+                expected = numerator / denominator
+                tolerance = max(Decimal("1e-12"), abs(expected) * Decimal("1e-12"))
+        except DecimalException as exc:
+            raise WorkbookError("OUTPUT_CALCULATION_MISMATCH", "输出公式缓存无法计算", reference) from exc
+        if abs(actual - expected) > tolerance:
+            raise WorkbookError("OUTPUT_CALCULATION_MISMATCH", "输出公式缓存数值不正确", reference)
 
 
-def _validate_totals(root: etree._Element, items: tuple[ParsedItem, ...], shared_strings: tuple[str, ...]) -> None:
+def _validate_totals(root: etree._Element, items: tuple[ParsedItem, ...], shared_strings: tuple[str, ...]) -> dict[str, Decimal]:
     # Parsed items expose a stable cells mapping; avoid depending on implementation details.
     rows = [item.cells for item in items]
     totals = compute_totals(rows)
@@ -217,6 +257,7 @@ def _validate_totals(root: etree._Element, items: tuple[ParsedItem, ...], shared
             raise WorkbookError("OUTPUT_TOTAL_MISMATCH", "输出工作簿合计不是有效数字", f"{column}{total_row}") from exc
         if not matches:
             raise WorkbookError("OUTPUT_TOTAL_MISMATCH", "输出工作簿合计不正确", f"{column}{total_row}")
+    return totals
 
 
 def _validate_layout(
@@ -300,20 +341,18 @@ def _validate_style_indices(package: SafePackage, styles: Mapping[str, str | Non
 
 
 def _assert_non_overlapping_merges(merges: list[etree._Element]) -> None:
-    rectangles: list[tuple[int, int, int, int]] = []
+    rectangles: list[tuple[str, tuple[int, int, int, int]]] = []
     for merge in merges:
         reference = merge.get("ref") or ""
         try:
-            left, right = reference.split(":")
-            left_col, left_row = _parse_merge_endpoint(left)
-            right_col, right_row = _parse_merge_endpoint(right)
-            rectangle = (_merge_column_number(left_col), left_row, _merge_column_number(right_col), right_row)
-        except (ValueError, TypeError):
+            rectangle = _range_rectangle(reference)
+        except WorkbookError:
             raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", "输出合并区域引用无效", reference)
-        for other in rectangles:
-            if rectangle[0] <= other[2] and other[0] <= rectangle[2] and rectangle[1] <= other[3] and other[1] <= rectangle[3]:
-                raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", "输出合并区域重复或重叠", reference)
-        rectangles.append(rectangle)
+        rectangles.append((reference, rectangle))
+    try:
+        _validate_non_overlapping_rectangles(rectangles)
+    except WorkbookError as exc:
+        raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", exc.message, exc.location) from exc
 
 
 def _validate_unchanged_parts(package: SafePackage, expected: Mapping[str, str]) -> None:
@@ -334,18 +373,3 @@ def _anchor_signature(anchor: Anchor) -> tuple[int, int, int, int, int, int, int
         anchor.to_row_off,
         anchor.to_col_off,
     )
-
-
-def _parse_merge_endpoint(value: str) -> tuple[str, int]:
-    column = "".join(character for character in value if character.isalpha())
-    digits = "".join(character for character in value if character.isdigit())
-    if not column or not digits:
-        raise ValueError(value)
-    return column, int(digits)
-
-
-def _merge_column_number(value: str) -> int:
-    result = 0
-    for character in value.upper():
-        result = result * 26 + ord(character) - ord("A") + 1
-    return result

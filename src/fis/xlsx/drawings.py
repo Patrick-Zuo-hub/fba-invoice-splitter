@@ -1007,7 +1007,26 @@ def parse_workbook_drawings(path: Path | str, parsed_bundle: ParsedBundle) -> Dr
 
     try:
         with SafePackage.open(path) as package:
-            return _parse_inventory(package, parsed_bundle)
+            return parse_workbook_drawings_package(package, parsed_bundle)
+    except WorkbookError as exc:
+        if exc.code == "EXTERNAL_RESOURCE":
+            raise _drawing_error("UNSUPPORTED_DRAWING", exc.location or "relationship") from exc
+        if exc.code in {
+            "INVALID_RELATIONSHIP",
+            "MISSING_RELATIONSHIP_SOURCE",
+            "MISSING_RELATIONSHIP_TARGET",
+        }:
+            raise _drawing_error("INVALID_DRAWING", exc.location or "relationship") from exc
+        raise
+
+
+def parse_workbook_drawings_package(
+    package: SafePackage, parsed_bundle: ParsedBundle
+) -> DrawingInventory:
+    """Inventory drawings from a caller-owned package without reopening its path."""
+
+    try:
+        return _parse_inventory(package, parsed_bundle)
     except WorkbookError as exc:
         if exc.code == "EXTERNAL_RESOURCE":
             raise _drawing_error("UNSUPPORTED_DRAWING", exc.location or "relationship") from exc

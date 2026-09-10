@@ -107,3 +107,74 @@ def test_generated_validation_rejects_style_and_merge_mutations(tmp_path: Path) 
             archive.writestr(name, value)
     report = validate_generated_workbook(mutated, expected_shipment="S1", expected_rows=2, expected_images=2)
     assert not report.ok
+
+
+def test_validation_rejects_garbage_formula_cache(tmp_path: Path) -> None:
+    source = tmp_path / "source.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    output = generate_shipment_workbook(source, _request(), tmp_path / "out")
+    with ZipFile(output) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    from lxml import etree
+
+    main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    root = etree.fromstring(parts["xl/worksheets/sheet1.xml"])
+    root.xpath(".//main:c[@r='O10']/main:v", namespaces={"main": main})[0].text = "NaN"
+    mutated = tmp_path / "formula.xlsx"
+    parts["xl/worksheets/sheet1.xml"] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with ZipFile(mutated, "w") as archive:
+        for name, value in parts.items():
+            archive.writestr(name, value)
+    report = validate_generated_workbook(mutated, expected_shipment="S1")
+    assert not report.ok
+
+
+def test_validation_uses_target_sheet_comment_relationship(tmp_path: Path) -> None:
+    source = tmp_path / "source.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    output = generate_shipment_workbook(source, _request(), tmp_path / "out")
+    with ZipFile(output) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    from lxml import etree
+
+    rels = etree.fromstring(parts["xl/worksheets/_rels/sheet1.xml.rels"])
+    relation = next(item for item in rels if (item.get("Type") or "").endswith("/comments"))
+    relation.set("Target", "../comments2.xml")
+    parts["xl/comments2.xml"] = b'<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>'
+    mutated = tmp_path / "comments.xlsx"
+    parts["xl/worksheets/_rels/sheet1.xml.rels"] = etree.tostring(
+        rels, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+    with ZipFile(mutated, "w") as archive:
+        for name, value in parts.items():
+            archive.writestr(name, value)
+    report = validate_generated_workbook(mutated, expected_shipment="S1")
+    assert not report.ok
+
+
+def test_generation_reads_source_package_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "source.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    from fis.xlsx import generator
+
+    original = generator.SafePackage.open
+    calls = 0
+
+    def counted(path: Path | str):
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(generator.SafePackage, "open", counted)
+    generator._generate_payload(source, _request())
+    assert calls == 1
+
+
+def test_batch_failure_cleans_previously_generated_files(tmp_path: Path) -> None:
+    source = tmp_path / "source.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    from fis.xlsx.generator import generate_shipment_workbooks
+
+    with pytest.raises(WorkbookError):
+        generate_shipment_workbooks(source, (_request("S1"), _request("missing")), tmp_path / "batch")
+    assert not (tmp_path / "batch" / "S1_ONT8.xlsx").exists()
