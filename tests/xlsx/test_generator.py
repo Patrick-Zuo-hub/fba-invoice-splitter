@@ -129,6 +129,37 @@ def test_validation_rejects_garbage_formula_cache(tmp_path: Path) -> None:
     assert not report.ok
 
 
+def test_validation_rejects_zero_for_tiny_formula_result(tmp_path: Path) -> None:
+    source = tmp_path / "source.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    with ZipFile(source) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    from lxml import etree
+
+    main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    root = etree.fromstring(parts["xl/worksheets/sheet1.xml"])
+    tiny = "1e-307"
+    for reference, value in (("M12", "1"), ("N12", "1"), ("P12", tiny)):
+        cell = root.xpath(f".//main:c[@r='{reference}']", namespaces={"main": main})[0]
+        cell.xpath("./main:is/main:t", namespaces={"main": main})[0].text = value
+    mutated_source = tmp_path / "tiny-source.xlsx"
+    parts["xl/worksheets/sheet1.xml"] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with ZipFile(mutated_source, "w") as archive:
+        for name, value in parts.items():
+            archive.writestr(name, value)
+    output = generate_shipment_workbook(mutated_source, _request(), tmp_path / "out")
+    with ZipFile(output) as archive:
+        output_parts = {name: archive.read(name) for name in archive.namelist()}
+    output_root = etree.fromstring(output_parts["xl/worksheets/sheet1.xml"])
+    output_root.xpath(".//main:c[@r='O10']/main:v", namespaces={"main": main})[0].text = "0"
+    bad = tmp_path / "tiny-bad.xlsx"
+    output_parts["xl/worksheets/sheet1.xml"] = etree.tostring(output_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with ZipFile(bad, "w") as archive:
+        for name, value in output_parts.items():
+            archive.writestr(name, value)
+    assert not validate_generated_workbook(bad, expected_shipment="S1").ok
+
+
 def test_validation_uses_target_sheet_comment_relationship(tmp_path: Path) -> None:
     source = tmp_path / "source.xlsx"
     build_standard_v1(source, {"S1": 1}, [12])

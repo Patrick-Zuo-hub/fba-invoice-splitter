@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal, DecimalException, InvalidOperation, localcontext
+from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
 
 from lxml import etree  # type: ignore[import-untyped]
@@ -22,10 +22,13 @@ from fis.xlsx.parser import (
 )
 from fis.xlsx.template import STANDARD_V1
 from fis.xlsx.transform import (
+    _divide_for_cache,
     _range_rectangle,
     _validate_non_overlapping_rectangles,
     compute_totals,
 )
+
+EXCEL_NS = "urn:schemas-microsoft-com:office:excel"
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +72,6 @@ def validate_generated_workbook(
             strings = _shared_strings(package)
             _validate_values(root, expected_values or {}, strings)
             _validate_comments(package, worksheet_part)
-            _validate_totals(root, shipment.items, strings)
             totals = _validate_totals(root, shipment.items, strings)
             _validate_formula_caches(package, root, totals)
             _validate_layout(
@@ -187,7 +189,37 @@ def _validate_comments(package: SafePackage, worksheet_part: str) -> None:
     if len(vml_relations) != 1 or not vml_relations[0].get("Target"):
         raise WorkbookError("OUTPUT_COMMENTS_MISSING", "目标工作表批注 VML 关系无效", relation_part)
     vml_part = package.resolve_relationship_target(worksheet_part, vml_relations[0].get("Target") or "")
-    package.read(vml_part, MAX_ENTRY)
+    vml = package.read_xml(vml_part, MAX_ENTRY)
+    clients = vml.xpath(".//x:ClientData", namespaces={"x": EXCEL_NS})
+    if len(clients) != len(refs):
+        raise WorkbookError("OUTPUT_COMMENTS_MISSING", "批注与 VML 形状数量不一致", vml_part)
+    expected_coordinates = {_comment_coordinate(reference) for reference in refs}
+    actual_coordinates: set[tuple[int, int]] = set()
+    for client in clients:
+        if client.get("ObjectType") != "Note":
+            raise WorkbookError("OUTPUT_COMMENTS_MISSING", "VML 包含非批注对象", vml_part)
+        rows = client.findall(f"{{{EXCEL_NS}}}Row")
+        columns = client.findall(f"{{{EXCEL_NS}}}Column")
+        if len(rows) != 1 or len(columns) != 1:
+            raise WorkbookError("OUTPUT_COMMENTS_MISSING", "VML 批注定位不完整", vml_part)
+        try:
+            coordinate = (int(rows[0].text or ""), int(columns[0].text or ""))
+        except ValueError as exc:
+            raise WorkbookError("OUTPUT_COMMENTS_MISSING", "VML 批注定位无效", vml_part) from exc
+        actual_coordinates.add(coordinate)
+    if actual_coordinates != expected_coordinates:
+        raise WorkbookError("OUTPUT_COMMENTS_MISSING", "批注与 VML 定位不一致", vml_part)
+
+
+def _comment_coordinate(reference: str) -> tuple[int, int]:
+    column = "".join(character for character in reference if character.isalpha())
+    row = "".join(character for character in reference if character.isdigit())
+    if not column or not row:
+        raise WorkbookError("OUTPUT_COMMENTS_MISSING", "批注单元格引用无效", reference)
+    number = 0
+    for character in column.upper():
+        number = number * 26 + ord(character) - ord("A") + 1
+    return int(row) - 1, number - 1
 
 
 def _validate_formula_caches(
@@ -225,14 +257,8 @@ def _validate_formula_caches(
             raise WorkbookError("OUTPUT_CALCULATION_MISMATCH", "输出公式缓存不是有限数字", reference)
         denominator = totals["N"]
         numerator = totals["P"] if reference == "O10" else totals["M"]
-        try:
-            with localcontext() as context:
-                context.prec = 28
-                expected = numerator / denominator
-                tolerance = max(Decimal("1e-12"), abs(expected) * Decimal("1e-12"))
-        except DecimalException as exc:
-            raise WorkbookError("OUTPUT_CALCULATION_MISMATCH", "输出公式缓存无法计算", reference) from exc
-        if abs(actual - expected) > tolerance:
+        expected = _divide_for_cache(numerator, denominator, "N")
+        if actual != expected:
             raise WorkbookError("OUTPUT_CALCULATION_MISMATCH", "输出公式缓存数值不正确", reference)
 
 
