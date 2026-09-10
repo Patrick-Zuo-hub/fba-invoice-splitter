@@ -8,6 +8,7 @@ from zipfile import ZipFile
 import pytest
 from lxml import etree
 
+import fis.xlsx.transform as transform_module
 from fis.xlsx.errors import WorkbookError
 from fis.xlsx.parser import ParsedBundle, ParsedItem, ParsedShipment, parse_invoice_bundle
 from fis.xlsx.template import STANDARD_V1
@@ -940,6 +941,18 @@ def test_workbook_inserts_calcpr_before_extlst_when_missing() -> None:
     assert tags.index("calcPr") < tags.index("extLst")
 
 
+def test_workbook_inserts_calcpr_before_all_schema_successors() -> None:
+    root = etree.Element(f"{{{MAIN_NS}}}workbook", nsmap={None: MAIN_NS})
+    # There is no extLst here; both are legal successors of calcPr.
+    etree.SubElement(root, f"{{{MAIN_NS}}}customWorkbookViews")
+    etree.SubElement(root, f"{{{MAIN_NS}}}webPublishing")
+
+    output = _parsed_xml(transform_workbook_xml(etree.tostring(root), _bundle(), (13, 16)))
+    tags = [etree.QName(child).localname for child in output]
+    assert tags.index("calcPr") < tags.index("customWorkbookViews")
+    assert tags.index("calcPr") < tags.index("webPublishing")
+
+
 def test_workbook_rejects_duplicate_calcpr() -> None:
     root = etree.Element(f"{{{MAIN_NS}}}workbook", nsmap={None: MAIN_NS})
     etree.SubElement(root, f"{{{MAIN_NS}}}calcPr")
@@ -949,6 +962,29 @@ def test_workbook_rejects_duplicate_calcpr() -> None:
         transform_workbook_xml(etree.tostring(root), _bundle(), (13, 16))
 
     assert caught.value.code == "TEMPLATE_VERSION_MISMATCH"
+
+
+def test_merge_validation_uses_subquadratic_overlap_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _parsed_xml(_worksheet())
+    merges = root.find(f"{{{MAIN_NS}}}mergeCells")
+    assert merges is not None
+    for row in range(20, 1220):
+        etree.SubElement(merges, f"{{{MAIN_NS}}}mergeCell", ref=f"A{row}:B{row}")
+    merges.set("count", str(len(merges)))
+    calls = 0
+    original = transform_module._rectangles_overlap
+
+    def counted(left: tuple[int, int, int, int], right: tuple[int, int, int, int]) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(left, right)
+
+    monkeypatch.setattr(transform_module, "_rectangles_overlap", counted)
+    transform_sheet_xml(etree.tostring(root), _bundle(), (13, 16), {})
+
+    assert calls < 20_000
 
 
 def test_workbook_uses_sheet_order_local_id_and_moves_multi_area_print_ranges() -> None:

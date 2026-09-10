@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
+from bisect import bisect_right
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime
 from decimal import (
@@ -16,6 +17,7 @@ from decimal import (
     Overflow,
     Underflow,
 )
+from heapq import heappop, heappush
 from typing import cast
 
 from lxml import etree  # type: ignore[import-untyped]
@@ -49,6 +51,20 @@ _SQREF_TOKEN = re.compile(
     re.ASCII | re.IGNORECASE,
 )
 _TOTAL_COLUMNS = ("K", "M", "N", "P")
+_CALC_PR_SUCCESSOR_TAGS = frozenset(
+    f"{{{MAIN_NS}}}{local_name}"
+    for local_name in (
+        "oleSize",
+        "customWorkbookViews",
+        "pivotCaches",
+        "smartTagPr",
+        "smartTagTypes",
+        "webPublishing",
+        "fileRecoveryPr",
+        "webPublishObjects",
+        "extLst",
+    )
+)
 _MAX_DECIMAL_TEXT = 128
 _MAX_SIGNIFICANT_DIGITS = 15
 _MIN_EXCEL_EXPONENT = -307
@@ -557,6 +573,88 @@ def _rectangles_overlap(
     )
 
 
+def _validate_non_overlapping_rectangles(
+    rectangles: Sequence[tuple[str, tuple[int, int, int, int]]],
+) -> None:
+    """Reject overlapping rectangles with a row sweep and column interval index."""
+
+    if len(rectangles) < 2:
+        return
+    starts = sorted({rectangle[0] for _reference, rectangle in rectangles})
+    start_indexes = {column: index for index, column in enumerate(starts)}
+    tree_size = 1
+    while tree_size < len(starts):
+        tree_size <<= 1
+    tree: list[tuple[int, int] | None] = [None] * (tree_size * 2)
+    heaps: list[list[tuple[int, int]]] = [[] for _ in starts]
+    active = [False] * len(rectangles)
+    expiry: list[tuple[int, int]] = []
+
+    def update(position: int) -> None:
+        node = tree_size + position
+        while heaps[position] and not active[heaps[position][0][1]]:
+            heappop(heaps[position])
+        tree[node] = (
+            (-heaps[position][0][0], heaps[position][0][1])
+            if heaps[position]
+            else None
+        )
+        node //= 2
+        while node:
+            tree[node] = max(tree[node * 2], tree[node * 2 + 1], key=lambda item: item or (-1, -1))
+            node //= 2
+
+    def query(right_position: int) -> tuple[int, int] | None:
+        if right_position < 0:
+            return None
+        left = tree_size
+        right = tree_size + right_position + 1
+        result: tuple[int, int] | None = None
+        while left < right:
+            if left & 1:
+                candidate = tree[left]
+                if candidate is not None and (result is None or candidate > result):
+                    result = candidate
+                left += 1
+            if right & 1:
+                right -= 1
+                candidate = tree[right]
+                if candidate is not None and (result is None or candidate > result):
+                    result = candidate
+            left //= 2
+            right //= 2
+        return result
+
+    ordered = sorted(
+        enumerate(rectangles),
+        key=lambda item: (item[1][1][1], item[1][1][0], item[1][1][3], item[1][1][2], item[0]),
+    )
+    for index, (reference, rectangle) in ordered:
+        first_column, first_row, last_column, last_row = rectangle
+        while expiry and expiry[0][0] < first_row:
+            _expired_row, expired_index = heappop(expiry)
+            if not active[expired_index]:
+                continue
+            active[expired_index] = False
+            expired_rectangle = rectangles[expired_index][1]
+            update(start_indexes[expired_rectangle[0]])
+        right_position = bisect_right(starts, last_column) - 1
+        conflict = query(right_position)
+        if (
+            conflict is not None
+            and conflict[0] >= first_column
+            and _rectangles_overlap(rectangle, rectangles[conflict[1]][1])
+        ):
+            raise _error(
+                "TEMPLATE_VERSION_MISMATCH", "模板合并区域存在重复或重叠", reference
+            )
+        active[index] = True
+        position = start_indexes[first_column]
+        heappush(heaps[position], (-last_column, index))
+        update(position)
+        heappush(expiry, (last_row, index))
+
+
 def _validate_configured_merges(root: etree._Element) -> None:
     containers = root.findall(f"{{{MAIN_NS}}}mergeCells")
     if len(containers) != 1:
@@ -567,7 +665,6 @@ def _validate_configured_merges(root: etree._Element) -> None:
         raise _error("UNSAFE_REFERENCE", "合并区域缺少引用", "mergeCell")
     safe_references = cast(list[str], references)
     configured = tuple(STANDARD_V1.value_ranges.values())
-    configured_rectangles = {reference: _range_rectangle(reference) for reference in configured}
     for reference in configured:
         if safe_references.count(reference) != 1:
             raise _error(
@@ -578,22 +675,8 @@ def _validate_configured_merges(root: etree._Element) -> None:
         not count.isascii() or not count.isdigit() or int(count) != len(merges)
     ):
         raise _error("TEMPLATE_VERSION_MISMATCH", "模板合并区域数量无效", "mergeCells")
-    rectangles: list[tuple[str, tuple[int, int, int, int]]] = []
-    for reference in safe_references:
-        rectangle = _range_rectangle(reference)
-        for previous_reference, previous_rectangle in rectangles:
-            if _rectangles_overlap(rectangle, previous_rectangle):
-                raise _error(
-                    "TEMPLATE_VERSION_MISMATCH", "模板合并区域存在重复或重叠", reference
-                )
-        rectangles.append((reference, rectangle))
-        for configured_reference, configured_rectangle in configured_rectangles.items():
-            if reference != configured_reference and _rectangles_overlap(
-                rectangle, configured_rectangle
-            ):
-                raise _error(
-                    "TEMPLATE_VERSION_MISMATCH", "模板合并区域存在冲突", reference
-                )
+    rectangles = [(reference, _range_rectangle(reference)) for reference in safe_references]
+    _validate_non_overlapping_rectangles(rectangles)
 
 
 def _main(local_name: str) -> str:
@@ -1260,12 +1343,13 @@ def transform_workbook_xml(
     calc_pr = calc_pr_nodes[0] if calc_pr_nodes else None
     if calc_pr is None:
         calc_pr = etree.Element(f"{{{MAIN_NS}}}calcPr")
-        # calcPr precedes extLst in the SpreadsheetML workbook sequence.
-        ext_lst = root.find(f"{{{MAIN_NS}}}extLst")
-        if ext_lst is None:
+        successor = next(
+            (child for child in root if child.tag in _CALC_PR_SUCCESSOR_TAGS), None
+        )
+        if successor is None:
             root.append(calc_pr)
         else:
-            root.insert(root.index(ext_lst), calc_pr)
+            root.insert(root.index(successor), calc_pr)
     calc_pr.set("calcMode", "auto")
     calc_pr.set("fullCalcOnLoad", "1")
     calc_pr.set("forceFullCalc", "1")
