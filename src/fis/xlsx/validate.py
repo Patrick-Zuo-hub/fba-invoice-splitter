@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -9,10 +10,16 @@ from pathlib import Path
 
 from lxml import etree  # type: ignore[import-untyped]
 
-from fis.xlsx.drawings import parse_workbook_drawings
+from fis.xlsx.drawings import Anchor, parse_workbook_drawings
 from fis.xlsx.errors import WorkbookError
 from fis.xlsx.package import MAX_ENTRY, SafePackage
-from fis.xlsx.parser import MAIN_NS, ParsedItem, parse_invoice_bundle
+from fis.xlsx.parser import (
+    MAIN_NS,
+    ParsedItem,
+    _parse_shared_strings,
+    _workbook_relationships,
+    parse_invoice_bundle,
+)
 from fis.xlsx.template import STANDARD_V1
 from fis.xlsx.transform import compute_totals
 
@@ -31,6 +38,14 @@ def validate_generated_workbook(
     expected_rows: int | None = None,
     expected_images: int | None = None,
     expected_values: Mapping[str, str] | None = None,
+    expected_unchanged_parts: Mapping[str, str] | None = None,
+    expected_fixed_images: int | None = None,
+    expected_merge_count: int | None = None,
+    expected_print_area: bool | None = None,
+    expected_row_attributes: Mapping[int, Mapping[str, str]] | None = None,
+    expected_cols_xml: bytes | None = None,
+    expected_fixed_media: tuple[str, ...] | None = None,
+    expected_fixed_anchors: tuple[tuple[int, int, int, int, int, int, int, int], ...] | None = None,
 ) -> ValidationReport:
     """Reopen a generated package and verify independent business invariants."""
 
@@ -44,13 +59,31 @@ def validate_generated_workbook(
 
         with SafePackage.open(path) as package:
             root = _worksheet_root(package)
-            _validate_values(root, expected_values or {})
+            strings = _shared_strings(package)
+            _validate_values(root, expected_values or {}, strings)
             _validate_comments(package)
-            _validate_totals(root, shipment.items)
+            _validate_totals(root, shipment.items, strings)
             _validate_formula_caches(package, root)
+            _validate_layout(
+                root,
+                expected_merge_count,
+                expected_print_area,
+                package,
+                expected_row_attributes,
+                expected_cols_xml,
+            )
+            _validate_unchanged_parts(package, expected_unchanged_parts or {})
         inventory = parse_workbook_drawings(path, parsed)
-        if expected_images is not None and len(inventory.product_images) != expected_images:
+        if expected_images is not None and len(inventory.product_images) + len(inventory.fixed_images) != expected_images:
             raise WorkbookError("OUTPUT_IMAGE_MISMATCH", "输出工作簿商品图片数量不正确", expected_shipment)
+        if expected_fixed_images is not None and len(inventory.fixed_images) != expected_fixed_images:
+            raise WorkbookError("OUTPUT_FIXED_IMAGE_MISMATCH", "输出工作簿固定图片不完整", expected_shipment)
+        if expected_fixed_media is not None and tuple(sorted(image.media_part for image in inventory.fixed_images)) != tuple(sorted(expected_fixed_media)):
+            raise WorkbookError("OUTPUT_FIXED_IMAGE_MISMATCH", "输出工作簿固定图片关系不正确", expected_shipment)
+        if expected_fixed_anchors is not None:
+            actual_anchors = tuple(sorted(_anchor_signature(image.anchor) for image in inventory.fixed_images))
+            if actual_anchors != tuple(sorted(expected_fixed_anchors)):
+                raise WorkbookError("OUTPUT_FIXED_IMAGE_MISMATCH", "输出工作簿固定图片锚点不正确", expected_shipment)
         if any(image.source_row not in parsed.product_rows for image in inventory.product_images):
             raise WorkbookError("OUTPUT_IMAGE_MISMATCH", "输出工作簿图片无法关联到商品行", expected_shipment)
         return ValidationReport(ok=True)
@@ -91,18 +124,31 @@ def _cell(root: etree._Element, reference: str) -> etree._Element:
     return cells[0]
 
 
-def _cell_text(cell: etree._Element) -> str:
+def _shared_strings(package: SafePackage) -> tuple[str, ...]:
+    return _parse_shared_strings(package, _workbook_relationships(package))
+
+
+def _cell_text(cell: etree._Element, shared_strings: tuple[str, ...] = ()) -> str:
     if cell.get("t") == "inlineStr":
         return "".join(cell.xpath("./main:is//main:t/text()", namespaces={"main": MAIN_NS}))
+    if cell.get("t") == "s":
+        value = cell.findtext(f"{{{MAIN_NS}}}v") or ""
+        try:
+            index = int(value)
+        except ValueError as exc:
+            raise WorkbookError("OUTPUT_TEMPLATE_MISMATCH", "共享字符串索引无效", cell.get("r")) from exc
+        if index < 0 or index >= len(shared_strings):
+            raise WorkbookError("OUTPUT_TEMPLATE_MISMATCH", "共享字符串索引越界", cell.get("r"))
+        return shared_strings[index]
     return cell.findtext(f"{{{MAIN_NS}}}v") or ""
 
 
-def _validate_values(root: etree._Element, values: Mapping[str, str]) -> None:
+def _validate_values(root: etree._Element, values: Mapping[str, str], shared_strings: tuple[str, ...]) -> None:
     for field, expected in values.items():
         if field not in STANDARD_V1.value_ranges:
             raise WorkbookError("OUTPUT_TEMPLATE_MISMATCH", "输出字段不属于 V1 模板", field)
         reference = STANDARD_V1.value_ranges[field].split(":", 1)[0]
-        actual = _cell_text(_cell(root, reference))
+        actual = _cell_text(_cell(root, reference), shared_strings)
         if actual != str(expected):
             raise WorkbookError("OUTPUT_VALUE_MISMATCH", "输出物流字段不正确", reference)
 
@@ -122,16 +168,20 @@ def _validate_formula_caches(package: SafePackage, root: etree._Element) -> None
     calc_pr = workbook.find(f"{{{MAIN_NS}}}calcPr")
     if calc_pr is None or any(calc_pr.get(name) != "1" for name in ("fullCalcOnLoad", "forceFullCalc")):
         raise WorkbookError("OUTPUT_CALCULATION_MISMATCH", "输出工作簿未启用完整重算", "calcPr")
-    total_row = next(
+    strings = _shared_strings(package)
+    total_rows = [
         int(row.get("r") or "0")
         for row in root.xpath("./main:sheetData/main:row", namespaces={"main": MAIN_NS})
         if any(
             item.tag == f"{{{MAIN_NS}}}c"
             and item.get("r") == f"A{row.get('r')}"
-            and _cell_text(item) == "合计TOTAL"
+            and _cell_text(item, strings) == "合计TOTAL"
             for item in row
         )
-    )
+    ]
+    if len(total_rows) != 1:
+        raise WorkbookError("OUTPUT_TEMPLATE_MISMATCH", "输出工作簿缺少唯一合计行", "A")
+    total_row = total_rows[0]
     for reference, expected_formula in (("O10", f"P{total_row}/N{total_row}"), ("R10", "G9/G10")):
         cell = _cell(root, reference)
         formula = cell.findtext(f"{{{MAIN_NS}}}f")
@@ -140,7 +190,7 @@ def _validate_formula_caches(package: SafePackage, root: etree._Element) -> None
             raise WorkbookError("OUTPUT_CALCULATION_MISMATCH", "输出公式或缓存值不正确", reference)
 
 
-def _validate_totals(root: etree._Element, items: tuple[ParsedItem, ...]) -> None:
+def _validate_totals(root: etree._Element, items: tuple[ParsedItem, ...], shared_strings: tuple[str, ...]) -> None:
     # Parsed items expose a stable cells mapping; avoid depending on implementation details.
     rows = [item.cells for item in items]
     totals = compute_totals(rows)
@@ -148,12 +198,103 @@ def _validate_totals(root: etree._Element, items: tuple[ParsedItem, ...]) -> Non
     for row in root.xpath("./main:sheetData/main:row", namespaces={"main": MAIN_NS}):
         row_number = int(row.get("r") or "0")
         cells = [item for item in row if item.tag == f"{{{MAIN_NS}}}c" and item.get("r") == f"A{row_number}"]
-        if len(cells) == 1 and _cell_text(cells[0]) == "合计TOTAL":
+        if len(cells) == 1 and _cell_text(cells[0], shared_strings) == "合计TOTAL":
             total_rows.append(row_number)
     if len(total_rows) != 1:
         raise WorkbookError("OUTPUT_TEMPLATE_MISMATCH", "输出工作簿缺少唯一合计行", "A")
     total_row = total_rows[0]
     for column, expected in (("K", totals["K"]), ("M", totals["M"]), ("N", totals["N"]), ("P", totals["P"])):
-        actual = _cell_text(_cell(root, f"{column}{total_row}"))
-        if Decimal(actual) != expected:
+        actual = _cell_text(_cell(root, f"{column}{total_row}"), shared_strings)
+        try:
+            matches = Decimal(actual) == expected
+        except (ValueError, ArithmeticError) as exc:
+            raise WorkbookError("OUTPUT_TOTAL_MISMATCH", "输出工作簿合计不是有效数字", f"{column}{total_row}") from exc
+        if not matches:
             raise WorkbookError("OUTPUT_TOTAL_MISMATCH", "输出工作簿合计不正确", f"{column}{total_row}")
+
+
+def _validate_layout(
+    root: etree._Element,
+    expected_merge_count: int | None,
+    expected_print_area: bool | None,
+    package: SafePackage,
+    expected_row_attributes: Mapping[int, Mapping[str, str]] | None,
+    expected_cols_xml: bytes | None,
+) -> None:
+    merges = root.xpath("./main:mergeCells/main:mergeCell", namespaces={"main": MAIN_NS})
+    if expected_merge_count is not None and len(merges) != expected_merge_count:
+        raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", "输出工作簿合并区域不完整", "mergeCells")
+    _assert_non_overlapping_merges(merges)
+    required_ranges = set(STANDARD_V1.value_ranges.values())
+    actual_ranges = {merge.get("ref") for merge in merges}
+    if not required_ranges.issubset(actual_ranges):
+        raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", "输出工作簿配置合并区域不完整", "mergeCells")
+    if expected_row_attributes is not None:
+        for number, expected in expected_row_attributes.items():
+            rows = root.xpath(
+                "./main:sheetData/main:row[@r=$row]", row=str(number), namespaces={"main": MAIN_NS}
+            )
+            if len(rows) != 1 or {key: value for key, value in rows[0].attrib.items() if key != "r"} != dict(expected):
+                raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", "输出工作簿行高或行样式发生变化", f"row {number}")
+    if expected_cols_xml is not None:
+        cols = root.find(f"{{{MAIN_NS}}}cols")
+        actual = etree.tostring(cols, encoding="UTF-8") if cols is not None else None
+        if actual != expected_cols_xml:
+            raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", "输出工作簿列宽发生变化", "cols")
+    if expected_print_area is not None:
+        workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
+        names = workbook.xpath("./main:definedNames/main:definedName[@name='_xlnm.Print_Area']", namespaces={"main": MAIN_NS})
+        if bool(names) != expected_print_area:
+            raise WorkbookError("OUTPUT_PRINT_MISMATCH", "输出工作簿打印区域不完整", "definedNames")
+
+
+def _assert_non_overlapping_merges(merges: list[etree._Element]) -> None:
+    rectangles: list[tuple[int, int, int, int]] = []
+    for merge in merges:
+        reference = merge.get("ref") or ""
+        try:
+            left, right = reference.split(":")
+            left_col, left_row = _parse_merge_endpoint(left)
+            right_col, right_row = _parse_merge_endpoint(right)
+            rectangle = (_merge_column_number(left_col), left_row, _merge_column_number(right_col), right_row)
+        except (ValueError, TypeError):
+            raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", "输出合并区域引用无效", reference)
+        for other in rectangles:
+            if rectangle[0] <= other[2] and other[0] <= rectangle[2] and rectangle[1] <= other[3] and other[1] <= rectangle[3]:
+                raise WorkbookError("OUTPUT_LAYOUT_MISMATCH", "输出合并区域重复或重叠", reference)
+        rectangles.append(rectangle)
+
+
+def _validate_unchanged_parts(package: SafePackage, expected: Mapping[str, str]) -> None:
+    for name, digest in expected.items():
+        actual = hashlib.sha256(package.read(name, MAX_ENTRY)).hexdigest()
+        if actual != digest:
+            raise WorkbookError("OUTPUT_UNCHANGED_PART_MISMATCH", "未触及的工作簿部件发生变化", name)
+
+
+def _anchor_signature(anchor: Anchor) -> tuple[int, int, int, int, int, int, int, int]:
+    return (
+        anchor.from_row,
+        anchor.from_col,
+        anchor.from_row_off,
+        anchor.from_col_off,
+        anchor.to_row,
+        anchor.to_col,
+        anchor.to_row_off,
+        anchor.to_col_off,
+    )
+
+
+def _parse_merge_endpoint(value: str) -> tuple[str, int]:
+    column = "".join(character for character in value if character.isalpha())
+    digits = "".join(character for character in value if character.isdigit())
+    if not column or not digits:
+        raise ValueError(value)
+    return column, int(digits)
+
+
+def _merge_column_number(value: str) -> int:
+    result = 0
+    for character in value.upper():
+        result = result * 26 + ord(character) - ord("A") + 1
+    return result

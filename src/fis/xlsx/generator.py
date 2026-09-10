@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import tempfile
@@ -24,6 +25,7 @@ from fis.xlsx.parser import (
 )
 from fis.xlsx.template import STANDARD_V1
 from fis.xlsx.transform import (
+    build_row_map,
     transform_comments_vml_xml,
     transform_comments_xml,
     transform_drawing_anchors_xml,
@@ -54,6 +56,21 @@ class ShipmentOutput:
     delivery_warehouse: str
 
 
+@dataclass(frozen=True, slots=True)
+class _GeneratedPayload:
+    payload: bytes
+    expected_rows: int
+    expected_images: int
+    expected_fixed_images: int
+    expected_merge_count: int
+    expected_print_area: bool
+    expected_unchanged_parts: Mapping[str, str]
+    expected_row_attributes: Mapping[int, Mapping[str, str]]
+    expected_cols_xml: bytes | None
+    expected_fixed_media: tuple[str, ...]
+    expected_fixed_anchors: tuple[tuple[int, int, int, int, int, int, int, int], ...]
+
+
 def safe_filename(request: ShipmentOutput) -> str:
     """Return a deterministic filename without allowing path separators."""
 
@@ -79,7 +96,8 @@ def generate_shipment_workbook(
         raise WorkbookError("OUTPUT_PATH_CONFLICT", "输出文件不能覆盖源工作簿", str(output_path))
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    payload = _generate_payload(source_path, request)
+    generated = _generate_payload(source_path, request)
+    payload = generated.payload
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -92,9 +110,17 @@ def generate_shipment_workbook(
         report = validate_generated_workbook(
             temp_path,
             expected_shipment=request.shipment_id,
-            expected_rows=None,
-            expected_images=None,
+            expected_rows=generated.expected_rows,
+            expected_images=generated.expected_images,
+            expected_fixed_images=generated.expected_fixed_images,
+            expected_merge_count=generated.expected_merge_count,
+            expected_print_area=generated.expected_print_area,
+            expected_row_attributes=generated.expected_row_attributes,
+            expected_cols_xml=generated.expected_cols_xml,
+            expected_fixed_media=generated.expected_fixed_media,
+            expected_fixed_anchors=generated.expected_fixed_anchors,
             expected_values=_request_values(request),
+            expected_unchanged_parts=generated.expected_unchanged_parts,
         )
         if not report.ok:
             raise WorkbookError("OUTPUT_VALIDATION_FAILED", report.error or "生成工作簿校验失败")
@@ -116,8 +142,8 @@ def generate_shipment_workbook_bytes(source: Path | str | bytes, request: Shipme
         with tempfile.TemporaryDirectory(prefix="fis-source-") as directory:
             source_path = Path(directory) / "source.xlsx"
             source_path.write_bytes(source)
-            payload = _generate_payload(source_path, request)
-            return _validated_payload(payload, request)
+            generated = _generate_payload(source_path, request)
+            return _validated_payload(generated, request)
     return _validated_payload(_generate_payload(Path(source), request), request)
 
 
@@ -153,7 +179,7 @@ def _request_values(request: ShipmentOutput) -> dict[str, str]:
     }
 
 
-def _generate_payload(source: Path, request: ShipmentOutput) -> bytes:
+def _generate_payload(source: Path, request: ShipmentOutput) -> _GeneratedPayload:
     if source.suffix.lower() != ".xlsx" or not source.is_file():
         raise WorkbookError("INVALID_PATH", "请选择存在的 .xlsx 工作簿文件")
     parsed = parse_invoice_bundle(source)
@@ -239,23 +265,83 @@ def _generate_payload(source: Path, request: ShipmentOutput) -> bytes:
                     package.read(vml_part, MAX_ENTRY), parsed, kept_rows, comment_references=refs
                 )
 
-        return _write_deterministic_package(package, transformed, removed_media)
+        source_sheet_root = etree.fromstring(sheet_xml)
+        source_workbook_root = etree.fromstring(workbook_xml)
+        row_map = build_row_map(parsed.product_rows, kept_rows, parsed.total_row)
+        shift = len(parsed.product_rows) - len(kept_rows)
+        expected_row_attributes: dict[int, Mapping[str, str]] = {}
+        for row in source_sheet_root.xpath("./main:sheetData/main:row", namespaces={"main": MAIN_NS}):
+            old_number = int(row.get("r") or "0")
+            new_number = row_map.get(old_number)
+            if new_number is None:
+                if old_number in parsed.product_rows:
+                    continue
+                new_number = old_number - shift if old_number > parsed.total_row else old_number
+            expected_row_attributes[new_number] = {
+                key: value for key, value in row.attrib.items() if key != "r"
+            }
+        transformed_lower = {name.lower() for name in transformed}
+        removed_media_lower = {part.lower() for part in removed_media}
+        unchanged = {
+            name: hashlib.sha256(package.read(name, MAX_ENTRY)).hexdigest()
+            for name in package.names
+            if name.lower() not in transformed_lower and name.lower() not in removed_media_lower
+        }
+        target_image_count = sum(image.source_row in set(kept_rows) for image in inventory.product_images)
+        payload = _write_deterministic_package(package, transformed, removed_media)
+        return _GeneratedPayload(
+            payload=payload,
+            expected_rows=len(kept_rows),
+            expected_images=target_image_count + len(inventory.fixed_images),
+            expected_fixed_images=len(inventory.fixed_images),
+            expected_merge_count=len(source_sheet_root.xpath("./main:mergeCells/main:mergeCell", namespaces={"main": MAIN_NS})),
+            expected_print_area=bool(source_workbook_root.xpath("./main:definedNames/main:definedName[@name='_xlnm.Print_Area']", namespaces={"main": MAIN_NS})),
+            expected_unchanged_parts=unchanged,
+            expected_row_attributes=expected_row_attributes,
+            expected_cols_xml=(
+                cast(bytes, etree.tostring(source_sheet_root.find(f"{{{MAIN_NS}}}cols"), encoding="UTF-8"))
+                if source_sheet_root.find(f"{{{MAIN_NS}}}cols") is not None
+                else None
+            ),
+            expected_fixed_media=tuple(image.media_part for image in inventory.fixed_images),
+            expected_fixed_anchors=tuple(
+                (
+                    image.anchor.from_row,
+                    image.anchor.from_col,
+                    image.anchor.from_row_off,
+                    image.anchor.from_col_off,
+                    image.anchor.to_row,
+                    image.anchor.to_col,
+                    image.anchor.to_row_off,
+                    image.anchor.to_col_off,
+                )
+                for image in inventory.fixed_images
+            ),
+        )
 
 
-def _validated_payload(payload: bytes, request: ShipmentOutput) -> bytes:
+def _validated_payload(generated: _GeneratedPayload, request: ShipmentOutput) -> bytes:
     with tempfile.TemporaryDirectory(prefix="fis-output-") as directory:
         path = Path(directory) / "generated.xlsx"
-        path.write_bytes(payload)
+        path.write_bytes(generated.payload)
         report = validate_generated_workbook(
             path,
             expected_shipment=request.shipment_id,
-            expected_rows=None,
-            expected_images=None,
+            expected_rows=generated.expected_rows,
+            expected_images=generated.expected_images,
+            expected_fixed_images=generated.expected_fixed_images,
+            expected_merge_count=generated.expected_merge_count,
+            expected_print_area=generated.expected_print_area,
+            expected_row_attributes=generated.expected_row_attributes,
+            expected_cols_xml=generated.expected_cols_xml,
+            expected_fixed_media=generated.expected_fixed_media,
+            expected_fixed_anchors=generated.expected_fixed_anchors,
             expected_values=_request_values(request),
+            expected_unchanged_parts=generated.expected_unchanged_parts,
         )
         if not report.ok:
             raise WorkbookError("OUTPUT_VALIDATION_FAILED", report.error or "生成工作簿校验失败")
-    return payload
+    return generated.payload
 
 
 def _relationship_part(source_part: str) -> str:

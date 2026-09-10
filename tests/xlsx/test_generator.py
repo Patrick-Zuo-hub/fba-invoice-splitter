@@ -69,3 +69,18 @@ def test_generation_removes_unselected_media_and_relationships(tmp_path: Path) -
         assert "xl/media/image2.png" not in names
         rels = archive.read("xl/drawings/_rels/drawing1.xml.rels")
         assert b"rId2" not in rels
+
+
+def test_validation_resolves_shared_string_total_label(tmp_path: Path) -> None:
+    source = tmp_path / "source.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    payload = generate_shipment_workbook_bytes(source, _request())
+    from lxml import etree
+
+    from fis.xlsx.validate import _cell_text
+
+    main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    cell = etree.Element(f"{{{main}}}c", r="A14", t="s")
+    etree.SubElement(cell, f"{{{main}}}v").text = "0"
+    assert _cell_text(cell, ("合计TOTAL",)) == "合计TOTAL"
+    assert payload
