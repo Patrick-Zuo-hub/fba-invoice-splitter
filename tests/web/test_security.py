@@ -1,5 +1,4 @@
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import pytest
 from fastapi import Response
@@ -7,238 +6,207 @@ from fastapi.testclient import TestClient
 
 from fis.config import Settings
 from fis.web.app import create_app
+from fis.web.security import LocalRequestPolicy
 
 HOST = "127.0.0.1:8765"
 ORIGIN = f"http://{HOST}"
 
 
 def _client(tmp_path: Path) -> TestClient:
-    app = create_app(Settings(data_root=tmp_path / "data"), launch_secret="secret")
+    app = create_app(Settings(data_root=tmp_path / "data"), bound_port=8765)
 
-    @app.post("/test-mutation", status_code=204)
+    @app.api_route("/_test/mutation", methods=["POST", "PUT", "PATCH", "DELETE"])
     def test_mutation() -> Response:
         return Response(status_code=204)
 
     return TestClient(app)
 
 
-def _launch(client: TestClient, *, host: str = HOST) -> str:
-    response = client.get(
-        "/launch?secret=secret", headers={"host": host}, follow_redirects=False
-    )
-    assert response.status_code == 303
-    page = client.get("/", headers={"host": host})
-    marker = 'content="'
-    tail = page.text.split('name="csrf-token"', 1)[1]
-    return tail.split(marker, 1)[1].split('"', 1)[0]
+@pytest.mark.parametrize("port", [0, 65536, -1, True, False, 1.5, "8765"])
+def test_policy_rejects_invalid_bound_port(port: object) -> None:
+    with pytest.raises(ValueError, match="bound_port"):
+        LocalRequestPolicy(port)  # type: ignore[arg-type]
+
+
+def test_policy_is_immutable_and_uses_exact_loopback_values() -> None:
+    policy = LocalRequestPolicy(8765)
+
+    assert policy.authority == HOST
+    assert policy.origin == ORIGIN
+    with pytest.raises((AttributeError, TypeError)):
+        policy.bound_port = 9000  # type: ignore[misc]
 
 
 @pytest.mark.parametrize(
     "host",
     [
-        "attacker.example",
-        "localhost.attacker.example",
-        "127.0.0.1.attacker.example",
-        "localhost.",
-        "localhost:0",
-        "localhost:65536",
-        "localhost:abc",
-        "user@localhost",
-        "localhost,attacker.example",
-        " localhost",
-        "localhost ",
-        "[::1]",
+        "attacker.example:8765",
+        "localhost:8765",
+        "127.0.0.1",
+        "127.0.0.1:8766",
+        "127.0.0.1.:8765",
+        "user@127.0.0.1:8765",
         "[::1]:8765",
+        "127.0.0.1:8765,attacker.example",
+        " 127.0.0.1:8765",
+        "127.0.0.1:8765 ",
     ],
 )
-def test_unexpected_or_ambiguous_host_is_rejected(tmp_path: Path, host: str) -> None:
-    client = _client(tmp_path)
+def test_host_must_exactly_match_bound_authority(tmp_path: Path, host: str) -> None:
+    response = _client(tmp_path).get("/health", headers={"host": host})
 
-    assert client.get("/health", headers={"host": host}).status_code == 400
-
-
-@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", HOST, "localhost:65535"])
-def test_exact_loopback_hosts_are_allowed(tmp_path: Path, host: str) -> None:
-    client = _client(tmp_path)
-
-    assert client.get("/health", headers={"host": host}).status_code == 200
-
-
-def test_duplicate_host_headers_are_rejected(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    response = client.get(
-        "/health",
-        headers=[("host", "127.0.0.1"), ("host", "localhost")],
-    )
     assert response.status_code == 400
+    assert response.text == "请求无效"
+    assert host not in response.text
+
+
+def test_missing_duplicate_and_non_ascii_host_are_rejected(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+
+    assert client.get("/health", headers={}).status_code == 400
+    assert (
+        client.get("/health", headers=[("host", HOST), ("Host", HOST)]).status_code
+        == 400
+    )
+    assert client.get("/health", headers=[(b"host", b"\xff")]).status_code == 400
 
 
 @pytest.mark.parametrize(
-    "path",
+    "headers",
     [
-        "/launch",
-        "/launch?secret=",
-        "/launch?secret=wrong",
-        "/launch?secret=secret&secret=secret",
-        "/launch?secret=secret&next=/",
-        "/launch?secret=secret%0d%0aX-Test:bad",
+        [("forwarded", "for=127.0.0.1")],
+        [("Forwarded", "for=127.0.0.1"), ("forwarded", "for=127.0.0.1")],
+        [("x-forwarded-for", "127.0.0.1")],
+        [("X-Forwarded-Host", HOST)],
+        [("x-forwarded-proto", "http")],
+        [("x-forwarded-port", "8765")],
+        [("x-forwarded-anything", "value")],
     ],
 )
-def test_launch_requires_one_exact_secret_without_reflection(tmp_path: Path, path: str) -> None:
-    client = _client(tmp_path)
+def test_forwarding_headers_are_rejected(
+    tmp_path: Path, headers: list[tuple[str, str]]
+) -> None:
+    response = _client(tmp_path).get("/health", headers=[("host", HOST), *headers])
 
-    response = client.get(path, headers={"host": HOST}, follow_redirects=False)
-
-    assert response.status_code == 403
-    assert "secret" not in response.text.lower()
-    assert "wrong" not in response.text
+    assert response.status_code == 400
+    assert response.text == "请求无效"
 
 
-def test_launch_cookie_is_scoped_for_loopback_http(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    response = client.get(
-        "/launch?secret=secret", headers={"host": HOST}, follow_redirects=False
+@pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+def test_unsafe_methods_accept_only_exact_origin_and_request_marker(
+    tmp_path: Path, method: str
+) -> None:
+    response = getattr(_client(tmp_path), method)(
+        "/_test/mutation",
+        headers={"host": HOST, "origin": ORIGIN, "x-fis-request": "1"},
     )
 
-    cookie = response.headers["set-cookie"]
-    assert "fis_session=" in cookie
-    assert "HttpOnly" in cookie
-    assert "SameSite=strict" in cookie
-    assert "Path=/" in cookie
-    assert "Max-Age=" in cookie
-    assert "Secure" not in cookie
-    assert "secret" not in cookie
-
-
-def test_wrong_or_missing_session_cannot_access_application(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    assert client.get("/", headers={"host": HOST}).status_code == 401
-    client.cookies.set("fis_session", "wrong")
-    assert client.get("/", headers={"host": HOST}).status_code == 401
-
-
-def test_launch_url_does_not_survive_the_redirect_target(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    response = client.get("/launch?secret=secret", headers={"host": HOST})
-
-    assert response.status_code == 200
-    assert urlsplit(str(response.url)).path == "/"
-    assert urlsplit(str(response.url)).query == ""
-    assert "secret" not in response.history[0].headers["location"]
-
-
-def test_get_routes_do_not_require_origin_or_csrf(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-    _launch(client)
-
-    assert client.get("/", headers={"host": HOST}).status_code == 200
-
-
-def test_health_mutation_does_not_bypass_the_session(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    assert client.post("/health", headers={"host": HOST}).status_code == 401
+    assert response.status_code == 204
 
 
 @pytest.mark.parametrize(
     "origin",
     [
+        None,
+        "",
+        "HTTP://127.0.0.1:8765",
         "https://127.0.0.1:8765",
         "http://localhost:8765",
         "http://127.0.0.1",
         "http://127.0.0.1:8766",
-        "http://user@127.0.0.1:8765",
-        "http://127.0.0.1:8765/extra",
-        "http://127.0.0.1:8765?x=1",
-        "http://127.0.0.1:8765#x",
+        "http://127.0.0.1:8765/",
         "http://127.0.0.1:8765, http://attacker.example",
+        " http://127.0.0.1:8765",
+        "http://127.0.0.1:8765 ",
         "null",
     ],
 )
-def test_mutation_rejects_missing_or_non_matching_origin(tmp_path: Path, origin: str) -> None:
-    client = _client(tmp_path)
-    token = _launch(client)
+def test_unsafe_method_rejects_missing_or_non_exact_origin(
+    tmp_path: Path, origin: str | None
+) -> None:
+    headers = {"host": HOST, "x-fis-request": "1"}
+    if origin is not None:
+        headers["origin"] = origin
 
-    response = client.post(
-        "/test-mutation",
-        headers={"host": HOST, "origin": origin, "x-csrf-token": token},
+    response = _client(tmp_path).post("/_test/mutation", headers=headers)
+
+    assert response.status_code == 403
+    assert response.text == "禁止访问"
+    if origin:
+        assert origin not in response.text
+
+
+def test_unsafe_method_rejects_duplicate_origin(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/_test/mutation",
+        headers=[
+            ("host", HOST),
+            ("origin", ORIGIN),
+            ("Origin", ORIGIN),
+            ("x-fis-request", "1"),
+        ],
     )
 
     assert response.status_code == 403
 
 
-def test_mutation_rejects_missing_origin(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-    token = _launch(client)
-
-    response = client.post(
-        "/test-mutation", headers={"host": HOST, "x-csrf-token": token}
+def test_unsafe_method_rejects_non_ascii_origin(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/_test/mutation",
+        headers=[
+            (b"host", HOST.encode("ascii")),
+            (b"origin", b"\xff"),
+            (b"x-fis-request", b"1"),
+        ],
     )
+
     assert response.status_code == 403
 
 
-@pytest.mark.parametrize("token", [None, "", "wrong"])
-def test_mutation_rejects_missing_or_wrong_csrf_header(tmp_path: Path, token: str | None) -> None:
-    client = _client(tmp_path)
-    _launch(client)
+@pytest.mark.parametrize("marker", [None, "", "0", "01", "true", "ONE", " 1", "1 ", "1,1"])
+def test_unsafe_method_rejects_missing_or_non_exact_request_marker(
+    tmp_path: Path, marker: str | None
+) -> None:
     headers = {"host": HOST, "origin": ORIGIN}
-    if token is not None:
-        headers["x-csrf-token"] = token
+    if marker is not None:
+        headers["x-fis-request"] = marker
 
-    assert client.post("/test-mutation", headers=headers).status_code == 403
+    response = _client(tmp_path).post("/_test/mutation", headers=headers)
 
-
-def test_mutation_accepts_csrf_header(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-    token = _launch(client)
-
-    response = client.post(
-        "/test-mutation",
-        headers={"host": HOST, "origin": ORIGIN, "x-csrf-token": token},
-    )
-
-    assert response.status_code == 204
+    assert response.status_code == 403
+    assert response.text == "禁止访问"
 
 
-def test_mutation_accepts_urlencoded_csrf_form_field(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-    token = _launch(client)
-
-    response = client.post(
-        "/test-mutation",
-        headers={"host": HOST, "origin": ORIGIN},
-        data={"csrf_token": token},
-    )
-
-    assert response.status_code == 204
-
-
-def test_mutation_accepts_multipart_csrf_form_field(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-    token = _launch(client)
-
-    response = client.post(
-        "/test-mutation",
-        headers={"host": HOST, "origin": ORIGIN},
-        data={"csrf_token": token},
-        files={"invoice": ("invoice.xlsx", b"placeholder", "application/octet-stream")},
-    )
-
-    assert response.status_code == 204
-
-
-def test_mutation_rejects_conflicting_header_and_form_tokens(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-    token = _launch(client)
-
-    response = client.post(
-        "/test-mutation",
-        headers={"host": HOST, "origin": ORIGIN, "x-csrf-token": token},
-        data={"csrf_token": "wrong"},
+def test_unsafe_method_rejects_duplicate_request_marker(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/_test/mutation",
+        headers=[
+            ("host", HOST),
+            ("origin", ORIGIN),
+            ("x-fis-request", "1"),
+            ("X-FIS-Request", "1"),
+        ],
     )
 
     assert response.status_code == 403
+
+
+def test_get_and_head_do_not_require_unsafe_headers(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+
+    assert client.get("/", headers={"host": HOST}).status_code == 200
+    assert client.head("/", headers={"host": HOST}).status_code == 200
+
+
+def test_options_does_not_grant_cors_access(tmp_path: Path) -> None:
+    response = _client(tmp_path).options(
+        "/_test/mutation",
+        headers={
+            "host": HOST,
+            "origin": "http://attacker.example",
+            "access-control-request-method": "POST",
+        },
+    )
+
+    assert response.status_code == 405
+    assert not any(name.lower().startswith("access-control-allow-") for name in response.headers)

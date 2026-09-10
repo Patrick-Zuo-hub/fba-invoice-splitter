@@ -5,80 +5,83 @@ from fastapi.testclient import TestClient
 from fis.config import Settings
 from fis.web.app import create_app
 
+HOST = "127.0.0.1:8765"
+
 
 def _client(tmp_path: Path) -> TestClient:
-    return TestClient(create_app(Settings(data_root=tmp_path / "data"), launch_secret="secret"))
+    return TestClient(create_app(Settings(data_root=tmp_path / "data"), bound_port=8765))
 
 
-def _launch(client: TestClient) -> None:
-    response = client.get(
-        "/launch?secret=secret",
-        headers={"host": "127.0.0.1:8765"},
-        follow_redirects=False,
+def test_app_records_settings_and_actual_bound_port(tmp_path: Path) -> None:
+    settings = Settings(data_root=tmp_path / "data")
+    app = create_app(settings, bound_port=8765)
+
+    assert app.state.settings is settings
+    assert app.state.bound_port == 8765
+
+
+def test_root_is_directly_available_without_cookie_or_tokens(tmp_path: Path) -> None:
+    response = _client(tmp_path).get("/", headers={"host": HOST})
+
+    assert response.status_code == 200
+    assert "FBA Invoice Splitter" in response.text
+    assert "csrf" not in response.text.lower()
+    assert "launch" not in response.text.lower()
+    assert "session" not in response.text.lower()
+    assert "set-cookie" not in response.headers
+
+
+def test_launch_route_is_removed(tmp_path: Path) -> None:
+    response = _client(tmp_path).get(
+        "/launch?secret=anything", headers={"host": HOST}, follow_redirects=False
     )
-    assert response.status_code == 303
+
+    assert response.status_code == 404
+    assert "set-cookie" not in response.headers
 
 
-def test_health_is_the_only_unauthenticated_data_free_route(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    response = client.get("/health", headers={"host": "127.0.0.1"})
+def test_health_returns_only_ok_status(tmp_path: Path) -> None:
+    response = _client(tmp_path).get("/health", headers={"host": HOST})
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
-    assert response.headers["cache-control"] == "no-store"
-    assert client.get("/", headers={"host": "127.0.0.1"}).status_code == 401
-    assert client.get("/missing", headers={"host": "127.0.0.1"}).status_code == 401
 
 
-def test_launch_redirects_to_clean_root_and_renders_minimal_page(tmp_path: Path) -> None:
-    client = _client(tmp_path)
+def test_static_content_is_available_with_exact_host(tmp_path: Path) -> None:
+    response = _client(tmp_path).get("/static/app.css", headers={"host": HOST})
 
-    launch = client.get(
-        "/launch?secret=secret",
-        headers={"host": "localhost:8123"},
-        follow_redirects=False,
-    )
-
-    assert launch.status_code == 303
-    assert launch.headers["location"] == "/"
-    assert "secret" not in launch.text
-    assert "secret" not in launch.headers["location"]
-    page = client.get("/", headers={"host": "localhost:8123"})
-    assert page.status_code == 200
-    assert "FBA Invoice Splitter" in page.text
-    assert 'name="csrf-token"' in page.text
-    assert "secret" not in page.text
-
-
-def test_static_content_is_protected_by_the_session(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    assert client.get("/static/app.css", headers={"host": "localhost"}).status_code == 401
-
-    _launch(client)
-    response = client.get("/static/app.css", headers={"host": "127.0.0.1:8765"})
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/css")
 
 
 def test_framework_documentation_endpoints_are_disabled(tmp_path: Path) -> None:
     client = _client(tmp_path)
-    _launch(client)
 
     for path in ("/docs", "/redoc", "/openapi.json"):
-        assert client.get(path, headers={"host": "127.0.0.1:8765"}).status_code == 404
+        assert client.get(path, headers={"host": HOST}).status_code == 404
 
 
-def test_security_headers_are_applied_to_success_and_rejection(tmp_path: Path) -> None:
+def test_security_headers_are_applied_to_success_rejection_and_not_found(
+    tmp_path: Path,
+) -> None:
     client = _client(tmp_path)
 
     for response in (
-        client.get("/health", headers={"host": "localhost"}),
+        client.get("/health", headers={"host": HOST}),
         client.get("/health", headers={"host": "attacker.example"}),
+        client.get("/missing", headers={"host": HOST}),
     ):
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["content-security-policy"] == (
+            "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
+            "form-action 'self'; object-src 'none'"
+        )
+        assert response.headers["cross-origin-resource-policy"] == "same-origin"
+        assert response.headers["permissions-policy"]
+        assert response.headers["referrer-policy"] == "no-referrer"
         assert response.headers["x-content-type-options"] == "nosniff"
         assert response.headers["x-frame-options"] == "DENY"
-        assert response.headers["referrer-policy"] == "no-referrer"
-        assert response.headers["cache-control"] == "no-store"
-        assert response.headers["content-security-policy"].startswith("default-src 'self'")
+        assert not any(
+            name.lower().startswith("access-control-allow-")
+            for name in response.headers
+        )
