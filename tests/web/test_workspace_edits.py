@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fis.config import Settings
+from fis.storage.repositories import MasterDataRepository
 from fis.web.app import create_app
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
@@ -203,3 +204,140 @@ def test_output_folder_unknown_batch_returns_404(client: TestClient) -> None:
     )
 
     assert response.status_code == 404
+
+
+def test_cell_save_updates_only_one_shipment(
+    app: FastAPI, client: TestClient, uploaded_batch: str
+) -> None:
+    MasterDataRepository(app.state.database).add_channel("美森正班")
+    response = client.patch(
+        f"/workspace/{uploaded_batch}/shipments/S2",
+        headers=mutation_headers(),
+        json={"field": "channel", "value": "美森正班"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["save_state"] == "saved"
+    assert payload["row"]["fields"]["channel"] == "美森正班"
+    workspace = app.state.batch_service.get(uploaded_batch)
+    assert app.state.batch_service.effective_fields(workspace, "S1")["channel"] is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("channel", "不存在的渠道"), ("delivery_warehouse", "不存在的仓库")),
+)
+def test_cell_save_requires_active_master_choice(
+    client: TestClient, uploaded_batch: str, field: str, value: str
+) -> None:
+    response = client.patch(
+        f"/workspace/{uploaded_batch}/shipments/S1",
+        headers=mutation_headers(),
+        json={"field": field, "value": value},
+    )
+
+    assert response.status_code == 422
+
+
+def test_cell_save_rejects_non_editable_field(
+    client: TestClient, uploaded_batch: str
+) -> None:
+    response = client.patch(
+        f"/workspace/{uploaded_batch}/shipments/S1",
+        headers=mutation_headers(),
+        json={"field": "carton_count", "value": "99"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_bulk_save_updates_every_shipment(
+    app: FastAPI, client: TestClient, uploaded_batch: str
+) -> None:
+    response = client.post(
+        f"/workspace/{uploaded_batch}/bulk",
+        headers=mutation_headers(),
+        json={"field": "delivery_date", "value": "2026-09-17"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["updated"] == 3
+    workspace = app.state.batch_service.get(uploaded_batch)
+    assert all(
+        app.state.batch_service.effective_fields(workspace, shipment_id)["delivery_date"]
+        == date(2026, 9, 17)
+        for shipment_id in workspace.shipment_ids
+    )
+
+
+def test_bulk_save_rejects_warehouse_code(
+    client: TestClient, uploaded_batch: str
+) -> None:
+    response = client.post(
+        f"/workspace/{uploaded_batch}/bulk",
+        headers=mutation_headers(),
+        json={"field": "warehouse_code", "value": "ONT8"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_editor_view_exposes_only_active_master_choices(
+    app: FastAPI, client: TestClient, uploaded_batch: str
+) -> None:
+    masters = MasterDataRepository(app.state.database)
+    active_channel = masters.add_channel("美森正班")
+    inactive_channel = masters.add_channel("停用渠道")
+    masters.set_channel_active(inactive_channel, False)
+    active_warehouse = masters.add_delivery_warehouse("义乌仓", "义乌市")
+    inactive_warehouse = masters.add_delivery_warehouse("停用仓", "宁波市")
+    masters.set_delivery_warehouse_active(inactive_warehouse, False)
+
+    workspace = app.state.batch_service.get(uploaded_batch)
+    view = app.state.batch_service.editor_view(workspace)
+
+    assert view["channel_choices"] == ((active_channel, "美森正班"),)
+    assert view["delivery_warehouse_choices"] == ((active_warehouse, "义乌仓"),)
+
+
+def test_unknown_warehouse_address_can_be_saved_inline(
+    app: FastAPI, client: TestClient, uploaded_batch: str
+) -> None:
+    client.patch(
+        f"/workspace/{uploaded_batch}/shipments/S1",
+        headers=mutation_headers(),
+        json={"field": "warehouse_code", "value": "new1"},
+    )
+
+    response = client.post(
+        f"/workspace/{uploaded_batch}/shipments/S1/warehouse-address",
+        headers=mutation_headers(),
+        json={"address": "123 Example Ave, Ontario, CA"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["row"]["fields"]["warehouse_address"].startswith("123 Example")
+    saved = MasterDataRepository(app.state.database).get_fba_warehouse("NEW1")
+    assert saved is not None
+    assert saved.address == "123 Example Ave, Ontario, CA"
+
+
+def test_inline_address_cannot_overwrite_existing_master(
+    app: FastAPI, client: TestClient, uploaded_batch: str
+) -> None:
+    MasterDataRepository(app.state.database).create_fba_warehouse("ONT8", "Original")
+    client.patch(
+        f"/workspace/{uploaded_batch}/shipments/S1",
+        headers=mutation_headers(),
+        json={"field": "warehouse_code", "value": "ONT8"},
+    )
+
+    response = client.post(
+        f"/workspace/{uploaded_batch}/shipments/S1/warehouse-address",
+        headers=mutation_headers(),
+        json={"address": "Replacement"},
+    )
+
+    assert response.status_code == 422
+    assert MasterDataRepository(app.state.database).get_fba_warehouse("ONT8").address == "Original"

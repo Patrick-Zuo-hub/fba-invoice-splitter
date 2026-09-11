@@ -51,6 +51,19 @@ _TEXT_FIELDS = ("warehouse_code", "warehouse_address", "channel", "delivery_ware
 _DATE_FIELDS = ("delivery_date", "sailing_date")
 _ALL_SUFFIX = "_all"
 _DEFAULT_CHANNEL_KEY = "channel"
+_EDITABLE_FIELDS = frozenset(
+    {
+        "warehouse_code",
+        "warehouse_address",
+        "channel",
+        "delivery_date",
+        "sailing_date",
+        "delivery_warehouse",
+    }
+)
+_BULK_FIELDS = frozenset(
+    {"channel", "delivery_date", "sailing_date", "delivery_warehouse"}
+)
 
 
 class UploadRejected(Exception):
@@ -334,6 +347,8 @@ class BatchService:
         for field_name in _TEXT_FIELDS:
             if field_name in raw:
                 text = "" if raw[field_name] is None else str(raw[field_name]).strip()
+                if field_name == "warehouse_code":
+                    text = text.upper()
                 updates[field_name] = text or None
 
         delivery_changed = False
@@ -479,45 +494,138 @@ class BatchService:
         self, workspace: Workspace, errors: Mapping[str, Mapping[str, str]] | None = None
     ) -> dict[str, object]:
         errors = errors or {}
-        rows: list[dict[str, object]] = []
-        for shipment in workspace.parsed.shipments:
-            fields = self.effective_fields(workspace, shipment.shipment_id)
-            product_names = tuple(
-                dict.fromkeys(
-                    name
-                    for item in shipment.items
-                    if (name := item.cells.get("E", "").strip())
-                )
+        rows = [
+            self._row_view(workspace, shipment.shipment_id, errors.get(shipment.shipment_id))
+            for shipment in workspace.parsed.shipments
+        ]
+        complete_count = sum(1 for row in rows if row["complete"])
+        channel_choices: tuple[tuple[int, str], ...] = ()
+        delivery_warehouse_choices: tuple[tuple[int, str], ...] = ()
+        if self._masters is not None:
+            channel_choices = tuple(
+                (channel.id, channel.name)
+                for channel in self._masters.list_channels(active_only=True)
             )
-            carton_total = Decimal(0)
-            for item in shipment.items:
-                try:
-                    carton_total += Decimal(item.cells.get("K", "0").strip() or "0")
-                except InvalidOperation:
-                    continue
-            rows.append(
-                {
-                    "shipment_id": shipment.shipment_id,
-                    "item_count": len(shipment.items),
-                    "carton_count": (
-                        int(carton_total)
-                        if carton_total == carton_total.to_integral_value()
-                        else str(carton_total.normalize())
-                    ),
-                    "product_names": product_names,
-                    "product_summary": _product_summary(product_names),
-                    "fields": {name: _display(value) for name, value in fields.items()},
-                    "errors": dict(errors.get(shipment.shipment_id, {})),
-                }
+            delivery_warehouse_choices = tuple(
+                (warehouse.id, warehouse.name)
+                for warehouse in self._masters.list_delivery_warehouses(active_only=True)
             )
         return {
             "batch_id": workspace.id,
             "rows": rows,
+            "complete_count": complete_count,
+            "total_count": len(rows),
+            "channel_choices": channel_choices,
+            "delivery_warehouse_choices": delivery_warehouse_choices,
             "common_errors": dict(errors.get("common", {})),
             "output_directory": str(workspace.output_directory)
             if workspace.output_directory is not None
             else None,
         }
+
+    def _row_view(
+        self,
+        workspace: Workspace,
+        shipment_id: str,
+        save_errors: Mapping[str, str] | None = None,
+    ) -> dict[str, object]:
+        shipment = next(
+            item for item in workspace.parsed.shipments if item.shipment_id == shipment_id
+        )
+        fields = self.effective_fields(workspace, shipment_id)
+        _output, completion_errors = self.resolve_output(workspace, shipment_id)
+        product_names = tuple(
+            dict.fromkeys(
+                name
+                for item in shipment.items
+                if (name := item.cells.get("E", "").strip())
+            )
+        )
+        carton_total = Decimal(0)
+        for item in shipment.items:
+            try:
+                carton_total += Decimal(item.cells.get("K", "0").strip() or "0")
+            except InvalidOperation:
+                continue
+        row_errors = dict(completion_errors)
+        row_errors.update(save_errors or {})
+        return {
+            "shipment_id": shipment_id,
+            "item_count": len(shipment.items),
+            "carton_count": (
+                int(carton_total)
+                if carton_total == carton_total.to_integral_value()
+                else str(carton_total.normalize())
+            ),
+            "product_names": product_names,
+            "product_summary": _product_summary(product_names),
+            "fields": {name: _display(value) for name, value in fields.items()},
+            "errors": row_errors,
+            "complete": not completion_errors,
+        }
+
+    def save_shipment_field(
+        self, batch_id: str, shipment_id: str, field_name: str, value: object
+    ) -> tuple[dict[str, object], dict[str, str]]:
+        if field_name not in _EDITABLE_FIELDS or field_name == "warehouse_address":
+            raise ValueError("该字段不支持逐货件编辑")
+        workspace = self.require(batch_id)
+        if shipment_id not in workspace.shipment_ids:
+            raise KeyError(shipment_id)
+        self._validate_master_choice(field_name, value)
+        workspace, errors = self.apply_fields(
+            batch_id, {}, {shipment_id: {field_name: value}}
+        )
+        field_errors = errors.get(shipment_id, {})
+        return self._row_view(workspace, shipment_id, field_errors), field_errors
+
+    def save_bulk_field(
+        self, batch_id: str, field_name: str, value: object
+    ) -> tuple[Workspace, dict[str, dict[str, str]]]:
+        if field_name not in _BULK_FIELDS:
+            raise ValueError("该字段不支持批量设置")
+        workspace = self.require(batch_id)
+        self._validate_master_choice(field_name, value)
+        overrides = {
+            shipment_id: {field_name: value} for shipment_id in workspace.shipment_ids
+        }
+        return self.apply_fields(batch_id, {}, overrides)
+
+    def save_inline_fba_warehouse(
+        self, batch_id: str, shipment_id: str, address: str
+    ) -> dict[str, object]:
+        workspace = self.require(batch_id)
+        if shipment_id not in workspace.shipment_ids:
+            raise KeyError(shipment_id)
+        if self._masters is None:
+            raise ValueError("主数据不可用")
+        code_value = self.effective_fields(workspace, shipment_id)["warehouse_code"]
+        code = str(code_value or "").strip().upper()
+        normalized_address = address.strip()
+        if not code:
+            raise ValueError("请先填写 FBA 仓库代码")
+        if not normalized_address:
+            raise ValueError("FBA 仓库地址不能为空")
+        if self._masters.get_fba_warehouse(code) is not None:
+            raise ValueError("已有仓库地址只能在主数据中修改")
+        self._masters.create_fba_warehouse(code, normalized_address)
+        return self._row_view(workspace, shipment_id)
+
+    def _validate_master_choice(self, field_name: str, value: object) -> None:
+        normalized = "" if value is None else str(value).strip()
+        if not normalized or self._masters is None:
+            return
+        if field_name == "channel":
+            active = {item.name for item in self._masters.list_channels(active_only=True)}
+            if normalized not in active:
+                raise ValueError("请选择主数据中的有效运输渠道")
+        if field_name == "delivery_warehouse":
+            active = {
+                item.name
+                for item in self._masters.list_delivery_warehouses(active_only=True)
+            }
+            if normalized not in active:
+                raise ValueError("请选择主数据中的有效送货仓库")
 
     # -- output folder ----------------------------------------------------
 

@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
@@ -161,6 +162,105 @@ async def generate_batch(request: Request, batch_id: str) -> Response:
             "filenames": result.filenames,
             "output_directory": str(result.output_directory),
         },
+    )
+
+
+@router.patch("/workspace/{batch_id}/shipments/{shipment_id}")
+async def save_shipment_cell(
+    request: Request, batch_id: str, shipment_id: str
+) -> Response:
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 - malformed JSON body is a client error
+        return PlainTextResponse("请求体必须是 JSON", status_code=400)
+    if not isinstance(payload, dict):
+        return PlainTextResponse("请求体必须是 JSON 对象", status_code=400)
+    field_name = str(payload.get("field", ""))
+    try:
+        row, errors = await run_in_threadpool(
+            _service(request).save_shipment_field,
+            batch_id,
+            shipment_id,
+            field_name,
+            payload.get("value"),
+        )
+    except KeyError:
+        return PlainTextResponse("未找到该批次或货件", status_code=404)
+    except ValueError as error:
+        return PlainTextResponse(str(error), status_code=422)
+    view = _service(request).editor_view(_service(request).require(batch_id))
+    body = {
+        "save_state": "failed" if errors else "saved",
+        "row": row,
+        "complete_count": view["complete_count"],
+        "total_count": view["total_count"],
+    }
+    return JSONResponse(body, status_code=422 if errors else 200)
+
+
+@router.post("/workspace/{batch_id}/bulk")
+async def save_bulk_field(request: Request, batch_id: str) -> Response:
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 - malformed JSON body is a client error
+        return PlainTextResponse("请求体必须是 JSON", status_code=400)
+    if not isinstance(payload, dict):
+        return PlainTextResponse("请求体必须是 JSON 对象", status_code=400)
+    service = _service(request)
+    try:
+        workspace, errors = await run_in_threadpool(
+            service.save_bulk_field,
+            batch_id,
+            str(payload.get("field", "")),
+            payload.get("value"),
+        )
+    except KeyError:
+        return PlainTextResponse("未找到该批次", status_code=404)
+    except ValueError as error:
+        return PlainTextResponse(str(error), status_code=422)
+    view = service.editor_view(workspace, errors)
+    return JSONResponse(
+        {
+            "save_state": "failed" if errors else "saved",
+            "updated": workspace.shipment_count,
+            "rows": view["rows"],
+            "complete_count": view["complete_count"],
+            "total_count": view["total_count"],
+        },
+        status_code=422 if errors else 200,
+    )
+
+
+@router.post("/workspace/{batch_id}/shipments/{shipment_id}/warehouse-address")
+async def save_inline_warehouse_address(
+    request: Request, batch_id: str, shipment_id: str
+) -> Response:
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 - malformed JSON body is a client error
+        return PlainTextResponse("请求体必须是 JSON", status_code=400)
+    if not isinstance(payload, dict):
+        return PlainTextResponse("请求体必须是 JSON 对象", status_code=400)
+    service = _service(request)
+    try:
+        row = await run_in_threadpool(
+            service.save_inline_fba_warehouse,
+            batch_id,
+            shipment_id,
+            str(payload.get("address", "")),
+        )
+    except KeyError:
+        return PlainTextResponse("未找到该批次或货件", status_code=404)
+    except ValueError as error:
+        return PlainTextResponse(str(error), status_code=422)
+    view = service.editor_view(service.require(batch_id))
+    return JSONResponse(
+        {
+            "save_state": "saved",
+            "row": row,
+            "complete_count": view["complete_count"],
+            "total_count": view["total_count"],
+        }
     )
 
 
