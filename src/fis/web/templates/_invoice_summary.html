@@ -1,0 +1,28 @@
+<section id="invoice-summary" aria-live="polite">
+  <h2>发票概览</h2>
+  <p>已解析发票「{{ batch.source_filename }}」，共 {{ shipment_count }} 个货件。</p>
+  <table>
+    <caption>货件明细</caption>
+    <thead>
+      <tr>
+        <th scope="col">货件编号</th>
+        <th scope="col">商品行数</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for shipment in shipments %}
+      <tr>
+        <th scope="row">{{ shipment.shipment_id }}</th>
+        <td>{{ shipment.items | length }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <form
+    id="output-folder-form"
+    action="/workspace/{{ batch.id }}/output-folder"
+    method="post"
+  >
+    <button type="submit">选择输出文件夹</button>
+  </form>
+</section>

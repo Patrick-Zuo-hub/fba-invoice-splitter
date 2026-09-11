@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>FBA Invoice Splitter</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+  </head>
+  <body>
+    <main>
+      <h1>FBA Invoice Splitter</h1>
+      <p>请选择清关发票开始处理。</p>
+      <form
+        id="invoice-form"
+        action="/workspace/invoice"
+        method="post"
+        enctype="multipart/form-data"
+      >
+        <label for="invoice">发票文件（.xlsx）</label>
+        <input id="invoice" name="invoice" type="file" accept=".xlsx" required>
+        <button type="submit">上传发票</button>
+      </form>
+      <section id="workspace-result" aria-live="polite"></section>
+    </main>
+  </body>
+</html>
