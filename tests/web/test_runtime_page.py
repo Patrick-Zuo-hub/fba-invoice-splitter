@@ -84,6 +84,13 @@ def test_app_js_is_served_as_javascript(client: TestClient) -> None:
     assert "scrollLeft" in response.text
 
 
+def test_workspace_declares_inline_favicon_to_avoid_browser_404(client: TestClient) -> None:
+    response = client.get("/", headers={"host": HOST})
+
+    assert response.status_code == 200
+    assert 'rel="icon" href="data:image/svg+xml,' in response.text
+
+
 def test_heartbeat_registers_a_live_page(app: FastAPI, client: TestClient) -> None:
     response = client.post(
         "/runtime/heartbeat", headers=mutation_headers(), json={"page_id": "page-1"}

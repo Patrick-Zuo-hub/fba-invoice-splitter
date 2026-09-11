@@ -5,8 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fis.config import Settings
-from fis.storage.repositories import MasterDataRepository
-from fis.storage.repositories import DefaultsRepository
+from fis.storage.repositories import DefaultsRepository, MasterDataRepository
 from fis.web.app import create_app
 from fis.xlsx.errors import WorkbookError
 from tests.fixtures.standard_v1_builder import build_standard_v1
