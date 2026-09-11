@@ -51,6 +51,7 @@ _TEXT_FIELDS = ("warehouse_code", "warehouse_address", "channel", "delivery_ware
 _DATE_FIELDS = ("delivery_date", "sailing_date")
 _ALL_SUFFIX = "_all"
 _DEFAULT_CHANNEL_KEY = "channel"
+_LAST_OUTPUT_DIRECTORY_KEY = "last_successful_output_directory"
 _EDITABLE_FIELDS = frozenset(
     {
         "warehouse_code",
@@ -289,7 +290,10 @@ class BatchService:
                 source_sha256=digest,
                 parsed=parsed,
             )
-            workspace = Workspace(batch=batch)
+            workspace = Workspace(
+                batch=batch,
+                output_directory=self._remembered_output_directory(),
+            )
             self._store.put(workspace)
             return workspace
         except Exception:
@@ -302,6 +306,17 @@ class BatchService:
             self._files.delete_batch(batch_id)
         except OSError:
             pass
+
+    def _remembered_output_directory(self) -> Path | None:
+        if self._defaults is None:
+            return None
+        saved = self._defaults.get(_LAST_OUTPUT_DIRECTORY_KEY)
+        if not saved:
+            return None
+        candidate = Path(saved)
+        if candidate.is_dir() and os.access(candidate, os.W_OK):
+            return candidate
+        return None
 
     # -- edits ------------------------------------------------------------
 
@@ -746,6 +761,10 @@ class BatchService:
             self._defaults.set(f"{_DEFAULT_CHANNEL_KEY}:{output.warehouse_code}", output.channel)
         if workspace.common.delivery_warehouse:
             self._defaults.set("delivery_warehouse", workspace.common.delivery_warehouse)
+        if workspace.output_directory is not None:
+            self._defaults.set(
+                _LAST_OUTPUT_DIRECTORY_KEY, str(workspace.output_directory)
+            )
 
     # -- history ----------------------------------------------------------
 

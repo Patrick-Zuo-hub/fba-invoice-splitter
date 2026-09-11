@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from fis.config import Settings
 from fis.storage.repositories import MasterDataRepository
+from fis.storage.repositories import DefaultsRepository
 from fis.web.app import create_app
 from fis.xlsx.errors import WorkbookError
 from tests.fixtures.standard_v1_builder import build_standard_v1
@@ -71,7 +72,7 @@ def _upload(app: FastAPI, client: TestClient, workbook: bytes) -> str:
         files={"invoice": ("invoice.xlsx", workbook, XLSX_MIME)},
     )
     assert response.status_code == 200
-    return app.state.batch_service.store.active_ids()[0]
+    return app.state.batch_service.store.active_ids()[-1]
 
 
 def _ready_batch(
@@ -193,3 +194,55 @@ def test_generate_unknown_batch_returns_404(client: TestClient) -> None:
     )
 
     assert response.status_code == 404
+
+
+def test_first_upload_has_no_default_output_folder(
+    app: FastAPI, client: TestClient, tmp_path: Path
+) -> None:
+    batch_id = _upload(app, client, _make_workbook(tmp_path / "first.xlsx", 1))
+
+    assert app.state.batch_service.get(batch_id).output_directory is None
+
+
+def test_choosing_folder_without_generation_does_not_remember_it(
+    app: FastAPI, client: TestClient, tmp_path: Path, folder_picker: FakeFolderPicker
+) -> None:
+    first = _upload(app, client, _make_workbook(tmp_path / "first.xlsx", 1))
+    chosen = tmp_path / "chosen"
+    chosen.mkdir()
+    folder_picker.result = chosen
+    assert client.post(
+        f"/workspace/{first}/output-folder", headers=mutation_headers()
+    ).status_code == 200
+
+    second = _upload(app, client, _make_workbook(tmp_path / "second.xlsx", 1))
+
+    assert app.state.batch_service.get(second).output_directory is None
+
+
+def test_successful_generation_remembers_output_folder_for_next_upload(
+    app: FastAPI, client: TestClient, tmp_path: Path, folder_picker: FakeFolderPicker
+) -> None:
+    batch_id, output_dir = _ready_batch(app, client, tmp_path, folder_picker, count=1)
+    assert client.post(
+        f"/workspace/{batch_id}/generate", headers=mutation_headers()
+    ).status_code == 200
+
+    second_source = tmp_path / "second" / "source.xlsx"
+    second_source.parent.mkdir()
+    second = _upload(app, client, _make_workbook(second_source, 1))
+
+    assert app.state.batch_service.get(second).output_directory == output_dir
+
+
+def test_missing_last_successful_output_folder_is_ignored(
+    app: FastAPI, client: TestClient, tmp_path: Path
+) -> None:
+    missing = tmp_path / "missing"
+    DefaultsRepository(app.state.database).set(
+        "last_successful_output_directory", str(missing)
+    )
+
+    batch_id = _upload(app, client, _make_workbook(tmp_path / "source.xlsx", 1))
+
+    assert app.state.batch_service.get(batch_id).output_directory is None
