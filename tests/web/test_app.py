@@ -41,7 +41,7 @@ def test_root_is_directly_available_without_cookie_or_tokens(tmp_path: Path) -> 
     response = _client(tmp_path).get("/", headers={"host": HOST})
 
     assert response.status_code == 200
-    assert "FBA Invoice Splitter" in response.text
+    assert "FBA 发票拆分工具" in response.text
     assert "csrf" not in response.text.lower()
     assert "launch" not in response.text.lower()
     assert "session" not in response.text.lower()

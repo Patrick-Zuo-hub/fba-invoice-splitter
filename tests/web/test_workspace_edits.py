@@ -74,7 +74,12 @@ def _fields(client: TestClient, batch_id: str, payload: dict[str, object]) -> ob
     )
 
 
-def test_common_value_then_shipment_override(client: TestClient, uploaded_batch: str) -> None:
+def test_common_value_then_shipment_override(
+    app: FastAPI, client: TestClient, uploaded_batch: str
+) -> None:
+    masters = MasterDataRepository(app.state.database)
+    masters.add_channel("Ocean")
+    masters.add_channel("Air")
     response = _fields(
         client,
         uploaded_batch,

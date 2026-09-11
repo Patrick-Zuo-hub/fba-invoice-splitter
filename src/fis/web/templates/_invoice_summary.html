@@ -1,42 +1,39 @@
-<section id="invoice-summary" aria-live="polite">
-  <h2>2. 核对货件</h2>
-  <p>已解析发票「{{ batch.source_filename }}」，共 {{ shipment_count }} 个货件。</p>
-  <table>
-    <caption>货件明细</caption>
-    <thead>
-      <tr>
-        <th scope="col">货件编号</th>
-        <th scope="col">商品行数</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for shipment in shipments %}
-      <tr>
-        <th scope="row">{{ shipment.shipment_id }}</th>
-        <td>{{ shipment.items | length }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+<section id="invoice-summary" class="workspace" aria-live="polite">
+  <div class="file-bar">
+    <span class="success-dot" aria-hidden="true"></span>
+    <strong>{{ batch.source_filename }}</strong>
+    <span>已识别 {{ shipment_count }} 个货件，解析完成</span>
+    <button type="button" class="button secondary compact" data-reupload>重新上传</button>
+  </div>
 
-  <h2>3. 完善公共信息</h2>
-  <form data-fis="json" action="/workspace/{{ batch.id }}/fields" method="post">
-    <label>FBA 仓库编码 <input name="warehouse_code_all"></label>
-    <label>FBA 仓库地址 <input name="warehouse_address_all"></label>
-    <label>运输渠道 <input name="channel_all"></label>
-    <label>送仓日期 <input name="delivery_date_all" type="date"></label>
-    <label>开船日期 <input name="sailing_date_all" type="date"></label>
-    <label>送货仓库 <input name="delivery_warehouse_all"></label>
-    <button type="submit">应用到全部货件</button>
-  </form>
+  <details id="mapping-panel" class="mapping-panel" {% if not view.mapping_report or view.mapping_report.unmapped or view.mapping_report.unknown %}open{% endif %}>
+    <summary>
+      <span>
+        {% if view.mapping_report and not view.mapping_report.unmapped and not view.mapping_report.unknown %}
+        货件映射已完成：{{ shipment_count }} / {{ shipment_count }}
+        {% else %}
+        粘贴仓库代码与货件单号
+        {% endif %}
+      </span>
+      <span class="summary-action">{{ "重新编辑映射" if view.mapping_report else "填写映射" }}</span>
+    </summary>
+    <form class="mapping-form" data-fis="json" action="/workspace/{{ batch.id }}/mapping" method="post">
+      <label for="mapping-text">从 Excel 粘贴两列内容：仓库代码在前，货件单号在后</label>
+      <textarea id="mapping-text" name="mapping" rows="5"
+                placeholder="ONT8&#9;FBA19ND7DCY0&#10;IAH3&#9;FBA19ND7GNPK"></textarea>
+      <div class="mapping-actions">
+        <span>支持 Tab 分列、自动清理空格并统一仓库代码大写。</span>
+        <button class="button primary" type="submit">应用映射</button>
+      </div>
+    </form>
+    {% if view.mapping_report %}
+    <div class="mapping-report {% if view.mapping_report.unmapped or view.mapping_report.unknown %}warning{% else %}success{% endif %}" role="status">
+      已应用 {{ view.mapping_report.applied | length }} 个货件。
+      {% if view.mapping_report.unknown %}未识别货件：{{ view.mapping_report.unknown | join("、") }}。{% endif %}
+      {% if view.mapping_report.unmapped %}尚未映射：{{ view.mapping_report.unmapped | join("、") }}。{% endif %}
+    </div>
+    {% endif %}
+  </details>
 
-  <h2>4. 选择输出文件夹</h2>
-  <form id="output-folder-form" data-fis="post" action="/workspace/{{ batch.id }}/output-folder" method="post">
-    <button type="submit">选择输出文件夹</button>
-  </form>
-
-  <h2>5. 生成发票</h2>
-  <form data-fis="post" action="/workspace/{{ batch.id }}/generate" method="post">
-    <button type="submit">生成发票</button>
-  </form>
+  {% include "_shipment_editor.html" %}
 </section>

@@ -49,7 +49,14 @@ async def _read_bounded(upload: UploadFile, limit: int) -> list[bytes]:
     return chunks
 
 
-def _summary_response(request: Request, workspace: Workspace) -> Response:
+def _summary_response(
+    request: Request,
+    workspace: Workspace,
+    mapping_report: dict[str, object] | None = None,
+) -> Response:
+    service = _service(request)
+    view = service.editor_view(workspace)
+    view["mapping_report"] = mapping_report
     return _templates(request).TemplateResponse(
         request=request,
         name="_invoice_summary.html",
@@ -57,6 +64,7 @@ def _summary_response(request: Request, workspace: Workspace) -> Response:
             "batch": workspace,
             "shipment_count": workspace.shipment_count,
             "shipments": workspace.parsed.shipments,
+            "view": view,
         },
     )
 
@@ -280,11 +288,7 @@ async def apply_mapping(request: Request, batch_id: str) -> Response:
         return PlainTextResponse("未找到该批次", status_code=404)
     except ValueError as error:
         return PlainTextResponse(f"映射解析失败：{error}", status_code=422)
-    view = service.editor_view(workspace)
-    view["mapping_report"] = report
-    return _templates(request).TemplateResponse(
-        request=request, name="_shipment_editor.html", context={"view": view}
-    )
+    return _summary_response(request, workspace, report)
 
 
 __all__ = ["router"]

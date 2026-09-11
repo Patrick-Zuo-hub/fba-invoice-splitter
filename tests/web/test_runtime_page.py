@@ -59,9 +59,13 @@ def test_single_page_shell_has_sections_and_script(client: TestClient) -> None:
     assert response.status_code == 200
     assert 'id="workspace-sections"' in response.text
     assert 'id="invoice-form"' in response.text
-    assert "history-panel" in response.text
-    assert "masters-panel" in response.text
+    assert "history-drawer" in response.text
+    assert "masters-drawer" in response.text
     assert "/static/app.js" in response.text
+    assert 'class="app-header"' in response.text
+    assert 'data-drawer-open="history-drawer"' in response.text
+    assert 'data-drawer-open="masters-drawer"' in response.text
+    assert 'id="drawer-backdrop"' in response.text
     assert "csrf" not in response.text.lower()
     assert "launch" not in response.text.lower()
 
@@ -73,6 +77,11 @@ def test_app_js_is_served_as_javascript(client: TestClient) -> None:
     assert "javascript" in response.headers["content-type"]
     assert "X-FIS-Request" in response.text
     assert "/runtime/heartbeat" in response.text
+    assert "data-cell-save" in response.text
+    assert "bulkField" in response.text
+    assert "data-product-toggle" in response.text
+    assert "drawerOpen" in response.text
+    assert "scrollLeft" in response.text
 
 
 def test_heartbeat_registers_a_live_page(app: FastAPI, client: TestClient) -> None:

@@ -56,7 +56,7 @@ def test_index_renders_single_page_upload(client: TestClient) -> None:
     response = client.get("/", headers={"host": HOST})
 
     assert response.status_code == 200
-    assert "FBA Invoice Splitter" in response.text
+    assert "FBA 发票拆分工具" in response.text
     assert 'name="invoice"' in response.text
     assert "csrf" not in response.text.lower()
     assert "launch" not in response.text.lower()
@@ -75,6 +75,29 @@ def test_upload_returns_summary_on_same_page(
     assert "3 个货件" in response.text
     assert "选择输出文件夹" in response.text
     assert "S1" in response.text and "S2" in response.text and "S3" in response.text
+    assert 'class="file-bar"' in response.text
+    assert 'id="mapping-panel"' in response.text
+    assert 'id="shipment-table"' in response.text
+    for heading in (
+        "货件单号",
+        "总箱数",
+        "中文产品品名",
+        "FBA 仓库代码",
+        "仓库完整地址",
+        "运输渠道",
+        "提货日期",
+        "开船日期",
+        "交仓仓库",
+        "完整性",
+    ):
+        assert heading in response.text
+    assert response.text.count('data-bulk-field="') == 4
+    assert 'type="checkbox"' not in response.text
+    assert 'id="save-status"' in response.text
+    assert 'class="action-bar"' in response.text
+    assert 'class="sticky-col sticky-col-1"' in response.text
+    assert 'class="sticky-col sticky-col-2"' in response.text
+    assert 'class="sticky-col sticky-col-3"' in response.text
 
 
 def test_upload_registers_active_workspace_batch(

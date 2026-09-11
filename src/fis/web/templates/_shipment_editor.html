@@ -1,50 +1,117 @@
-<section id="shipment-editor" aria-live="polite">
-  <h2>完善物流信息</h2>
+<section id="shipment-editor" class="shipment-card" aria-live="polite" data-batch-id="{{ view.batch_id }}">
+  <header class="shipment-card-header">
+    <div>
+      <h2>货件信息</h2>
+      <span>共 {{ view.total_count }} 个货件，点击单元格即可编辑</span>
+    </div>
+    <div class="workspace-state">
+      <span id="completion-badge" class="status-badge {% if view.complete_count == view.total_count %}complete{% else %}incomplete{% endif %}"
+            data-complete-count="{{ view.complete_count }}" data-total-count="{{ view.total_count }}">
+        {{ view.complete_count }} / {{ view.total_count }} 完整
+      </span>
+      <span id="save-status" class="save-status" role="status" aria-live="polite">已保存</span>
+    </div>
+  </header>
+
   {% if view.common_errors %}
-  <div role="alert" class="errors">
-    <p>公共字段有误：</p>
-    <ul>
-      {% for field, message in view.common_errors.items() %}
-      <li>{{ message }}</li>
-      {% endfor %}
-    </ul>
+  <div class="error-summary" role="alert">
+    {% for message in view.common_errors.values() %}<span>{{ message }}</span>{% endfor %}
   </div>
   {% endif %}
-  <table>
-    <caption>各货件确认值</caption>
-    <thead>
-      <tr>
-        <th scope="col">货件编号</th>
-        <th scope="col">FBA 仓库编码</th>
-        <th scope="col">FBA 仓库地址</th>
-        <th scope="col">运输渠道</th>
-        <th scope="col">送仓日期</th>
-        <th scope="col">开船日期</th>
-        <th scope="col">送货仓库</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for row in view.rows %}
-      <tr>
-        <th scope="row">{{ row.shipment_id }}</th>
-        <td>{{ row.fields.warehouse_code }}</td>
-        <td>{{ row.fields.warehouse_address }}</td>
-        <td>{{ row.fields.channel }}</td>
-        <td>{{ row.fields.delivery_date }}</td>
-        <td>{{ row.fields.sailing_date }}</td>
-        <td>{{ row.fields.delivery_warehouse }}</td>
-      </tr>
-      {% if row.errors %}
-      <tr>
-        <td colspan="7" role="alert" class="errors">
-          {% for field, message in row.errors.items() %}<span>{{ message }}</span>{% endfor %}
-        </td>
-      </tr>
-      {% endif %}
-      {% endfor %}
-    </tbody>
-  </table>
-  {% if view.output_directory %}
-  <p>当前输出文件夹：{{ view.output_directory }}</p>
-  {% endif %}
+
+  <div class="table-scroll" data-table-scroll>
+    <table id="shipment-table" class="shipment-table">
+      <thead>
+        <tr>
+          <th class="sticky-col sticky-col-1" scope="col">货件单号</th>
+          <th class="sticky-col sticky-col-2" scope="col">总箱数</th>
+          <th class="sticky-col sticky-col-3" scope="col">中文产品品名</th>
+          <th scope="col">FBA 仓库代码</th>
+          <th scope="col">仓库完整地址</th>
+          <th scope="col"><span>运输渠道</span><button type="button" class="batch-link" data-bulk-field="channel">批量</button></th>
+          <th scope="col"><span>提货日期</span><button type="button" class="batch-link" data-bulk-field="delivery_date">批量</button></th>
+          <th scope="col"><span>开船日期</span><button type="button" class="batch-link" data-bulk-field="sailing_date">批量</button></th>
+          <th scope="col"><span>交仓仓库</span><button type="button" class="batch-link" data-bulk-field="delivery_warehouse">批量</button></th>
+          <th scope="col">完整性</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in view.rows %}
+        <tr data-shipment-row="{{ row.shipment_id }}" class="{% if row.errors %}row-incomplete{% else %}row-complete{% endif %}">
+          <th class="sticky-col sticky-col-1 shipment-id" scope="row">{{ row.shipment_id }}</th>
+          <td class="sticky-col sticky-col-2 number">{{ row.carton_count }}</td>
+          <td class="sticky-col sticky-col-3 products">
+            <button type="button" class="product-summary" data-product-toggle aria-expanded="false">{{ row.product_summary or "—" }}</button>
+            <span class="product-all" hidden>{{ row.product_names | join("、") }}</span>
+          </td>
+          <td class="editable-cell {% if row.errors.warehouse_code %}field-incomplete{% endif %}">
+            <input data-cell-save data-field="warehouse_code" aria-label="{{ row.shipment_id }} FBA 仓库代码"
+                   value="{{ row.fields.warehouse_code }}" placeholder="填写代码">
+          </td>
+          <td class="address-cell {% if row.errors.warehouse_address %}field-incomplete{% endif %}">
+            {% if row.fields.warehouse_address %}
+            <span>{{ row.fields.warehouse_address }}</span>
+            {% else %}
+            <div class="inline-address">
+              <input data-inline-address aria-label="{{ row.shipment_id }} 仓库完整地址" placeholder="填写完整地址">
+              <button type="button" class="text-button" data-save-address>保存到主数据</button>
+            </div>
+            {% endif %}
+          </td>
+          <td class="editable-cell {% if row.errors.channel %}field-incomplete{% endif %}">
+            <select data-cell-save data-field="channel" aria-label="{{ row.shipment_id }} 运输渠道">
+              <option value="">请选择</option>
+              {% for id, name in view.channel_choices %}<option value="{{ name }}" {% if row.fields.channel == name %}selected{% endif %}>{{ name }}</option>{% endfor %}
+            </select>
+          </td>
+          <td class="editable-cell {% if row.errors.delivery_date %}field-incomplete{% endif %}">
+            <input type="date" data-cell-save data-field="delivery_date" aria-label="{{ row.shipment_id }} 提货日期" value="{{ row.fields.delivery_date }}">
+          </td>
+          <td class="editable-cell {% if row.errors.sailing_date %}field-incomplete{% endif %}">
+            <input type="date" data-cell-save data-field="sailing_date" aria-label="{{ row.shipment_id }} 开船日期" value="{{ row.fields.sailing_date }}">
+          </td>
+          <td class="editable-cell {% if row.errors.delivery_warehouse %}field-incomplete{% endif %}">
+            <select data-cell-save data-field="delivery_warehouse" aria-label="{{ row.shipment_id }} 交仓仓库">
+              <option value="">请选择</option>
+              {% for id, name in view.delivery_warehouse_choices %}<option value="{{ name }}" {% if row.fields.delivery_warehouse == name %}selected{% endif %}>{{ name }}</option>{% endfor %}
+            </select>
+          </td>
+          <td class="completeness"><span class="row-status {% if row.complete %}complete{% else %}incomplete{% endif %}">{{ "完整" if row.complete else "待补充" }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div id="bulk-popover" class="bulk-popover" hidden>
+    <strong data-bulk-title>批量设置</strong>
+    <span>将应用到全部 {{ view.total_count }} 个货件</span>
+    <label data-bulk-label for="bulk-value">字段</label>
+    <div data-bulk-control></div>
+    <div class="popover-actions">
+      <button type="button" class="text-button" data-bulk-clear>清空</button>
+      <button type="button" class="button secondary compact" data-bulk-cancel>取消</button>
+      <button type="button" class="button primary compact" data-bulk-confirm>确认</button>
+    </div>
+  </div>
+
+  <div class="action-bar" data-batch-id="{{ view.batch_id }}">
+    <div><span>货件完整度</span><strong data-completion-text>{{ view.complete_count }} / {{ view.total_count }}</strong></div>
+    <div id="output-folder" class="output-folder" data-folder-selected="{{ 'true' if view.output_directory else 'false' }}">
+      <span>输出文件夹</span>
+      <strong>{% if view.output_directory %}{{ view.output_directory }}{% else %}首次使用，请选择保存位置{% endif %}</strong>
+    </div>
+    <form data-fis="post" action="/workspace/{{ view.batch_id }}/output-folder" method="post">
+      <button class="button secondary" type="submit">{{ "更改文件夹" if view.output_directory else "选择输出文件夹" }}</button>
+    </form>
+    <p id="workspace-status" class="action-message" role="alert" aria-live="polite"></p>
+    <div id="generation-action">
+      <form data-fis="post" action="/workspace/{{ view.batch_id }}/generate" method="post">
+        <button class="button primary generate" type="submit"
+                {% if view.complete_count != view.total_count or not view.output_directory %}disabled{% endif %}>
+          生成 {{ view.total_count }} 份发票
+        </button>
+      </form>
+    </div>
+  </div>
 </section>
