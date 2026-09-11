@@ -15,6 +15,7 @@ import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -481,10 +482,30 @@ class BatchService:
         rows: list[dict[str, object]] = []
         for shipment in workspace.parsed.shipments:
             fields = self.effective_fields(workspace, shipment.shipment_id)
+            product_names = tuple(
+                dict.fromkeys(
+                    name
+                    for item in shipment.items
+                    if (name := item.cells.get("E", "").strip())
+                )
+            )
+            carton_total = Decimal(0)
+            for item in shipment.items:
+                try:
+                    carton_total += Decimal(item.cells.get("K", "0").strip() or "0")
+                except InvalidOperation:
+                    continue
             rows.append(
                 {
                     "shipment_id": shipment.shipment_id,
                     "item_count": len(shipment.items),
+                    "carton_count": (
+                        int(carton_total)
+                        if carton_total == carton_total.to_integral_value()
+                        else str(carton_total.normalize())
+                    ),
+                    "product_names": product_names,
+                    "product_summary": _product_summary(product_names),
                     "fields": {name: _display(value) for name, value in fields.items()},
                     "errors": dict(errors.get(shipment.shipment_id, {})),
                 }
@@ -633,6 +654,12 @@ class BatchService:
             raise KeyError(batch_id)
         self._opener.open(Path(directory))
 
+
+
+def _product_summary(names: tuple[str, ...]) -> str:
+    if len(names) <= 2:
+        return "、".join(names)
+    return f"{names[0]}、{names[1]}，等 {len(names)} 种产品"
 
 
 def _display(value: object) -> str:

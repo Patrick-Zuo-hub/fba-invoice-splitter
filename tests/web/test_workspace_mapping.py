@@ -68,7 +68,7 @@ def test_paste_mapping_assigns_codes(app: FastAPI, client: TestClient, tmp_path:
     batch_id = _upload(app, client, tmp_path)
     response = client.post(
         f"/workspace/{batch_id}/mapping", headers=mut(),
-        json={"mapping": "S1\tONT8\nS2\tIAH3"},
+        json={"mapping": "ONT8\tS1\nIAH3\tS2"},
     )
     assert response.status_code == 200
     assert "ONT8" in response.text and "IAH3" in response.text
@@ -84,7 +84,7 @@ def test_address_auto_derived_and_generation_succeeds(
     masters.create_fba_warehouse("ONT8", "2245 Cactus Ave, Ontario, CA 91761")
     masters.create_fba_warehouse("IAH3", "10384 W Airport Blvd, Houston, TX 77048")
     batch_id = _upload(app, client, tmp_path)
-    client.post(f"/workspace/{batch_id}/mapping", headers=mut(), json={"mapping": "S1\tONT8\nS2\tIAH3"})
+    client.post(f"/workspace/{batch_id}/mapping", headers=mut(), json={"mapping": "ONT8\tS1\nIAH3\tS2"})
     client.post(f"/workspace/{batch_id}/fields", headers=mut(), json=COMMON)
     workspace = _service(app).get(batch_id)
     assert "Ontario" in str(_service(app).effective_fields(workspace, "S1")["warehouse_address"])
@@ -105,7 +105,7 @@ def test_code_without_master_address_blocks_generation(
     MasterDataRepository(app.state.database).create_fba_warehouse("ONT8", "Ontario, CA")
     batch_id = _upload(app, client, tmp_path)
     # S2 mapped to a code that is NOT in Master Data.
-    client.post(f"/workspace/{batch_id}/mapping", headers=mut(), json={"mapping": "S1\tONT8\nS2\tZZZ9"})
+    client.post(f"/workspace/{batch_id}/mapping", headers=mut(), json={"mapping": "ONT8\tS1\nZZZ9\tS2"})
     client.post(f"/workspace/{batch_id}/fields", headers=mut(), json=COMMON)
     output_dir = tmp_path / "out"
     output_dir.mkdir()
@@ -123,7 +123,7 @@ def test_unmapped_shipment_blocks_generation(
 ) -> None:
     MasterDataRepository(app.state.database).create_fba_warehouse("ONT8", "Ontario, CA")
     batch_id = _upload(app, client, tmp_path)
-    client.post(f"/workspace/{batch_id}/mapping", headers=mut(), json={"mapping": "S1\tONT8"})
+    client.post(f"/workspace/{batch_id}/mapping", headers=mut(), json={"mapping": "ONT8\tS1"})
     client.post(f"/workspace/{batch_id}/fields", headers=mut(), json=COMMON)
     output_dir = tmp_path / "out"
     output_dir.mkdir()
@@ -139,7 +139,7 @@ def test_unknown_shipment_in_paste_is_reported(
     app: FastAPI, client: TestClient, tmp_path: Path
 ) -> None:
     batch_id = _upload(app, client, tmp_path)
-    _workspace, report = _service(app).apply_mapping(batch_id, "S1\tONT8\nS9\tIAH3")
+    _workspace, report = _service(app).apply_mapping(batch_id, "ONT8\tS1\nIAH3\tS9")
     assert report["applied"] == {"S1": "ONT8"}
     assert report["unknown"] == ["S9"]
     assert "S2" in report["unmapped"]
@@ -148,7 +148,7 @@ def test_unknown_shipment_in_paste_is_reported(
 def test_malformed_mapping_returns_422(app: FastAPI, client: TestClient, tmp_path: Path) -> None:
     batch_id = _upload(app, client, tmp_path)
     response = client.post(
-        f"/workspace/{batch_id}/mapping", headers=mut(), json={"mapping": "S1\tONT8\tEXTRA"}
+        f"/workspace/{batch_id}/mapping", headers=mut(), json={"mapping": "ONT8\tS1\tEXTRA"}
     )
     assert response.status_code == 422
 
@@ -157,7 +157,7 @@ def test_per_shipment_channel_override(
     app: FastAPI, client: TestClient, tmp_path: Path
 ) -> None:
     batch_id = _upload(app, client, tmp_path)
-    client.post(f"/workspace/{batch_id}/mapping", headers=mut(), json={"mapping": "S1\tONT8\nS2\tIAH3"})
+    client.post(f"/workspace/{batch_id}/mapping", headers=mut(), json={"mapping": "ONT8\tS1\nIAH3\tS2"})
     client.post(
         f"/workspace/{batch_id}/fields", headers=mut(),
         json={"channel_all": "海运", "shipments": {"S2": {"channel": "空运"}}},
@@ -173,7 +173,7 @@ def test_channel_is_remembered_per_warehouse_code(
     MasterDataRepository(app.state.database).create_fba_warehouse("ONT8", "Ontario, CA")
     # First batch: generate S1 -> ONT8 with channel 海运.
     b1 = _upload(app, client, tmp_path, count=1)
-    client.post(f"/workspace/{b1}/mapping", headers=mut(), json={"mapping": "S1\tONT8"})
+    client.post(f"/workspace/{b1}/mapping", headers=mut(), json={"mapping": "ONT8\tS1"})
     client.post(f"/workspace/{b1}/fields", headers=mut(), json=COMMON)
     out1 = tmp_path / "out1"
     out1.mkdir()
@@ -183,6 +183,6 @@ def test_channel_is_remembered_per_warehouse_code(
 
     # Second batch: ONT8 should pre-fill channel 海运 without re-entering it.
     b2 = _upload(app, client, (tmp_path / "b2"), count=1)
-    client.post(f"/workspace/{b2}/mapping", headers=mut(), json={"mapping": "S1\tONT8"})
+    client.post(f"/workspace/{b2}/mapping", headers=mut(), json={"mapping": "ONT8\tS1"})
     workspace = _service(app).get(b2)
     assert _service(app).effective_fields(workspace, "S1")["channel"] == "海运"

@@ -19,14 +19,16 @@ def parse_warehouse_mapping(text: str) -> dict[str, str]:
             and len(columns) == 2
             and all(columns)
             and columns[0].lower().replace(" ", "")
-            in {"shipmentid", "货件编号"}
+            in {"warehouse", "warehousecode", "仓库", "仓库代码"}
+            and columns[1].lower().replace(" ", "")
+            in {"shipment", "shipmentid", "货件编号", "货件单号"}
         )
         first_nonblank_row = False
         if is_header:
             continue
         if len(columns) != 2 or not all(columns):
             raise ValueError(f"Invalid mapping row {line_number}")
-        shipment_id, code = columns[0], columns[1].upper()
+        code, shipment_id = columns[0].upper(), columns[1]
         if shipment_id in result and result[shipment_id] != code:
             raise ValueError(f"Conflicting warehouse mapping for {shipment_id}")
         result[shipment_id] = code

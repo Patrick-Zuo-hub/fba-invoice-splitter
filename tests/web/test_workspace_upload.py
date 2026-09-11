@@ -5,7 +5,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fis.config import Settings
+from fis.services.batches import BatchService, Workspace, WorkspaceBatch, WorkspaceStore
+from fis.storage.batch_files import BatchFiles
 from fis.web.app import create_app
+from fis.xlsx.parser import ParsedBundle, ParsedItem, ParsedShipment
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
 PORT = 8765
@@ -181,3 +184,31 @@ def test_retry_after_failure_succeeds(
     )
     assert success.status_code == 200
     assert "3 个货件" in success.text
+
+
+def test_editor_view_summarizes_cartons_and_unique_chinese_product_names(
+    tmp_path: Path,
+) -> None:
+    shipment = ParsedShipment(
+        "S1",
+        (
+            ParsedItem("S1", 12, {"E": "收纳箱", "K": "1"}),
+            ParsedItem("S1", 13, {"E": "置物架", "K": "2"}),
+            ParsedItem("S1", 14, {"E": "收纳箱", "K": "0"}),
+            ParsedItem("S1", 15, {"E": "鞋盒", "K": "0"}),
+        ),
+    )
+    batch = WorkspaceBatch(
+        id="batch-1",
+        source_path=tmp_path / "source.xlsx",
+        source_filename="invoice.xlsx",
+        source_sha256="abc",
+        parsed=ParsedBundle((shipment,), (12, 13, 14, 15), 16, 17),
+    )
+    service = BatchService(BatchFiles(tmp_path / "data"), WorkspaceStore())
+
+    row = service.editor_view(Workspace(batch=batch))["rows"][0]
+
+    assert row["carton_count"] == 3
+    assert row["product_names"] == ("收纳箱", "置物架", "鞋盒")
+    assert row["product_summary"] == "收纳箱、置物架，等 3 种产品"
