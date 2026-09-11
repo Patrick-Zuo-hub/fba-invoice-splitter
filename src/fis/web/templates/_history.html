@@ -1,0 +1,29 @@
+<section id="history" aria-live="polite">
+  <h2>历史记录</h2>
+  {% if not entries %}
+  <p>暂无历史记录。</p>
+  {% endif %}
+  <ul>
+    {% for entry in entries %}
+    <li>
+      <span class="filename">{{ entry.source_filename }}</span>
+      <span class="state">{{ entry.state.value }}</span>
+      {% if entry.completed_at %}<time>{{ entry.completed_at }}</time>{% endif %}
+      {% if entry.error_code %}<span class="error">{{ entry.error_code }}</span>{% endif %}
+      {% if entry.output_directory %}<span class="folder">{{ entry.output_directory }}</span>{% endif %}
+      {% if entry.shipments %}
+      <ul>
+        {% for shipment in entry.shipments %}
+        <li>{{ shipment.shipment_id }} → {{ shipment.output_path }}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+      {% if entry.output_directory %}
+      <form action="/history/{{ entry.id }}/open-folder" method="post">
+        <button type="submit">打开文件夹</button>
+      </form>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>

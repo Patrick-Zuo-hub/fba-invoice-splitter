@@ -118,10 +118,41 @@ class NativeFolderPicker:
         raise PlatformError("当前系统不支持文件夹选择窗口")
 
 
+class FolderOpener(Protocol):
+    def open(self, folder: Path) -> None:
+        """Reveal an existing local directory in the system file browser."""
+        raise NotImplementedError
+
+
+def open_with_system(folder: Path) -> None:
+    if not folder.is_dir():
+        raise PlatformError("文件已移动或删除")
+    if sys.platform == "darwin":
+        executable = ["/usr/bin/open", str(folder)]
+    elif os.name == "nt":
+        explorer = os.path.join(os.environ.get("SystemRoot", r"C:\\Windows"), "explorer.exe")
+        executable = [explorer, str(folder)]
+    else:
+        raise PlatformError("当前系统不支持打开文件夹")
+    completed = subprocess.run(  # noqa: S603 - fixed executable, path passed as argv
+        executable, capture_output=True, text=True, check=False
+    )
+    if completed.returncode not in (0, 1):
+        raise PlatformError("无法打开文件夹")
+
+
+class NativeFolderOpener:
+    def open(self, folder: Path) -> None:
+        open_with_system(folder)
+
+
 __all__ = [
+    "FolderOpener",
     "FolderPicker",
+    "NativeFolderOpener",
     "NativeFolderPicker",
     "PlatformError",
     "choose_with_osascript",
     "choose_with_powershell",
+    "open_with_system",
 ]

@@ -9,20 +9,37 @@ while a page is open.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
 from fis.domain.rules import default_dates
-from fis.platform.folders import FolderPicker, NativeFolderPicker, PlatformError
+from fis.platform.folders import (
+    FolderOpener,
+    FolderPicker,
+    NativeFolderOpener,
+    NativeFolderPicker,
+    PlatformError,
+)
 from fis.storage.batch_files import BatchFiles
 from fis.storage.database import Database
-from fis.storage.repositories import DefaultsRepository, MasterDataRepository
-from fis.xlsx.generator import ShipmentOutput
+from fis.storage.repositories import (
+    BatchRepository,
+    DefaultsRepository,
+    HistoryEntry,
+    MasterDataRepository,
+)
+from fis.xlsx.errors import WorkbookError
+from fis.xlsx.generator import (
+    ShipmentOutput,
+    generate_shipment_workbooks,
+    safe_filename,
+)
 from fis.xlsx.parser import ParsedBundle, parse_invoice_bundle
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -180,6 +197,27 @@ FIELD_LABELS = {
 }
 
 
+GenerateEngine = Callable[[str, tuple[ShipmentOutput, ...], Path], tuple[Path, ...]]
+
+
+class GenerationError(Exception):
+    """Generation was blocked or failed; carries a user-facing message."""
+
+    status_code = 422
+
+    def __init__(self, message: str, *, field_errors: Mapping[str, Mapping[str, str]] | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.field_errors = field_errors or {}
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationResult:
+    batch_id: str
+    output_directory: Path
+    filenames: tuple[str, ...]
+
+
 class BatchService:
     """Coordinate safe upload, parse, edits, defaults, and folder selection."""
 
@@ -190,14 +228,21 @@ class BatchService:
         *,
         database: Database | None = None,
         folder_picker: FolderPicker | None = None,
+        folder_opener: FolderOpener | None = None,
+        engine: GenerateEngine | None = None,
         today: Callable[[], date] | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._files = files
         self._store = store
         self._defaults = DefaultsRepository(database) if database is not None else None
         self._masters = MasterDataRepository(database) if database is not None else None
+        self._batches = BatchRepository(database) if database is not None else None
         self._picker: FolderPicker = folder_picker or NativeFolderPicker()
+        self._opener: FolderOpener = folder_opener or NativeFolderOpener()
+        self._engine: GenerateEngine = engine or generate_shipment_workbooks
         self._today = today or date.today
+        self._now = now or (lambda: datetime.now(UTC))
 
     @property
     def store(self) -> WorkspaceStore:
@@ -427,6 +472,126 @@ class BatchService:
         return workspace, True
 
 
+    # -- generation -------------------------------------------------------
+
+    def generate(self, batch_id: str) -> GenerationResult:
+        workspace = self.require(batch_id)
+        destination = workspace.output_directory
+        if destination is None:
+            raise GenerationError("请先选择输出文件夹")
+        if not destination.is_dir() or not os.access(destination, os.W_OK):
+            raise GenerationError("输出文件夹不存在或不可写入")
+
+        outputs, field_errors = self.resolve_all(workspace)
+        if field_errors:
+            raise GenerationError(_summarize_field_errors(field_errors), field_errors=field_errors)
+        if not outputs:
+            raise GenerationError("没有可生成的货件")
+
+        try:
+            names = [safe_filename(output) for output in outputs]
+        except WorkbookError as error:
+            raise GenerationError(str(error) or "无法生成安全文件名") from error
+        if len({name.casefold() for name in names}) != len(names):
+            raise GenerationError("多个货件会生成相同的文件名")
+        clashes = [name for name in names if (destination / name).exists()]
+        if clashes:
+            raise GenerationError("输出文件夹中已存在同名文件：" + "、".join(clashes))
+
+        now = self._now()
+        try:
+            paths = self._engine(str(workspace.source_path), tuple(outputs), destination)
+        except WorkbookError as error:
+            self._record_failed(workspace, error.code, str(error), now)
+            raise GenerationError(str(error) or "生成失败") from error
+        except Exception as error:
+            self._record_failed(workspace, "INTERNAL", None, now)
+            raise GenerationError("生成过程中发生内部错误") from error
+
+        self._record_completed(workspace, outputs, paths, now)
+        self._store_defaults(workspace)
+        return GenerationResult(batch_id, destination, tuple(path.name for path in paths))
+
+    def _snapshot_json(self, output: ShipmentOutput) -> str:
+        return json.dumps(
+            {
+                "shipment_id": output.shipment_id,
+                "warehouse_code": output.warehouse_code,
+                "warehouse_address": output.warehouse_address,
+                "channel": output.channel,
+                "delivery_date": output.delivery_date.isoformat(),
+                "sailing_date": output.sailing_date.isoformat(),
+                "delivery_warehouse": output.delivery_warehouse,
+            },
+            ensure_ascii=False,
+        )
+
+    def _record_completed(
+        self,
+        workspace: Workspace,
+        outputs: tuple[ShipmentOutput, ...],
+        paths: tuple[Path, ...],
+        now: datetime,
+    ) -> None:
+        if self._batches is None:
+            return
+        shipments = [
+            (output.shipment_id, self._snapshot_json(output), str(path))
+            for output, path in zip(outputs, paths, strict=True)
+        ]
+        item_count = sum(len(shipment.items) for shipment in workspace.parsed.shipments)
+        self._batches.record_completed(
+            batch_id=workspace.id,
+            filename=workspace.source_filename,
+            sha256=workspace.batch.source_sha256,
+            source_path=str(workspace.source_path),
+            shipment_count=len(outputs),
+            item_count=item_count,
+            shipments=shipments,
+            now=now,
+        )
+
+    def _record_failed(
+        self, workspace: Workspace, error_code: str, error_detail: str | None, now: datetime
+    ) -> None:
+        if self._batches is None:
+            return
+        self._batches.record_failed(
+            batch_id=workspace.id,
+            filename=workspace.source_filename,
+            sha256=workspace.batch.source_sha256,
+            source_path=str(workspace.source_path),
+            shipment_count=workspace.shipment_count,
+            error_code=error_code,
+            error_detail=error_detail,
+            now=now,
+        )
+
+    def _store_defaults(self, workspace: Workspace) -> None:
+        if self._defaults is None:
+            return
+        if workspace.common.channel:
+            self._defaults.set("channel", workspace.common.channel)
+        if workspace.common.delivery_warehouse:
+            self._defaults.set("delivery_warehouse", workspace.common.delivery_warehouse)
+
+    # -- history ----------------------------------------------------------
+
+    def history_entries(self) -> list[HistoryEntry]:
+        if self._batches is None:
+            return []
+        return self._batches.list_history_entries()
+
+    def open_history_folder(self, batch_id: str) -> None:
+        if self._batches is None:
+            raise KeyError(batch_id)
+        directory = self._batches.output_directory(batch_id)
+        if directory is None:
+            raise KeyError(batch_id)
+        self._opener.open(Path(directory))
+
+
+
 def _display(value: object) -> str:
     if value is None:
         return ""
@@ -435,9 +600,19 @@ def _display(value: object) -> str:
     return str(value)
 
 
+def _summarize_field_errors(errors: Mapping[str, Mapping[str, str]]) -> str:
+    parts: list[str] = []
+    for shipment_id, fields in errors.items():
+        labels = "、".join(fields.values())
+        parts.append(f"{shipment_id}：{labels}")
+    return "以下货件信息不完整 —— " + "；".join(parts)
+
+
 __all__ = [
     "BatchService",
     "FIELD_LABELS",
+    "GenerationError",
+    "GenerationResult",
     "MAX_UPLOAD_BYTES",
     "ShipmentEdit",
     "UploadRejected",

@@ -13,7 +13,7 @@ from starlette.responses import Response
 
 from fis.platform.folders import PlatformError
 from fis.services import batches
-from fis.services.batches import BatchService, UploadRejected, Workspace
+from fis.services.batches import BatchService, GenerationError, UploadRejected, Workspace
 from fis.xlsx.errors import WorkbookError
 
 router = APIRouter()
@@ -136,6 +136,27 @@ async def choose_output_folder(request: Request, batch_id: str) -> Response:
         request=request,
         name="_output_folder.html",
         context={"folder": str(workspace.output_directory)},
+    )
+
+
+@router.post("/workspace/{batch_id}/generate")
+async def generate_batch(request: Request, batch_id: str) -> Response:
+    service = _service(request)
+    try:
+        result = await run_in_threadpool(service.generate, batch_id)
+    except KeyError:
+        return PlainTextResponse("未找到该批次", status_code=404)
+    except GenerationError as error:
+        return PlainTextResponse(error.message, status_code=error.status_code)
+    return _templates(request).TemplateResponse(
+        request=request,
+        name="_generation_result.html",
+        context={
+            "result": result,
+            "count": len(result.filenames),
+            "filenames": result.filenames,
+            "output_directory": str(result.output_directory),
+        },
     )
 
 

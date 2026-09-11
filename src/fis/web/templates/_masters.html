@@ -1,0 +1,41 @@
+<section id="masters" aria-live="polite">
+  <h2>主数据</h2>
+
+  <h3>运输渠道</h3>
+  <ul class="channels">
+    {% for channel in view.channels %}
+    <li data-id="{{ channel.id }}">
+      <span class="name">{{ channel.name }}</span>
+      <span class="status">{{ "启用" if channel.active else "停用" }}</span>
+    </li>
+    {% else %}
+    <li class="empty">暂无渠道</li>
+    {% endfor %}
+  </ul>
+
+  <h3>送货仓库</h3>
+  <ul class="delivery-warehouses">
+    {% for warehouse in view.delivery_warehouses %}
+    <li data-id="{{ warehouse.id }}">
+      <span class="name">{{ warehouse.name }}</span>
+      <span class="address">{{ warehouse.address }}</span>
+      <span class="status">{{ "启用" if warehouse.active else "停用" }}</span>
+    </li>
+    {% else %}
+    <li class="empty">暂无送货仓库</li>
+    {% endfor %}
+  </ul>
+
+  <h3>FBA 仓库</h3>
+  <ul class="fba-warehouses">
+    {% for warehouse in view.fba_warehouses %}
+    <li data-code="{{ warehouse.code }}">
+      <span class="code">{{ warehouse.code }}</span>
+      <span class="address">{{ warehouse.address }}</span>
+      <span class="status">{{ "启用" if warehouse.active else "停用" }}</span>
+    </li>
+    {% else %}
+    <li class="empty">暂无 FBA 仓库</li>
+    {% endfor %}
+  </ul>
+</section>

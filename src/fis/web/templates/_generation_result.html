@@ -1,0 +1,13 @@
+<section id="generation-result" aria-live="polite">
+  <h2>生成结果</h2>
+  <p>已成功生成 {{ count }} 份发票。</p>
+  <p>输出文件夹：<span class="path">{{ output_directory }}</span></p>
+  <ul>
+    {% for name in filenames %}
+    <li>{{ name }}</li>
+    {% endfor %}
+  </ul>
+  <form action="/history/{{ result.batch_id }}/open-folder" method="post">
+    <button type="submit">打开文件夹</button>
+  </form>
+</section>
