@@ -73,7 +73,7 @@ def choose_with_osascript(initial: Path | None) -> Path | None:
     arguments = [_OSASCRIPT, "-e", _MAC_SCRIPT]
     if initial is not None:
         arguments.append(str(initial))
-    completed = subprocess.run(  # noqa: S603 - fixed executable, path passed as argv
+    completed = subprocess.run(
         arguments, capture_output=True, text=True, check=False
     )
     if completed.returncode != 0:
@@ -99,7 +99,7 @@ def choose_with_powershell(initial: Path | None) -> Path | None:
     ]
     if initial is not None:
         arguments.append(str(initial))
-    completed = subprocess.run(  # noqa: S603 - fixed script, path passed as argv
+    completed = subprocess.run(
         arguments, capture_output=True, text=True, check=False
     )
     if completed.returncode != 0:
@@ -134,7 +134,7 @@ def open_with_system(folder: Path) -> None:
         executable = [explorer, str(folder)]
     else:
         raise PlatformError("当前系统不支持打开文件夹")
-    completed = subprocess.run(  # noqa: S603 - fixed executable, path passed as argv
+    completed = subprocess.run(
         executable, capture_output=True, text=True, check=False
     )
     if completed.returncode not in (0, 1):

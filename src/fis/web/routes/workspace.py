@@ -142,12 +142,16 @@ async def choose_output_folder(request: Request, batch_id: str) -> Response:
 @router.post("/workspace/{batch_id}/generate")
 async def generate_batch(request: Request, batch_id: str) -> Response:
     service = _service(request)
+    lifecycle = request.app.state.lifecycle
+    lifecycle.begin_job()
     try:
         result = await run_in_threadpool(service.generate, batch_id)
     except KeyError:
         return PlainTextResponse("未找到该批次", status_code=404)
     except GenerationError as error:
         return PlainTextResponse(error.message, status_code=error.status_code)
+    finally:
+        lifecycle.end_job()
     return _templates(request).TemplateResponse(
         request=request,
         name="_generation_result.html",

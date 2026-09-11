@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from fis.domain.rules import default_dates
@@ -328,7 +329,7 @@ class BatchService:
         manual: dict[str | None, bool],
         errors: dict[str, str],
     ) -> ShipmentEdit:
-        updates: dict[str, str | date | None] = {}
+        updates: dict[str, Any] = {}
         for field_name in _TEXT_FIELDS:
             if field_name in raw:
                 text = "" if raw[field_name] is None else str(raw[field_name]).strip()
@@ -374,7 +375,7 @@ class BatchService:
         common = workspace.common
         override = workspace.overrides.get(shipment_id)
 
-        def pick(name: str) -> object:
+        def pick(name: str) -> Any:
             if override is not None:
                 value = getattr(override, name)
                 if value is not None:
@@ -609,11 +610,11 @@ def _summarize_field_errors(errors: Mapping[str, Mapping[str, str]]) -> str:
 
 
 __all__ = [
-    "BatchService",
     "FIELD_LABELS",
+    "MAX_UPLOAD_BYTES",
+    "BatchService",
     "GenerationError",
     "GenerationResult",
-    "MAX_UPLOAD_BYTES",
     "ShipmentEdit",
     "UploadRejected",
     "Workspace",

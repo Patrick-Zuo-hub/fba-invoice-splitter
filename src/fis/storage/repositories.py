@@ -330,7 +330,7 @@ class BatchRepository:
             connection.close()
         if row is None or not row["output_path"]:
             return None
-        return os.path.dirname(row["output_path"])
+        return os.path.dirname(str(row["output_path"]))
 
 
 

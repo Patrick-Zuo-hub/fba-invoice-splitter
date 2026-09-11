@@ -1,5 +1,5 @@
 <section id="invoice-summary" aria-live="polite">
-  <h2>发票概览</h2>
+  <h2>2. 核对货件</h2>
   <p>已解析发票「{{ batch.source_filename }}」，共 {{ shipment_count }} 个货件。</p>
   <table>
     <caption>货件明细</caption>
@@ -18,11 +18,25 @@
       {% endfor %}
     </tbody>
   </table>
-  <form
-    id="output-folder-form"
-    action="/workspace/{{ batch.id }}/output-folder"
-    method="post"
-  >
+
+  <h2>3. 完善公共信息</h2>
+  <form data-fis="json" action="/workspace/{{ batch.id }}/fields" method="post">
+    <label>FBA 仓库编码 <input name="warehouse_code_all"></label>
+    <label>FBA 仓库地址 <input name="warehouse_address_all"></label>
+    <label>运输渠道 <input name="channel_all"></label>
+    <label>送仓日期 <input name="delivery_date_all" type="date"></label>
+    <label>开船日期 <input name="sailing_date_all" type="date"></label>
+    <label>送货仓库 <input name="delivery_warehouse_all"></label>
+    <button type="submit">应用到全部货件</button>
+  </form>
+
+  <h2>4. 选择输出文件夹</h2>
+  <form id="output-folder-form" data-fis="post" action="/workspace/{{ batch.id }}/output-folder" method="post">
     <button type="submit">选择输出文件夹</button>
+  </form>
+
+  <h2>5. 生成发票</h2>
+  <form data-fis="post" action="/workspace/{{ batch.id }}/generate" method="post">
+    <button type="submit">生成发票</button>
   </form>
 </section>

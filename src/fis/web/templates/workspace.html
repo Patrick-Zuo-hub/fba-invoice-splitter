@@ -9,18 +9,41 @@
   <body>
     <main>
       <h1>FBA Invoice Splitter</h1>
-      <p>请选择清关发票开始处理。</p>
-      <form
-        id="invoice-form"
-        action="/workspace/invoice"
-        method="post"
-        enctype="multipart/form-data"
-      >
-        <label for="invoice">发票文件（.xlsx）</label>
-        <input id="invoice" name="invoice" type="file" accept=".xlsx" required>
-        <button type="submit">上传发票</button>
-      </form>
-      <section id="workspace-result" aria-live="polite"></section>
+      <p>请选择清关发票开始处理。整个流程都在本页完成。</p>
+
+      <section id="upload" aria-labelledby="upload-heading">
+        <h2 id="upload-heading">1. 选择发票</h2>
+        <form
+          id="invoice-form"
+          action="/workspace/invoice"
+          method="post"
+          enctype="multipart/form-data"
+        >
+          <label for="invoice">发票文件（.xlsx）</label>
+          <input id="invoice" name="invoice" type="file" accept=".xlsx" required>
+          <button type="submit">上传发票</button>
+        </form>
+        <p id="upload-status" role="status" aria-live="polite"></p>
+      </section>
+
+      <div id="workspace-sections"></div>
+
+      <section id="history-panel" aria-labelledby="history-heading">
+        <h2 id="history-heading">历史记录</h2>
+        <button type="button" data-fis-load="/history" data-target="history-body">
+          刷新历史
+        </button>
+        <div id="history-body"></div>
+      </section>
+
+      <section id="masters-panel" aria-labelledby="masters-heading">
+        <h2 id="masters-heading">主数据</h2>
+        <button type="button" data-fis-load="/masters" data-target="masters-body">
+          刷新主数据
+        </button>
+        <div id="masters-body"></div>
+      </section>
     </main>
+    <script src="{{ url_for('static', path='/app.js') }}"></script>
   </body>
 </html>

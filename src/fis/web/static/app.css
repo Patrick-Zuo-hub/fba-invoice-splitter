@@ -10,10 +10,89 @@ body {
 }
 
 main {
-  width: min(48rem, calc(100% - 2rem));
-  margin: 4rem auto;
+  width: min(56rem, calc(100% - 2rem));
+  margin: 2.5rem auto;
   padding: 2rem;
   border-radius: 0.75rem;
   background: #fff;
   box-shadow: 0 0.5rem 2rem rgb(23 32 42 / 8%);
+}
+
+h1 {
+  margin-top: 0;
+}
+
+section {
+  margin: 1.5rem 0;
+  padding-top: 1rem;
+  border-top: 1px solid #e3e7eb;
+}
+
+section:first-of-type {
+  border-top: none;
+}
+
+h2 {
+  font-size: 1.15rem;
+}
+
+h3 {
+  font-size: 1rem;
+  margin-bottom: 0.35rem;
+}
+
+label {
+  display: block;
+  margin: 0.4rem 0;
+}
+
+input {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #c6ccd2;
+  border-radius: 0.35rem;
+  font: inherit;
+}
+
+button {
+  margin-top: 0.5rem;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid #2c3e50;
+  border-radius: 0.35rem;
+  background: #2c3e50;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 3px solid #4c8bf5;
+  outline-offset: 1px;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.5rem 0;
+}
+
+th,
+td {
+  border: 1px solid #e3e7eb;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.errors {
+  color: #a4262c;
+}
+
+.path,
+.folder {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  word-break: break-all;
+}
+
+ul {
+  padding-left: 1.2rem;
 }

@@ -19,7 +19,7 @@
       </ul>
       {% endif %}
       {% if entry.output_directory %}
-      <form action="/history/{{ entry.id }}/open-folder" method="post">
+      <form data-fis="post" action="/history/{{ entry.id }}/open-folder" method="post">
         <button type="submit">打开文件夹</button>
       </form>
       {% endif %}

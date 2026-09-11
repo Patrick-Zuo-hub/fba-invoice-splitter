@@ -7,7 +7,7 @@
     <li>{{ name }}</li>
     {% endfor %}
   </ul>
-  <form action="/history/{{ result.batch_id }}/open-folder" method="post">
+  <form data-fis="post" action="/history/{{ result.batch_id }}/open-folder" method="post">
     <button type="submit">打开文件夹</button>
   </form>
 </section>

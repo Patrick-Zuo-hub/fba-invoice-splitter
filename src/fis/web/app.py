@@ -7,11 +7,13 @@ from fastapi.templating import Jinja2Templates
 
 from fis.config import Settings
 from fis.platform.folders import FolderPicker
+from fis.runtime.lifecycle import Lifecycle
 from fis.services.batches import BatchService, WorkspaceStore
 from fis.storage.batch_files import BatchFiles
 from fis.storage.database import Database
 from fis.web.routes import history as history_routes
 from fis.web.routes import masters as masters_routes
+from fis.web.routes import runtime as runtime_routes
 from fis.web.routes import workspace as workspace_routes
 from fis.web.security import (
     LocalRequestMiddleware,
@@ -39,6 +41,7 @@ def create_app(
     templates = Jinja2Templates(directory=_WEB_ROOT / "templates")
     app.state.templates = templates
     app.state.database = database
+    app.state.lifecycle = Lifecycle()
     app.state.batch_service = BatchService(
         BatchFiles(settings.data_root),
         WorkspaceStore(),
@@ -52,6 +55,7 @@ def create_app(
     app.include_router(workspace_routes.router)
     app.include_router(history_routes.router)
     app.include_router(masters_routes.router)
+    app.include_router(runtime_routes.router)
 
     @app.get("/health")
     def health(response: Response) -> dict[str, str]:

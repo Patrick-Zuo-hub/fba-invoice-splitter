@@ -12,6 +12,10 @@
     <li class="empty">暂无渠道</li>
     {% endfor %}
   </ul>
+  <form data-fis="json" action="/masters/channels" method="post">
+    <label>新增渠道 <input name="name"></label>
+    <button type="submit">新增</button>
+  </form>
 
   <h3>送货仓库</h3>
   <ul class="delivery-warehouses">
@@ -25,6 +29,11 @@
     <li class="empty">暂无送货仓库</li>
     {% endfor %}
   </ul>
+  <form data-fis="json" action="/masters/delivery-warehouses" method="post">
+    <label>名称 <input name="name"></label>
+    <label>地址 <input name="address"></label>
+    <button type="submit">新增</button>
+  </form>
 
   <h3>FBA 仓库</h3>
   <ul class="fba-warehouses">
@@ -38,4 +47,9 @@
     <li class="empty">暂无 FBA 仓库</li>
     {% endfor %}
   </ul>
+  <form data-fis="json" action="/masters/fba-warehouses" method="post">
+    <label>编码 <input name="code"></label>
+    <label>地址 <input name="address"></label>
+    <button type="submit">新增</button>
+  </form>
 </section>
