@@ -15,3 +15,8 @@ uploads/
 generated/
 .worktrees/
 .superpowers/
+
+# 本地开发临时/客户数据（严禁提交）
+_wip/
+samples/*.xlsx
+samples/**/*.xlsx
