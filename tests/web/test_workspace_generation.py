@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fis.config import Settings
+from fis.storage.repositories import MasterDataRepository
 from fis.web.app import create_app
 from fis.xlsx.errors import WorkbookError
 from tests.fixtures.standard_v1_builder import build_standard_v1
@@ -85,6 +86,7 @@ def _ready_batch(
 ) -> tuple[str, Path]:
     workbook = _make_workbook(tmp_path / "source.xlsx", count)
     batch_id = _upload(app, client, workbook)
+    MasterDataRepository(app.state.database).create_fba_warehouse("ONT8", "Ontario, CA 91761")
     if set_fields:
         assert (
             client.post(

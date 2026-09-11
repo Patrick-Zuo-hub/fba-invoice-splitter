@@ -604,6 +604,22 @@ class MasterDataRepository:
             for row in rows
         ]
 
+    def get_fba_warehouse(self, code: str) -> MasterFbaWarehouse | None:
+        normalized_code = code.strip().upper()
+        connection = self._database.connect()
+        try:
+            row = connection.execute(
+                "SELECT code, name, address, status FROM fba_warehouses WHERE code = ?",
+                (normalized_code,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return MasterFbaWarehouse(
+            row["code"], row["name"], row["address"], row["status"] == "active"
+        )
+
     def update_fba_warehouse(
         self, code: str, *, name: str | None = None, address: str | None = None
     ) -> None:

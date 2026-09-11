@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fis.config import Settings
+from fis.storage.repositories import MasterDataRepository
 from fis.web.app import create_app
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
@@ -77,6 +78,7 @@ def _generate(
     )
     assert response.status_code == 200
     batch_id = app.state.batch_service.store.active_ids()[0]
+    MasterDataRepository(app.state.database).create_fba_warehouse("ONT8", "Ontario, CA 91761")
     client.post(f"/workspace/{batch_id}/fields", headers=mutation_headers(), json=COMMON_FIELDS)
     output_dir = tmp_path / "output"
     output_dir.mkdir()

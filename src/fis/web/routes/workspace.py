@@ -164,4 +164,27 @@ async def generate_batch(request: Request, batch_id: str) -> Response:
     )
 
 
+@router.post("/workspace/{batch_id}/mapping")
+async def apply_mapping(request: Request, batch_id: str) -> Response:
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 - malformed JSON body is a client error
+        return PlainTextResponse("请求体必须是 JSON", status_code=400)
+    if not isinstance(payload, dict):
+        return PlainTextResponse("请求体必须是 JSON 对象", status_code=400)
+    text = str(payload.get("mapping", ""))
+    service = _service(request)
+    try:
+        workspace, report = await run_in_threadpool(service.apply_mapping, batch_id, text)
+    except KeyError:
+        return PlainTextResponse("未找到该批次", status_code=404)
+    except ValueError as error:
+        return PlainTextResponse(f"映射解析失败：{error}", status_code=422)
+    view = service.editor_view(workspace)
+    view["mapping_report"] = report
+    return _templates(request).TemplateResponse(
+        request=request, name="_shipment_editor.html", context={"view": view}
+    )
+
+
 __all__ = ["router"]

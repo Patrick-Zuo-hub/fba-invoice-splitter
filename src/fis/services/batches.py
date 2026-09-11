@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fis.domain.rules import default_dates
+from fis.domain.rules import default_dates, parse_warehouse_mapping
 from fis.platform.folders import (
     FolderOpener,
     FolderPicker,
@@ -363,13 +363,41 @@ class BatchService:
     # -- resolution -------------------------------------------------------
 
     def _default_channel(self, warehouse_code: str | None) -> str | None:
-        if self._masters is not None and warehouse_code:
-            recent = self._masters.get_recent_channel(warehouse_code)
-            if recent is not None:
-                return recent.name
+        if self._defaults is not None and warehouse_code:
+            remembered = self._defaults.get(f"{_DEFAULT_CHANNEL_KEY}:{warehouse_code}")
+            if remembered:
+                return remembered
         if self._defaults is not None:
             return self._defaults.get(_DEFAULT_CHANNEL_KEY)
         return None
+
+    def _lookup_address(self, warehouse_code: str | None) -> str | None:
+        if self._masters is None or not warehouse_code:
+            return None
+        warehouse = self._masters.get_fba_warehouse(warehouse_code)
+        return warehouse.address if warehouse is not None else None
+
+    def apply_mapping(
+        self, batch_id: str, text: str
+    ) -> tuple[Workspace, dict[str, object]]:
+        workspace = self.require(batch_id)
+        mapping = parse_warehouse_mapping(text)
+        known = set(workspace.shipment_ids)
+        applied: dict[str, str] = {}
+        unknown: list[str] = []
+        for shipment_id, code in mapping.items():
+            if shipment_id in known:
+                current = workspace.overrides.get(shipment_id, ShipmentEdit())
+                workspace.overrides[shipment_id] = replace(current, warehouse_code=code)
+                applied[shipment_id] = code
+            else:
+                unknown.append(shipment_id)
+        unmapped = [
+            shipment_id
+            for shipment_id in workspace.shipment_ids
+            if not (self.effective_fields(workspace, shipment_id)["warehouse_code"])
+        ]
+        return workspace, {"applied": applied, "unknown": unknown, "unmapped": unmapped}
 
     def effective_fields(self, workspace: Workspace, shipment_id: str) -> dict[str, object]:
         common = workspace.common
@@ -383,17 +411,17 @@ class BatchService:
             return getattr(common, name)
 
         warehouse_code = pick("warehouse_code")
+        code = warehouse_code if isinstance(warehouse_code, str) and warehouse_code else None
         delivery, sailing_default = default_dates(self._today())
         delivery_date = pick("delivery_date") or delivery
         sailing_date = pick("sailing_date")
         if sailing_date is None:
             sailing_date = delivery_date + timedelta(days=7) if delivery_date else sailing_default
-        channel = pick("channel") or self._default_channel(
-            warehouse_code if isinstance(warehouse_code, str) else None
-        )
+        channel = pick("channel") or self._default_channel(code)
         return {
             "warehouse_code": warehouse_code,
-            "warehouse_address": pick("warehouse_address"),
+            # Address is always derived from Master Data by code, never typed.
+            "warehouse_address": self._lookup_address(code),
             "channel": channel,
             "delivery_date": delivery_date,
             "sailing_date": sailing_date,
@@ -405,9 +433,19 @@ class BatchService:
     ) -> tuple[ShipmentOutput | None, dict[str, str]]:
         fields = self.effective_fields(workspace, shipment_id)
         errors: dict[str, str] = {}
-        for name, label in FIELD_LABELS.items():
-            if not fields.get(name):
-                errors[name] = f"{label}必填"
+        code = fields.get("warehouse_code")
+        if not code:
+            errors["warehouse_code"] = "未指派 FBA 仓库代码"
+        elif not fields.get("warehouse_address"):
+            errors["warehouse_address"] = f"仓库代码 {code} 未在主数据维护地址"
+        if not fields.get("channel"):
+            errors["channel"] = "运输渠道必填"
+        if not fields.get("delivery_date"):
+            errors["delivery_date"] = "送仓日期必填"
+        if not fields.get("sailing_date"):
+            errors["sailing_date"] = "开船日期必填"
+        if not fields.get("delivery_warehouse"):
+            errors["delivery_warehouse"] = "送货仓库必填"
         if errors:
             return None, errors
         return (
@@ -510,7 +548,7 @@ class BatchService:
             raise GenerationError("生成过程中发生内部错误") from error
 
         self._record_completed(workspace, outputs, paths, now)
-        self._store_defaults(workspace)
+        self._store_defaults(workspace, outputs)
         return GenerationResult(batch_id, destination, tuple(path.name for path in paths))
 
     def _snapshot_json(self, output: ShipmentOutput) -> str:
@@ -568,11 +606,15 @@ class BatchService:
             now=now,
         )
 
-    def _store_defaults(self, workspace: Workspace) -> None:
+    def _store_defaults(
+        self, workspace: Workspace, outputs: tuple[ShipmentOutput, ...]
+    ) -> None:
         if self._defaults is None:
             return
-        if workspace.common.channel:
-            self._defaults.set("channel", workspace.common.channel)
+        # Remember the channel chosen for each warehouse code, and the common
+        # delivery warehouse, so the next batch pre-fills the same choices.
+        for output in outputs:
+            self._defaults.set(f"{_DEFAULT_CHANNEL_KEY}:{output.warehouse_code}", output.channel)
         if workspace.common.delivery_warehouse:
             self._defaults.set("delivery_warehouse", workspace.common.delivery_warehouse)
 
