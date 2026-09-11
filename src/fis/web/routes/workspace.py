@@ -1,6 +1,8 @@
-"""One-page upload, parse, and summary routes."""
+"""One-page upload, edit, output-folder, and summary routes."""
 
 from __future__ import annotations
+
+from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse
@@ -9,13 +11,15 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.responses import Response
 
+from fis.platform.folders import PlatformError
 from fis.services import batches
-from fis.services.batches import BatchService, UploadRejected, WorkspaceBatch
+from fis.services.batches import BatchService, UploadRejected, Workspace
 from fis.xlsx.errors import WorkbookError
 
 router = APIRouter()
 
 _UPLOAD_CHUNK = 1024 * 1024
+_ALL_SUFFIX = "_all"
 
 
 def _service(request: Request) -> BatchService:
@@ -44,14 +48,14 @@ async def _read_bounded(upload: UploadFile, limit: int) -> list[bytes]:
     return chunks
 
 
-def _summary_response(request: Request, batch: WorkspaceBatch) -> Response:
+def _summary_response(request: Request, workspace: Workspace) -> Response:
     return _templates(request).TemplateResponse(
         request=request,
         name="_invoice_summary.html",
         context={
-            "batch": batch,
-            "shipment_count": batch.shipment_count,
-            "shipments": batch.parsed.shipments,
+            "batch": workspace,
+            "shipment_count": workspace.shipment_count,
+            "shipments": workspace.parsed.shipments,
         },
     )
 
@@ -70,12 +74,69 @@ async def upload_invoice(request: Request) -> Response:
     filename = upload.filename or ""
     try:
         chunks = await _read_bounded(upload, batches.MAX_UPLOAD_BYTES)
-        batch = await run_in_threadpool(_service(request).create_from_upload, filename, chunks)
+        workspace = await run_in_threadpool(
+            _service(request).create_from_upload, filename, chunks
+        )
     except UploadRejected as rejected:
         return PlainTextResponse(rejected.message, status_code=rejected.status_code)
     except WorkbookError as error:
         return PlainTextResponse(str(error) or "发票解析失败", status_code=422)
-    return _summary_response(request, batch)
+    return _summary_response(request, workspace)
+
+
+@router.post("/workspace/{batch_id}/fields")
+async def edit_fields(request: Request, batch_id: str) -> Response:
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 - any malformed JSON body is a client error
+        return PlainTextResponse("请求体必须是 JSON", status_code=400)
+    if not isinstance(payload, dict):
+        return PlainTextResponse("请求体必须是 JSON 对象", status_code=400)
+
+    common_raw: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key == "shipments":
+            continue
+        if isinstance(key, str) and key.endswith(_ALL_SUFFIX):
+            common_raw[key[: -len(_ALL_SUFFIX)]] = value
+
+    raw_shipments = payload.get("shipments") or {}
+    if not isinstance(raw_shipments, dict):
+        return PlainTextResponse("shipments 必须是对象", status_code=400)
+    override_raw = {
+        str(shipment_id): (fields if isinstance(fields, dict) else {})
+        for shipment_id, fields in raw_shipments.items()
+    }
+
+    service = _service(request)
+    try:
+        workspace, errors = await run_in_threadpool(
+            service.apply_fields, batch_id, common_raw, override_raw
+        )
+    except KeyError:
+        return PlainTextResponse("未找到该批次", status_code=404)
+    view = service.editor_view(workspace, errors)
+    return _templates(request).TemplateResponse(
+        request=request, name="_shipment_editor.html", context={"view": view}
+    )
+
+
+@router.post("/workspace/{batch_id}/output-folder")
+async def choose_output_folder(request: Request, batch_id: str) -> Response:
+    service = _service(request)
+    try:
+        workspace, changed = await run_in_threadpool(service.choose_output_folder, batch_id)
+    except KeyError:
+        return PlainTextResponse("未找到该批次", status_code=404)
+    except PlatformError as error:
+        return PlainTextResponse(str(error) or "所选文件夹无效", status_code=422)
+    if not changed:
+        return Response(status_code=204)
+    return _templates(request).TemplateResponse(
+        request=request,
+        name="_output_folder.html",
+        context={"folder": str(workspace.output_directory)},
+    )
 
 
 __all__ = ["router"]

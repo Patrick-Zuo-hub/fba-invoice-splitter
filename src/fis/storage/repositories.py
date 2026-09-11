@@ -212,4 +212,54 @@ class MasterDataRepository:
         return ChannelRecord(id=row["id"], name=row["name"])
 
 
-__all__ = ["BatchRecord", "BatchRepository", "ChannelRecord", "MasterDataRepository"]
+class DefaultsRepository:
+    """Persist last-used defaults as small key/value strings only."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def set(self, key: str, value: str) -> None:
+        normalized_key = key.strip()
+        if not normalized_key:
+            raise ValueError("default key must not be blank")
+        if not isinstance(value, str):
+            raise TypeError("default value must be a string")
+        with self._database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO app_defaults(key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized_key, value, _current_timestamp()),
+            )
+
+    def get(self, key: str) -> str | None:
+        connection = self._database.connect()
+        try:
+            row = connection.execute(
+                "SELECT value FROM app_defaults WHERE key = ?",
+                (key.strip(),),
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else row["value"]
+
+    def all(self) -> dict[str, str]:
+        connection = self._database.connect()
+        try:
+            rows = connection.execute("SELECT key, value FROM app_defaults").fetchall()
+        finally:
+            connection.close()
+        return {row["key"]: row["value"] for row in rows}
+
+
+__all__ = [
+    "BatchRecord",
+    "BatchRepository",
+    "ChannelRecord",
+    "DefaultsRepository",
+    "MasterDataRepository",
+]

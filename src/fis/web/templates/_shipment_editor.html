@@ -1,0 +1,50 @@
+<section id="shipment-editor" aria-live="polite">
+  <h2>完善物流信息</h2>
+  {% if view.common_errors %}
+  <div role="alert" class="errors">
+    <p>公共字段有误：</p>
+    <ul>
+      {% for field, message in view.common_errors.items() %}
+      <li>{{ message }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+  <table>
+    <caption>各货件确认值</caption>
+    <thead>
+      <tr>
+        <th scope="col">货件编号</th>
+        <th scope="col">FBA 仓库编码</th>
+        <th scope="col">FBA 仓库地址</th>
+        <th scope="col">运输渠道</th>
+        <th scope="col">送仓日期</th>
+        <th scope="col">开船日期</th>
+        <th scope="col">送货仓库</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in view.rows %}
+      <tr>
+        <th scope="row">{{ row.shipment_id }}</th>
+        <td>{{ row.fields.warehouse_code }}</td>
+        <td>{{ row.fields.warehouse_address }}</td>
+        <td>{{ row.fields.channel }}</td>
+        <td>{{ row.fields.delivery_date }}</td>
+        <td>{{ row.fields.sailing_date }}</td>
+        <td>{{ row.fields.delivery_warehouse }}</td>
+      </tr>
+      {% if row.errors %}
+      <tr>
+        <td colspan="7" role="alert" class="errors">
+          {% for field, message in row.errors.items() %}<span>{{ message }}</span>{% endfor %}
+        </td>
+      </tr>
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if view.output_directory %}
+  <p>当前输出文件夹：{{ view.output_directory }}</p>
+  {% endif %}
+</section>

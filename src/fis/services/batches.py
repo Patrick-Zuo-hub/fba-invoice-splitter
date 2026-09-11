@@ -1,32 +1,41 @@
 """Process-local orchestration for the single-page invoice workflow.
 
 The service layer keeps the completed XLSX engine and storage primitives
-independent. Workbook bytes never enter SQLite; only the active source path
-and the immutable parsed model live in process memory while a page is open.
+independent. Workbook bytes never enter SQLite; only the active source path,
+the immutable parsed model, and the in-progress edits live in process memory
+while a page is open.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field, replace
+from datetime import date, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from fis.domain.rules import default_dates
+from fis.platform.folders import FolderPicker, NativeFolderPicker, PlatformError
 from fis.storage.batch_files import BatchFiles
+from fis.storage.database import Database
+from fis.storage.repositories import DefaultsRepository, MasterDataRepository
+from fis.xlsx.generator import ShipmentOutput
 from fis.xlsx.parser import ParsedBundle, parse_invoice_bundle
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 _SOURCE_FILENAME = "source.xlsx"
 
+_TEXT_FIELDS = ("warehouse_code", "warehouse_address", "channel", "delivery_warehouse")
+_DATE_FIELDS = ("delivery_date", "sailing_date")
+_ALL_SUFFIX = "_all"
+_DEFAULT_CHANNEL_KEY = "channel"
+
 
 class UploadRejected(Exception):
-    """An upload was refused before or during safe ingestion.
-
-    ``status_code`` is the HTTP status the web layer returns and ``message``
-    is a user-facing Chinese explanation that never leaks internal detail.
-    """
+    """An upload was refused before or during safe ingestion."""
 
     def __init__(self, status_code: int, message: str) -> None:
         super().__init__(message)
@@ -49,28 +58,76 @@ class WorkspaceBatch:
         return len(self.parsed.shipments)
 
 
+@dataclass(frozen=True, slots=True)
+class ShipmentEdit:
+    """A sparse overlay of confirmed logistics values."""
+
+    warehouse_code: str | None = None
+    warehouse_address: str | None = None
+    channel: str | None = None
+    delivery_date: date | None = None
+    sailing_date: date | None = None
+    delivery_warehouse: str | None = None
+
+
+@dataclass
+class Workspace:
+    """Mutable per-page session state wrapping one immutable upload."""
+
+    batch: WorkspaceBatch
+    common: ShipmentEdit = ShipmentEdit()
+    overrides: dict[str, ShipmentEdit] = field(default_factory=dict)
+    output_directory: Path | None = None
+    # Scope key ``None`` is the common scope; a shipment id is an override scope.
+    sailing_manual: dict[str | None, bool] = field(default_factory=dict)
+
+    @property
+    def id(self) -> str:
+        return self.batch.id
+
+    @property
+    def source_path(self) -> Path:
+        return self.batch.source_path
+
+    @property
+    def source_filename(self) -> str:
+        return self.batch.source_filename
+
+    @property
+    def parsed(self) -> ParsedBundle:
+        return self.batch.parsed
+
+    @property
+    def shipment_count(self) -> int:
+        return self.batch.shipment_count
+
+    @property
+    def shipment_ids(self) -> tuple[str, ...]:
+        return tuple(shipment.shipment_id for shipment in self.batch.parsed.shipments)
+
+
 class WorkspaceStore:
-    """Thread-safe, process-local registry of active workspace batches."""
+    """Thread-safe, process-local registry of active workspaces."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._batches: dict[str, WorkspaceBatch] = {}
+        self._workspaces: dict[str, Workspace] = {}
 
-    def put(self, batch: WorkspaceBatch) -> None:
+    def put(self, workspace: Workspace) -> None:
         with self._lock:
-            self._batches[batch.id] = batch
+            self._workspaces[workspace.id] = workspace
 
-    def get(self, batch_id: str) -> WorkspaceBatch | None:
+    def get(self, batch_id: str) -> Workspace | None:
         with self._lock:
-            return self._batches.get(batch_id)
+            return self._workspaces.get(batch_id)
 
     def remove(self, batch_id: str) -> None:
         with self._lock:
-            self._batches.pop(batch_id, None)
+            self._workspaces.pop(batch_id, None)
 
     def active_ids(self) -> tuple[str, ...]:
         with self._lock:
-            return tuple(self._batches)
+            return tuple(self._workspaces)
 
 
 def require_xlsx_name(filename: str) -> None:
@@ -99,21 +156,65 @@ def _stream_to_file(destination: Path, chunks: Iterable[bytes], limit: int) -> s
     return hasher.hexdigest()
 
 
-class BatchService:
-    """Coordinate safe upload, parse, and process-local workspace state."""
+def _coerce_date(raw: object, errors: dict[str, str], field_name: str) -> tuple[str, date | None]:
+    """Return ("set"|"clear"|"error", value); record an error for bad input."""
 
-    def __init__(self, files: BatchFiles, store: WorkspaceStore) -> None:
+    text = "" if raw is None else str(raw).strip()
+    if text == "":
+        return "clear", None
+    try:
+        return "set", date.fromisoformat(text)
+    except ValueError:
+        errors[field_name] = "日期格式应为 YYYY-MM-DD"
+        return "error", None
+
+
+# Field labels used in the complete field-error mapping and the editor view.
+FIELD_LABELS = {
+    "warehouse_code": "FBA 仓库编码",
+    "warehouse_address": "FBA 仓库地址",
+    "channel": "运输渠道",
+    "delivery_date": "送仓日期",
+    "sailing_date": "开船日期",
+    "delivery_warehouse": "送货仓库",
+}
+
+
+class BatchService:
+    """Coordinate safe upload, parse, edits, defaults, and folder selection."""
+
+    def __init__(
+        self,
+        files: BatchFiles,
+        store: WorkspaceStore,
+        *,
+        database: Database | None = None,
+        folder_picker: FolderPicker | None = None,
+        today: Callable[[], date] | None = None,
+    ) -> None:
         self._files = files
         self._store = store
+        self._defaults = DefaultsRepository(database) if database is not None else None
+        self._masters = MasterDataRepository(database) if database is not None else None
+        self._picker: FolderPicker = folder_picker or NativeFolderPicker()
+        self._today = today or date.today
 
     @property
     def store(self) -> WorkspaceStore:
         return self._store
 
-    def get(self, batch_id: str) -> WorkspaceBatch | None:
+    def get(self, batch_id: str) -> Workspace | None:
         return self._store.get(batch_id)
 
-    def create_from_upload(self, filename: str, chunks: Iterable[bytes]) -> WorkspaceBatch:
+    def require(self, batch_id: str) -> Workspace:
+        workspace = self._store.get(batch_id)
+        if workspace is None:
+            raise KeyError(batch_id)
+        return workspace
+
+    # -- upload -----------------------------------------------------------
+
+    def create_from_upload(self, filename: str, chunks: Iterable[bytes]) -> Workspace:
         require_xlsx_name(filename)
         batch_id = str(uuid4())
         work = self._files.create(batch_id)
@@ -128,8 +229,9 @@ class BatchService:
                 source_sha256=digest,
                 parsed=parsed,
             )
-            self._store.put(batch)
-            return batch
+            workspace = Workspace(batch=batch)
+            self._store.put(workspace)
+            return workspace
         except Exception:
             self._store.remove(batch_id)
             self._discard(batch_id)
@@ -141,11 +243,205 @@ class BatchService:
         except OSError:
             pass
 
+    # -- edits ------------------------------------------------------------
+
+    def apply_fields(
+        self,
+        batch_id: str,
+        common_raw: Mapping[str, object],
+        override_raw: Mapping[str, Mapping[str, object]],
+    ) -> tuple[Workspace, dict[str, dict[str, str]]]:
+        workspace = self.require(batch_id)
+        errors: dict[str, dict[str, str]] = {}
+        known = set(workspace.shipment_ids)
+
+        common_errors: dict[str, str] = {}
+        workspace.common = self._merge_scope(
+            workspace.common, common_raw, None, workspace.sailing_manual, common_errors
+        )
+        if common_errors:
+            errors["common"] = common_errors
+
+        for shipment_id, raw in override_raw.items():
+            if shipment_id not in known:
+                errors.setdefault(shipment_id, {})["shipment"] = "未知货件编号"
+                continue
+            scope_errors: dict[str, str] = {}
+            current = workspace.overrides.get(shipment_id, ShipmentEdit())
+            workspace.overrides[shipment_id] = self._merge_scope(
+                current, raw, shipment_id, workspace.sailing_manual, scope_errors
+            )
+            if scope_errors:
+                errors[shipment_id] = scope_errors
+        return workspace, errors
+
+    def _merge_scope(
+        self,
+        target: ShipmentEdit,
+        raw: Mapping[str, object],
+        scope: str | None,
+        manual: dict[str | None, bool],
+        errors: dict[str, str],
+    ) -> ShipmentEdit:
+        updates: dict[str, str | date | None] = {}
+        for field_name in _TEXT_FIELDS:
+            if field_name in raw:
+                text = "" if raw[field_name] is None else str(raw[field_name]).strip()
+                updates[field_name] = text or None
+
+        delivery_changed = False
+        if "delivery_date" in raw:
+            kind, value = _coerce_date(raw["delivery_date"], errors, "delivery_date")
+            if kind == "set":
+                updates["delivery_date"] = value
+                delivery_changed = True
+            elif kind == "clear":
+                updates["delivery_date"] = None
+
+        if "sailing_date" in raw:
+            kind, value = _coerce_date(raw["sailing_date"], errors, "sailing_date")
+            if kind == "set":
+                updates["sailing_date"] = value
+                manual[scope] = True
+            elif kind == "clear":
+                updates["sailing_date"] = None
+                manual[scope] = False
+
+        merged = replace(target, **updates)
+        if delivery_changed and not manual.get(scope, False):
+            delivery = merged.delivery_date
+            if delivery is not None:
+                merged = replace(merged, sailing_date=delivery + timedelta(days=7))
+        return merged
+
+    # -- resolution -------------------------------------------------------
+
+    def _default_channel(self, warehouse_code: str | None) -> str | None:
+        if self._masters is not None and warehouse_code:
+            recent = self._masters.get_recent_channel(warehouse_code)
+            if recent is not None:
+                return recent.name
+        if self._defaults is not None:
+            return self._defaults.get(_DEFAULT_CHANNEL_KEY)
+        return None
+
+    def effective_fields(self, workspace: Workspace, shipment_id: str) -> dict[str, object]:
+        common = workspace.common
+        override = workspace.overrides.get(shipment_id)
+
+        def pick(name: str) -> object:
+            if override is not None:
+                value = getattr(override, name)
+                if value is not None:
+                    return value
+            return getattr(common, name)
+
+        warehouse_code = pick("warehouse_code")
+        delivery, sailing_default = default_dates(self._today())
+        delivery_date = pick("delivery_date") or delivery
+        sailing_date = pick("sailing_date")
+        if sailing_date is None:
+            sailing_date = delivery_date + timedelta(days=7) if delivery_date else sailing_default
+        channel = pick("channel") or self._default_channel(
+            warehouse_code if isinstance(warehouse_code, str) else None
+        )
+        return {
+            "warehouse_code": warehouse_code,
+            "warehouse_address": pick("warehouse_address"),
+            "channel": channel,
+            "delivery_date": delivery_date,
+            "sailing_date": sailing_date,
+            "delivery_warehouse": pick("delivery_warehouse"),
+        }
+
+    def resolve_output(
+        self, workspace: Workspace, shipment_id: str
+    ) -> tuple[ShipmentOutput | None, dict[str, str]]:
+        fields = self.effective_fields(workspace, shipment_id)
+        errors: dict[str, str] = {}
+        for name, label in FIELD_LABELS.items():
+            if not fields.get(name):
+                errors[name] = f"{label}必填"
+        if errors:
+            return None, errors
+        return (
+            ShipmentOutput(
+                shipment_id=shipment_id,
+                warehouse_code=str(fields["warehouse_code"]),
+                warehouse_address=str(fields["warehouse_address"]),
+                channel=str(fields["channel"]),
+                delivery_date=fields["delivery_date"],  # type: ignore[arg-type]
+                sailing_date=fields["sailing_date"],  # type: ignore[arg-type]
+                delivery_warehouse=str(fields["delivery_warehouse"]),
+            ),
+            {},
+        )
+
+    def resolve_all(
+        self, workspace: Workspace
+    ) -> tuple[tuple[ShipmentOutput, ...], dict[str, dict[str, str]]]:
+        outputs: list[ShipmentOutput] = []
+        errors: dict[str, dict[str, str]] = {}
+        for shipment_id in workspace.shipment_ids:
+            output, field_errors = self.resolve_output(workspace, shipment_id)
+            if output is None:
+                errors[shipment_id] = field_errors
+            else:
+                outputs.append(output)
+        return tuple(outputs), errors
+
+    def editor_view(
+        self, workspace: Workspace, errors: Mapping[str, Mapping[str, str]] | None = None
+    ) -> dict[str, object]:
+        errors = errors or {}
+        rows: list[dict[str, object]] = []
+        for shipment in workspace.parsed.shipments:
+            fields = self.effective_fields(workspace, shipment.shipment_id)
+            rows.append(
+                {
+                    "shipment_id": shipment.shipment_id,
+                    "item_count": len(shipment.items),
+                    "fields": {name: _display(value) for name, value in fields.items()},
+                    "errors": dict(errors.get(shipment.shipment_id, {})),
+                }
+            )
+        return {
+            "batch_id": workspace.id,
+            "rows": rows,
+            "common_errors": dict(errors.get("common", {})),
+            "output_directory": str(workspace.output_directory)
+            if workspace.output_directory is not None
+            else None,
+        }
+
+    # -- output folder ----------------------------------------------------
+
+    def choose_output_folder(self, batch_id: str) -> tuple[Workspace, bool]:
+        workspace = self.require(batch_id)
+        chosen = self._picker.choose(workspace.output_directory)
+        if chosen is None:
+            return workspace, False
+        if not os.access(chosen, os.W_OK):
+            raise PlatformError("所选文件夹不可写入")
+        workspace.output_directory = chosen
+        return workspace, True
+
+
+def _display(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
+
 
 __all__ = [
     "BatchService",
+    "FIELD_LABELS",
     "MAX_UPLOAD_BYTES",
+    "ShipmentEdit",
     "UploadRejected",
+    "Workspace",
     "WorkspaceBatch",
     "WorkspaceStore",
     "require_xlsx_name",

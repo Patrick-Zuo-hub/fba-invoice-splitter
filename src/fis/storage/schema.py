@@ -74,6 +74,12 @@ CREATE TABLE shipment_items (
     FOREIGN KEY (batch_id, shipment_id) REFERENCES shipments(batch_id, shipment_id)
         ON DELETE CASCADE
 );
+
+CREATE TABLE app_defaults (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 __all__ = ["SCHEMA_V1"]
