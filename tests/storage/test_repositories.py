@@ -294,6 +294,17 @@ def test_duplicate_warehouse_does_not_overwrite_address(database: Database) -> N
     assert address["address"] == "Original address"
 
 
+def test_delivery_warehouse_address_can_be_blank_and_cleared(database: Database) -> None:
+    repository = MasterDataRepository(database)
+
+    warehouse_id = repository.add_delivery_warehouse("宁波仓", "")
+    repository.update_delivery_warehouse(warehouse_id, address="  ")
+
+    warehouse = repository.list_delivery_warehouses()[0]
+    assert warehouse.name == "宁波仓"
+    assert warehouse.address == ""
+
+
 @pytest.mark.parametrize("name", ["", " ", "\t\n"])
 def test_blank_channel_name_is_rejected(database: Database, name: str) -> None:
     with pytest.raises(ValueError, match="channel name"):

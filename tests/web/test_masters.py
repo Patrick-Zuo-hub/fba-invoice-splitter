@@ -109,14 +109,18 @@ def test_create_delivery_warehouse(client: TestClient) -> None:
     assert "宁波市北仑区" in response.text
 
 
-def test_delivery_warehouse_requires_address(client: TestClient) -> None:
+def test_delivery_warehouse_allows_blank_address(app: FastAPI, client: TestClient) -> None:
     response = client.post(
         "/masters/delivery-warehouses",
         headers=mutation_headers(),
         json={"name": "宁波仓", "address": "  "},
     )
 
-    assert response.status_code == 422
+    assert response.status_code == 200
+    warehouse = _repo(app).list_delivery_warehouses()[0]
+    assert warehouse.name == "宁波仓"
+    assert warehouse.address == ""
+    assert "地址（选填）" in response.text
 
 
 def test_create_fba_warehouse_normalizes_code(client: TestClient) -> None:

@@ -522,8 +522,6 @@ class MasterDataRepository:
         normalized_address = address.strip()
         if not normalized_name:
             raise ValueError("送货仓库名称不能为空")
-        if not normalized_address:
-            raise ValueError("送货仓库地址不能为空")
         self._reject_duplicate("delivery_warehouses", "name", normalized_name)
         timestamp = _current_timestamp()
         with self._database.transaction() as connection:
@@ -562,8 +560,6 @@ class MasterDataRepository:
             params.append(normalized_name)
         if address is not None:
             normalized_address = address.strip()
-            if not normalized_address:
-                raise ValueError("送货仓库地址不能为空")
             assignments.append("address = ?")
             params.append(normalized_address)
         if not assignments:
