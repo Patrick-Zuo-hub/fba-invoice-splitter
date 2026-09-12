@@ -5,8 +5,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fis.config import Settings
-from fis.storage.repositories import DefaultsRepository, MasterDataRepository
+from fis.storage.repositories import BatchRepository, DefaultsRepository, MasterDataRepository
 from fis.web.app import create_app
+from fis.xlsx.combined import combined_sheet_names
 from fis.xlsx.errors import WorkbookError
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
@@ -107,7 +108,7 @@ def _ready_batch(
     return batch_id, output_dir
 
 
-def test_generation_publishes_complete_batch_to_selected_folder(
+def test_generation_publishes_one_workbook_to_selected_folder(
     app: FastAPI, client: TestClient, tmp_path: Path, folder_picker: FakeFolderPicker
 ) -> None:
     batch_id, output_dir = _ready_batch(app, client, tmp_path, folder_picker, count=2)
@@ -115,9 +116,28 @@ def test_generation_publishes_complete_batch_to_selected_folder(
     response = client.post(f"/workspace/{batch_id}/generate", headers=mutation_headers())
 
     assert response.status_code == 200
-    assert "已成功生成 2 份发票" in response.text
     produced = sorted(path.name for path in output_dir.glob("*.xlsx"))
-    assert produced == ["S1_AMAZON-ONT8.xlsx", "S2_AMAZON-ONT8.xlsx"]
+    assert produced == ["已处理_invoice.xlsx"]
+    assert combined_sheet_names(output_dir / "已处理_invoice.xlsx") == (
+        "AMAZON-ONT8-S1",
+        "AMAZON-ONT8-S2",
+    )
+
+
+def test_generation_records_one_batch_level_output_path(
+    app: FastAPI, client: TestClient, tmp_path: Path, folder_picker: FakeFolderPicker
+) -> None:
+    batch_id, output_dir = _ready_batch(app, client, tmp_path, folder_picker, count=2)
+
+    assert (
+        client.post(f"/workspace/{batch_id}/generate", headers=mutation_headers()).status_code
+        == 200
+    )
+
+    entry = BatchRepository(app.state.database).list_history_entries()[0]
+    assert entry.output_path == str(output_dir / "已处理_invoice.xlsx")
+    assert entry.output_directory == str(output_dir)
+    assert [shipment.output_path for shipment in entry.shipments] == ["", ""]
 
 
 def test_generation_without_output_folder_is_blocked(
@@ -146,18 +166,21 @@ def test_generation_with_incomplete_fields_is_blocked(
     assert list(output_dir.iterdir()) == []
 
 
-def test_filename_collision_blocks_and_keeps_existing_file(
+def test_existing_workbook_is_preserved_and_next_run_is_suffixed(
     app: FastAPI, client: TestClient, tmp_path: Path, folder_picker: FakeFolderPicker
 ) -> None:
     batch_id, output_dir = _ready_batch(app, client, tmp_path, folder_picker, count=2)
-    existing = output_dir / "S1_AMAZON-ONT8.xlsx"
+    existing = output_dir / "已处理_invoice.xlsx"
     existing.write_bytes(b"existing-user-file")
 
     response = client.post(f"/workspace/{batch_id}/generate", headers=mutation_headers())
 
-    assert response.status_code == 422
+    assert response.status_code == 200
     assert existing.read_bytes() == b"existing-user-file"
-    assert not (output_dir / "S2_AMAZON-ONT8.xlsx").exists()
+    assert sorted(path.name for path in output_dir.glob("*.xlsx")) == [
+        "已处理_invoice.xlsx",
+        "已处理_invoice_2.xlsx",
+    ]
 
 
 def test_engine_failure_publishes_no_files(
@@ -165,7 +188,7 @@ def test_engine_failure_publishes_no_files(
 ) -> None:
     batch_id, output_dir = _ready_batch(app, client, tmp_path, folder_picker, count=2)
 
-    def boom(source: str, outputs: object, destination: object) -> object:
+    def boom(source: str, outputs: object, destination: object, filename: str) -> object:
         raise WorkbookError("BOOM", "刻意失败")
 
     app.state.batch_service._engine = boom

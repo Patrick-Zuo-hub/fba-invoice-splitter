@@ -40,12 +40,9 @@ from fis.storage.repositories import (
     HistoryEntry,
     MasterDataRepository,
 )
+from fis.xlsx.combined import generate_combined_workbook
 from fis.xlsx.errors import WorkbookError
-from fis.xlsx.generator import (
-    ShipmentOutput,
-    generate_shipment_workbooks,
-    safe_filename,
-)
+from fis.xlsx.generator import ShipmentOutput
 from fis.xlsx.parser import ParsedBundle, parse_invoice_bundle
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -217,7 +214,7 @@ FIELD_LABELS = {
 }
 
 
-GenerateEngine = Callable[[str, tuple[ShipmentOutput, ...], Path], tuple[Path, ...]]
+GenerateEngine = Callable[[str, tuple[ShipmentOutput, ...], Path, str], Path]
 
 
 class GenerationError(Exception):
@@ -235,7 +232,8 @@ class GenerationError(Exception):
 class GenerationResult:
     batch_id: str
     output_directory: Path
-    filenames: tuple[str, ...]
+    filename: str
+    sheet_count: int
 
 
 class BatchService:
@@ -260,7 +258,7 @@ class BatchService:
         self._batches = BatchRepository(database) if database is not None else None
         self._picker: FolderPicker = folder_picker or NativeFolderPicker()
         self._opener: FolderOpener = folder_opener or NativeFolderOpener()
-        self._engine: GenerateEngine = engine or generate_shipment_workbooks
+        self._engine: GenerateEngine = engine or generate_combined_workbook
         self._today = today or date.today
         self._now = now or (lambda: datetime.now(UTC))
 
@@ -675,19 +673,14 @@ class BatchService:
         if not outputs:
             raise GenerationError("没有可生成的货件")
 
-        try:
-            names = [safe_filename(output) for output in outputs]
-        except WorkbookError as error:
-            raise GenerationError(str(error) or "无法生成安全文件名") from error
-        if len({name.casefold() for name in names}) != len(names):
-            raise GenerationError("多个货件会生成相同的文件名")
-        clashes = [name for name in names if (destination / name).exists()]
-        if clashes:
-            raise GenerationError("输出文件夹中已存在同名文件：" + "、".join(clashes))
-
         now = self._now()
         try:
-            paths = self._engine(str(workspace.source_path), tuple(outputs), destination)
+            path = self._engine(
+                str(workspace.source_path),
+                tuple(outputs),
+                destination,
+                workspace.source_filename,
+            )
         except WorkbookError as error:
             self._record_failed(workspace, error.code, str(error), now)
             raise GenerationError(str(error) or "生成失败") from error
@@ -695,9 +688,9 @@ class BatchService:
             self._record_failed(workspace, "INTERNAL", None, now)
             raise GenerationError("生成过程中发生内部错误") from error
 
-        self._record_completed(workspace, outputs, paths, now)
+        self._record_completed(workspace, outputs, path, now)
         self._store_defaults(workspace, outputs)
-        return GenerationResult(batch_id, destination, tuple(path.name for path in paths))
+        return GenerationResult(batch_id, destination, path.name, len(outputs))
 
     def _snapshot_json(self, output: ShipmentOutput) -> str:
         return json.dumps(
@@ -717,14 +710,13 @@ class BatchService:
         self,
         workspace: Workspace,
         outputs: tuple[ShipmentOutput, ...],
-        paths: tuple[Path, ...],
+        path: Path,
         now: datetime,
     ) -> None:
         if self._batches is None:
             return
         shipments = [
-            (output.shipment_id, self._snapshot_json(output), str(path))
-            for output, path in zip(outputs, paths, strict=True)
+            (output.shipment_id, self._snapshot_json(output)) for output in outputs
         ]
         item_count = sum(len(shipment.items) for shipment in workspace.parsed.shipments)
         self._batches.record_completed(
@@ -732,6 +724,7 @@ class BatchService:
             filename=workspace.source_filename,
             sha256=workspace.batch.source_sha256,
             source_path=str(workspace.source_path),
+            output_path=str(path),
             shipment_count=len(outputs),
             item_count=item_count,
             shipments=shipments,

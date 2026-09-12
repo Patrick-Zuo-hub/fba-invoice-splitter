@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from fis.config import Settings
 from fis.storage.repositories import MasterDataRepository
 from fis.web.app import create_app
+from fis.xlsx.combined import combined_sheet_names
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
 PORT = 8765
@@ -96,10 +97,11 @@ def test_address_auto_derived_and_generation_succeeds(
 
     response = client.post(f"/workspace/{batch_id}/generate", headers=mut())
     assert response.status_code == 200
-    assert sorted(p.name for p in output_dir.glob("*.xlsx")) == [
-        "S1_AMAZON-ONT8.xlsx",
-        "S2_AMAZON-IAH3.xlsx",
-    ]
+    assert sorted(p.name for p in output_dir.glob("*.xlsx")) == ["已处理_invoice.xlsx"]
+    assert combined_sheet_names(output_dir / "已处理_invoice.xlsx") == (
+        "AMAZON-ONT8-S1",
+        "AMAZON-IAH3-S2",
+    )
 
 
 def test_code_without_master_address_blocks_generation(

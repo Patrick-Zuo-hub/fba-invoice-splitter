@@ -2,6 +2,7 @@ from urllib.parse import urlsplit
 
 from playwright.sync_api import Page, expect
 
+from fis.xlsx.combined import combined_sheet_names
 from tests.browser.conftest import BrowserApp, apply_mapping, upload
 
 
@@ -34,14 +35,18 @@ def test_primary_single_page_flow_uses_loopback_only(
     expect(page.get_by_text("2 / 2 完整")).to_be_visible()
 
     page.get_by_role("button", name="选择输出文件夹").click()
-    generate = page.get_by_role("button", name="生成 2 份发票")
+    generate = page.get_by_role("button", name="生成工作簿")
     expect(generate).to_be_enabled()
     generate.click()
-    expect(page.get_by_text("已成功生成 2 份发票")).to_be_visible()
+    expect(page.get_by_text("已生成 1 个工作簿，共包含 2 个货件 Sheet")).to_be_visible()
+    expect(page.get_by_text("已处理_source.xlsx")).to_be_visible()
     assert sorted(path.name for path in browser_app.output.glob("*.xlsx")) == [
-        "S1_AMAZON-ONT8.xlsx",
-        "S2_AMAZON-IAH3.xlsx",
+        "已处理_source.xlsx"
     ]
+    assert combined_sheet_names(browser_app.output / "已处理_source.xlsx") == (
+        "AMAZON-ONT8-S1",
+        "AMAZON-IAH3-S2",
+    )
 
     page.get_by_role("button", name="历史记录").click()
     expect(page.get_by_role("complementary").filter(has_text="历史记录")).to_contain_text(

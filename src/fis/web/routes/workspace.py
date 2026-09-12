@@ -165,8 +165,8 @@ async def generate_batch(request: Request, batch_id: str) -> Response:
         name="_generation_result.html",
         context={
             "result": result,
-            "count": len(result.filenames),
-            "filenames": result.filenames,
+            "filename": result.filename,
+            "sheet_count": result.sheet_count,
             "output_directory": str(result.output_directory),
         },
     )

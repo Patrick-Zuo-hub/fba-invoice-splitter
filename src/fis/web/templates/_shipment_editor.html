@@ -109,7 +109,7 @@
       <form data-fis="post" action="/workspace/{{ view.batch_id }}/generate" method="post">
         <button class="button primary generate" type="submit"
                 {% if view.complete_count != view.total_count or not view.output_directory %}disabled{% endif %}>
-          生成 {{ view.total_count }} 份发票
+          生成工作簿
         </button>
       </form>
     </div>

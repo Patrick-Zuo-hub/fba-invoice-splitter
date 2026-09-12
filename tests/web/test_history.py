@@ -100,8 +100,10 @@ def test_history_lists_completed_batch_with_output_paths(
 
     assert response.status_code == 200
     assert "invoice.xlsx" in response.text
-    assert "S1_AMAZON-ONT8.xlsx" in response.text
-    assert "S2_AMAZON-ONT8.xlsx" in response.text
+    assert response.text.count("已处理_invoice.xlsx") == 1
+    assert "S1_AMAZON-ONT8.xlsx" not in response.text
+    assert "S2_AMAZON-ONT8.xlsx" not in response.text
+    assert "zip" not in response.text.casefold()
 
 
 def test_history_database_stores_paths_and_no_workbook_blobs(
@@ -112,7 +114,8 @@ def test_history_database_stores_paths_and_no_workbook_blobs(
     with closing(sqlite3.connect(app.state.database.path)) as connection:
         connection.row_factory = sqlite3.Row
         batch = connection.execute(
-            "SELECT source_path, state FROM processing_batches WHERE id = ?", (batch_id,)
+            "SELECT source_path, state, output_path FROM processing_batches WHERE id = ?",
+            (batch_id,),
         ).fetchone()
         shipments = connection.execute(
             "SELECT output_path FROM shipments WHERE batch_id = ? ORDER BY shipment_id",
@@ -123,10 +126,8 @@ def test_history_database_stores_paths_and_no_workbook_blobs(
 
     assert batch["source_path"].endswith("source.xlsx")
     assert batch["state"] == "completed"
-    assert [row["output_path"] for row in shipments] == [
-        str(output_dir / "S1_AMAZON-ONT8.xlsx"),
-        str(output_dir / "S2_AMAZON-ONT8.xlsx"),
-    ]
+    assert batch["output_path"] == str(output_dir / "已处理_invoice.xlsx")
+    assert [row["output_path"] for row in shipments] == [None, None]
     all_columns = list(columns) + list(shipment_columns)
     assert not any(column["type"].upper() == "BLOB" for column in all_columns)
 

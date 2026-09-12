@@ -11,7 +11,9 @@
       {% if entry.completed_at %}<time>{{ entry.completed_at }}</time>{% endif %}
       {% if entry.error_code %}<span class="error">{{ entry.error_code }}</span>{% endif %}
       {% if entry.output_directory %}<span class="folder">{{ entry.output_directory }}</span>{% endif %}
-      {% if entry.shipments %}
+      {% if entry.output_path %}
+      <span class="workbook">{{ entry.output_path }}</span>
+      {% elif entry.shipments %}
       <ul>
         {% for shipment in entry.shipments %}
         <li>{{ shipment.shipment_id }} → {{ shipment.output_path }}</li>
