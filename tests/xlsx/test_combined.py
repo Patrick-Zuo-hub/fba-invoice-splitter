@@ -62,7 +62,7 @@ def test_worksheet_titles_are_legal_ordered_and_unique() -> None:
 
     titles = worksheet_titles(requests)
 
-    assert titles == ("ONT_8-A_B", "ONT_8-A_B_2")
+    assert titles == ("AMAZON-ONT_8-A_B", "AMAZON-ONT_8-A_B_2")
     assert all(len(title) <= 31 for title in titles)
 
 
@@ -101,7 +101,11 @@ def test_assembly_creates_ordered_isolated_sheet_relationship_graphs(tmp_path: P
     with SafePackage.open(output) as package:
         workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
         sheets = workbook.xpath("./main:sheets/main:sheet", namespaces={"main": MAIN_NS})
-        assert [sheet.get("name") for sheet in sheets] == ["IAH3-S2", "ONT8-S1", "LAX9-S3"]
+        assert [sheet.get("name") for sheet in sheets] == [
+            "AMAZON-IAH3-S2",
+            "AMAZON-ONT8-S1",
+            "AMAZON-LAX9-S3",
+        ]
 
         workbook_rels = package.read_xml("xl/_rels/workbook.xml.rels", MAX_ENTRY)
         relations = {relation.get("Id"): relation for relation in workbook_rels}
@@ -217,7 +221,7 @@ def test_generate_combined_workbook_publishes_once_and_preserves_order(tmp_path:
     path = generate_combined_workbook(source, requests, output_dir, "invoice.xlsx")
 
     assert path.name == "已处理_invoice.xlsx"
-    assert combined_sheet_names(path) == ("IAH3-S2", "ONT8-S1")
+    assert combined_sheet_names(path) == ("AMAZON-IAH3-S2", "AMAZON-ONT8-S1")
     assert [child.name for child in output_dir.iterdir()] == ["已处理_invoice.xlsx"]
 
 
