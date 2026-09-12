@@ -316,12 +316,14 @@ def _print_area_reference(workbook: etree._Element) -> str | None:
 
 
 def _rebuild_workbook(
-    assembled: Parts, base_workbook: etree._Element, titles: Sequence[str]
+    assembled: Parts,
+    base_workbook: etree._Element,
+    titles: Sequence[str],
+    print_areas: Sequence[str | None],
 ) -> None:
     sheets = base_workbook.find(f"{{{MAIN_NS}}}sheets")
     if sheets is None:
         raise _combined_error("INVALID_COMBINED_INPUT", "工作簿缺少 sheets 节点", _WORKBOOK_PART)
-    print_area = _print_area_reference(base_workbook)
     for child in list(sheets):
         sheets.remove(child)
     for position, title in enumerate(titles, start=1):
@@ -333,9 +335,11 @@ def _rebuild_workbook(
     existing = base_workbook.find(f"{{{MAIN_NS}}}definedNames")
     if existing is not None:
         base_workbook.remove(existing)
-    if print_area is not None:
+    if any(print_area is not None for print_area in print_areas):
         defined_names = etree.Element(f"{{{MAIN_NS}}}definedNames")
-        for position, title in enumerate(titles):
+        for position, (title, print_area) in enumerate(zip(titles, print_areas, strict=True)):
+            if print_area is None:
+                continue
             entry = etree.SubElement(defined_names, f"{{{MAIN_NS}}}definedName")
             entry.set("name", "_xlnm.Print_Area")
             entry.set("localSheetId", str(position))
@@ -464,7 +468,10 @@ def assemble_combined_workbook(payloads: Sequence[bytes], titles: Sequence[str])
         for index, (package, worksheet) in enumerate(zip(packages, worksheets, strict=True))
     ]
 
-    _rebuild_workbook(assembled, _parse(base, _WORKBOOK_PART), titles)
+    print_areas = [
+        _print_area_reference(_parse(package, _WORKBOOK_PART)) for package in packages
+    ]
+    _rebuild_workbook(assembled, _parse(base, _WORKBOOK_PART), titles, print_areas)
     _rebuild_workbook_relationships(
         assembled, _parse(base, _rels_part(_WORKBOOK_PART)), cloned, shared_table is not None
     )

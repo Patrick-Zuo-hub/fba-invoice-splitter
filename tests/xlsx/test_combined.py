@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import zipfile
 from datetime import date
 from pathlib import Path
 
 import pytest
+from lxml import etree
 
 from fis.xlsx import combined
 from fis.xlsx.combined import (
@@ -19,6 +21,7 @@ from fis.xlsx.combined import (
 from fis.xlsx.errors import WorkbookError
 from fis.xlsx.generator import ShipmentOutput, generate_shipment_workbook_bytes
 from fis.xlsx.package import MAX_ENTRY, SafePackage
+from fis.xlsx.template import STANDARD_V1
 from fis.xlsx.validate import ValidationReport
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
@@ -278,3 +281,81 @@ def test_generate_combined_workbook_requires_at_least_one_shipment(tmp_path: Pat
         generate_combined_workbook(source, (), output_dir, "invoice.xlsx")
 
     assert caught.value.code == "INVALID_COMBINED_INPUT"
+
+
+def _with_print_area(source: Path, reference: str) -> None:
+    """Add a workbook-level print area to a built fixture, in place."""
+
+    with zipfile.ZipFile(source) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    workbook = etree.fromstring(parts["xl/workbook.xml"])
+    sheets = workbook.find(f"{{{MAIN_NS}}}sheets")
+    assert sheets is not None
+    defined_names = etree.Element(f"{{{MAIN_NS}}}definedNames")
+    entry = etree.SubElement(defined_names, f"{{{MAIN_NS}}}definedName")
+    entry.set("name", "_xlnm.Print_Area")
+    entry.set("localSheetId", "0")
+    entry.text = f"'{STANDARD_V1.sheet_name}'!{reference}"
+    sheets.addnext(defined_names)
+    parts["xl/workbook.xml"] = etree.tostring(workbook, xml_declaration=True, encoding="UTF-8")
+    with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in parts.items():
+            archive.writestr(name, payload)
+
+
+def _defined_names(path: Path) -> list[tuple[str | None, str | None, str | None]]:
+    with SafePackage.open(path) as package:
+        workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
+    return [
+        (name.get("name"), name.get("localSheetId"), name.text)
+        for name in workbook.xpath(
+            "./main:definedNames/main:definedName", namespaces={"main": MAIN_NS}
+        )
+    ]
+
+
+def test_combined_workbook_rescopes_print_area_to_every_sheet(tmp_path: Path) -> None:
+    source = tmp_path / "invoice.xlsx"
+    build_standard_v1(source, {"S2": 1, "S1": 1}, [12, 13])
+    _with_print_area(source, "$A$1:$H$20")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    requests = (_request("S2", "IAH3"), _request("S1", "ONT8"))
+
+    path = generate_combined_workbook(source, requests, output_dir, "invoice.xlsx")
+
+    assert _defined_names(path) == [
+        ("_xlnm.Print_Area", "0", "'AMAZON-IAH3-S2'!$A$1:$H$19"),
+        ("_xlnm.Print_Area", "1", "'AMAZON-ONT8-S1'!$A$1:$H$19"),
+    ]
+
+
+def test_each_sheet_keeps_its_own_translated_print_area(tmp_path: Path) -> None:
+    """Shipments with different item counts print different row ranges."""
+
+    source = tmp_path / "invoice.xlsx"
+    build_standard_v1(source, {"S1": 1, "S2": 3}, [12])
+    _with_print_area(source, "$A$1:$H$20")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    requests = (_request("S1", "ONT8"), _request("S2", "IAH3"))
+
+    path = generate_combined_workbook(source, requests, output_dir, "invoice.xlsx")
+
+    assert _defined_names(path) == [
+        ("_xlnm.Print_Area", "0", "'AMAZON-ONT8-S1'!$A$1:$H$17"),
+        ("_xlnm.Print_Area", "1", "'AMAZON-IAH3-S2'!$A$1:$H$19"),
+    ]
+
+
+def test_combined_workbook_without_print_area_declares_no_defined_names(tmp_path: Path) -> None:
+    source = tmp_path / "invoice.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    path = generate_combined_workbook(source, (_request("S1", "ONT8"),), output_dir, "invoice.xlsx")
+
+    with SafePackage.open(path) as package:
+        workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
+    assert workbook.xpath("./main:definedNames", namespaces={"main": MAIN_NS}) == []
