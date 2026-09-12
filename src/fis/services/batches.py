@@ -20,7 +20,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fis.domain.rules import default_dates, parse_warehouse_mapping
+from fis.domain.rules import (
+    canonical_amazon_warehouse_code,
+    default_dates,
+    parse_warehouse_mapping,
+)
 from fis.platform.folders import (
     FolderOpener,
     FolderPicker,
@@ -363,7 +367,7 @@ class BatchService:
             if field_name in raw:
                 text = "" if raw[field_name] is None else str(raw[field_name]).strip()
                 if field_name == "warehouse_code":
-                    text = text.upper()
+                    text = canonical_amazon_warehouse_code(text)
                 updates[field_name] = text or None
 
         delivery_changed = False

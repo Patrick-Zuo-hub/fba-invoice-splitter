@@ -15,6 +15,7 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from lxml import etree  # type: ignore[import-untyped]
 
+from fis.domain.rules import canonical_amazon_warehouse_code
 from fis.xlsx.drawings import parse_workbook_drawings_package
 from fis.xlsx.errors import WorkbookError
 from fis.xlsx.package import MAX_ENTRY, SafePackage
@@ -59,6 +60,13 @@ class ShipmentOutput:
     delivery_date: date
     sailing_date: date
     delivery_warehouse: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "warehouse_code",
+            canonical_amazon_warehouse_code(self.warehouse_code),
+        )
 
 
 @dataclass(frozen=True, slots=True)

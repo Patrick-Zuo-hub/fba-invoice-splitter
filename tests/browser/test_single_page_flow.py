@@ -16,7 +16,7 @@ def test_primary_single_page_flow_uses_loopback_only(
     apply_mapping(page, "ONT8\tS1\nIAH3\tS2")
     s1 = page.locator('[data-shipment-row="S1"]')
     s2 = page.locator('[data-shipment-row="S2"]')
-    expect(s1.locator('[data-field="warehouse_code"]')).to_have_value("ONT8")
+    expect(s1.locator('[data-field="warehouse_code"]')).to_have_value("AMAZON-ONT8")
     expect(s1.locator(".address-cell")).to_contain_text("Ontario, CA 91761")
 
     s2.locator("[data-inline-address]").fill("Houston, TX 77032")
@@ -39,8 +39,8 @@ def test_primary_single_page_flow_uses_loopback_only(
     generate.click()
     expect(page.get_by_text("已成功生成 2 份发票")).to_be_visible()
     assert sorted(path.name for path in browser_app.output.glob("*.xlsx")) == [
-        "S1_ONT8.xlsx",
-        "S2_IAH3.xlsx",
+        "S1_AMAZON-ONT8.xlsx",
+        "S2_AMAZON-IAH3.xlsx",
     ]
 
     page.get_by_role("button", name="历史记录").click()

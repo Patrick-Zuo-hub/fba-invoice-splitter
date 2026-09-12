@@ -100,8 +100,8 @@ def test_history_lists_completed_batch_with_output_paths(
 
     assert response.status_code == 200
     assert "invoice.xlsx" in response.text
-    assert "S1_ONT8.xlsx" in response.text
-    assert "S2_ONT8.xlsx" in response.text
+    assert "S1_AMAZON-ONT8.xlsx" in response.text
+    assert "S2_AMAZON-ONT8.xlsx" in response.text
 
 
 def test_history_database_stores_paths_and_no_workbook_blobs(
@@ -124,8 +124,8 @@ def test_history_database_stores_paths_and_no_workbook_blobs(
     assert batch["source_path"].endswith("source.xlsx")
     assert batch["state"] == "completed"
     assert [row["output_path"] for row in shipments] == [
-        str(output_dir / "S1_ONT8.xlsx"),
-        str(output_dir / "S2_ONT8.xlsx"),
+        str(output_dir / "S1_AMAZON-ONT8.xlsx"),
+        str(output_dir / "S2_AMAZON-ONT8.xlsx"),
     ]
     all_columns = list(columns) + list(shipment_columns)
     assert not any(column["type"].upper() == "BLOB" for column in all_columns)

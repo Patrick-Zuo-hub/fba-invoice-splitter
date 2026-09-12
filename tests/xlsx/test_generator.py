@@ -35,7 +35,8 @@ def test_generation_preserves_target_items_and_images(tmp_path: Path) -> None:
 
     output = generate_shipment_workbook(source, _request(), tmp_path / "out")
 
-    assert output.name == "S1_ONT8.xlsx"
+    assert output.name == "S1_AMAZON-ONT8.xlsx"
+    assert _request().warehouse_code == "AMAZON-ONT8"
     report = validate_generated_workbook(output, expected_shipment="S1", expected_rows=2, expected_images=2)
     assert report.ok
 
@@ -208,4 +209,4 @@ def test_batch_failure_cleans_previously_generated_files(tmp_path: Path) -> None
 
     with pytest.raises(WorkbookError):
         generate_shipment_workbooks(source, (_request("S1"), _request("missing")), tmp_path / "batch")
-    assert not (tmp_path / "batch" / "S1_ONT8.xlsx").exists()
+    assert not (tmp_path / "batch" / "S1_AMAZON-ONT8.xlsx").exists()

@@ -1,5 +1,16 @@
 from datetime import date, timedelta
 
+_AMAZON_WAREHOUSE_PREFIX = "AMAZON-"
+
+
+def canonical_amazon_warehouse_code(value: str) -> str:
+    """Normalize short and prefixed warehouse codes to the master-data format."""
+
+    normalized = value.strip().upper()
+    if not normalized or normalized.startswith(_AMAZON_WAREHOUSE_PREFIX):
+        return normalized
+    return f"{_AMAZON_WAREHOUSE_PREFIX}{normalized}"
+
 
 def default_dates(today: date) -> tuple[date, date]:
     days_until_thursday = (3 - today.weekday()) % 7
@@ -28,7 +39,7 @@ def parse_warehouse_mapping(text: str) -> dict[str, str]:
             continue
         if len(columns) != 2 or not all(columns):
             raise ValueError(f"Invalid mapping row {line_number}")
-        code, shipment_id = columns[0].upper(), columns[1]
+        code, shipment_id = canonical_amazon_warehouse_code(columns[0]), columns[1]
         if shipment_id in result and result[shipment_id] != code:
             raise ValueError(f"Conflicting warehouse mapping for {shipment_id}")
         result[shipment_id] = code

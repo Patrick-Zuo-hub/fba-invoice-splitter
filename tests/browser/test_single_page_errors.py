@@ -15,13 +15,13 @@ def test_error_recovery_preserves_valid_row_values(
     apply_mapping(page, "ONT8\tS1")
     expect(page.locator(".mapping-report")).to_contain_text("尚未映射：S2")
     expect(page.locator('[data-shipment-row="S1"] [data-field="warehouse_code"]')).to_have_value(
-        "ONT8"
+        "AMAZON-ONT8"
     )
 
     apply_mapping(page, "ONT8\tS1\nNEW1\tS2")
     s1 = page.locator('[data-shipment-row="S1"]')
     s2 = page.locator('[data-shipment-row="S2"]')
-    expect(s1.locator('[data-field="warehouse_code"]')).to_have_value("ONT8")
+    expect(s1.locator('[data-field="warehouse_code"]')).to_have_value("AMAZON-ONT8")
     expect(s2.locator("[data-inline-address]")).to_be_visible()
     s2.locator("[data-inline-address]").fill("New warehouse test address")
     s2.locator("[data-save-address]").click()
@@ -42,4 +42,4 @@ def test_error_recovery_preserves_valid_row_values(
     )
     assert result["status"] == 422
     expect(s1.locator('[data-field="channel"]')).to_have_value("空运")
-    expect(s1.locator('[data-field="warehouse_code"]')).to_have_value("ONT8")
+    expect(s1.locator('[data-field="warehouse_code"]')).to_have_value("AMAZON-ONT8")

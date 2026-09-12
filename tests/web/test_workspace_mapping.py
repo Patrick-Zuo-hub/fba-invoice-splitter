@@ -71,10 +71,10 @@ def test_paste_mapping_assigns_codes(app: FastAPI, client: TestClient, tmp_path:
         json={"mapping": "ONT8\tS1\nIAH3\tS2"},
     )
     assert response.status_code == 200
-    assert "ONT8" in response.text and "IAH3" in response.text
+    assert "AMAZON-ONT8" in response.text and "AMAZON-IAH3" in response.text
     workspace = _service(app).get(batch_id)
-    assert _service(app).effective_fields(workspace, "S1")["warehouse_code"] == "ONT8"
-    assert _service(app).effective_fields(workspace, "S2")["warehouse_code"] == "IAH3"
+    assert _service(app).effective_fields(workspace, "S1")["warehouse_code"] == "AMAZON-ONT8"
+    assert _service(app).effective_fields(workspace, "S2")["warehouse_code"] == "AMAZON-IAH3"
 
 
 def test_address_auto_derived_and_generation_succeeds(
@@ -96,7 +96,10 @@ def test_address_auto_derived_and_generation_succeeds(
 
     response = client.post(f"/workspace/{batch_id}/generate", headers=mut())
     assert response.status_code == 200
-    assert sorted(p.name for p in output_dir.glob("*.xlsx")) == ["S1_ONT8.xlsx", "S2_IAH3.xlsx"]
+    assert sorted(p.name for p in output_dir.glob("*.xlsx")) == [
+        "S1_AMAZON-ONT8.xlsx",
+        "S2_AMAZON-IAH3.xlsx",
+    ]
 
 
 def test_code_without_master_address_blocks_generation(
@@ -140,7 +143,7 @@ def test_unknown_shipment_in_paste_is_reported(
 ) -> None:
     batch_id = _upload(app, client, tmp_path)
     _workspace, report = _service(app).apply_mapping(batch_id, "ONT8\tS1\nIAH3\tS9")
-    assert report["applied"] == {"S1": "ONT8"}
+    assert report["applied"] == {"S1": "AMAZON-ONT8"}
     assert report["unknown"] == ["S9"]
     assert "S2" in report["unmapped"]
 

@@ -117,7 +117,7 @@ def test_generation_publishes_complete_batch_to_selected_folder(
     assert response.status_code == 200
     assert "已成功生成 2 份发票" in response.text
     produced = sorted(path.name for path in output_dir.glob("*.xlsx"))
-    assert produced == ["S1_ONT8.xlsx", "S2_ONT8.xlsx"]
+    assert produced == ["S1_AMAZON-ONT8.xlsx", "S2_AMAZON-ONT8.xlsx"]
 
 
 def test_generation_without_output_folder_is_blocked(
@@ -150,14 +150,14 @@ def test_filename_collision_blocks_and_keeps_existing_file(
     app: FastAPI, client: TestClient, tmp_path: Path, folder_picker: FakeFolderPicker
 ) -> None:
     batch_id, output_dir = _ready_batch(app, client, tmp_path, folder_picker, count=2)
-    existing = output_dir / "S1_ONT8.xlsx"
+    existing = output_dir / "S1_AMAZON-ONT8.xlsx"
     existing.write_bytes(b"existing-user-file")
 
     response = client.post(f"/workspace/{batch_id}/generate", headers=mutation_headers())
 
     assert response.status_code == 422
     assert existing.read_bytes() == b"existing-user-file"
-    assert not (output_dir / "S2_ONT8.xlsx").exists()
+    assert not (output_dir / "S2_AMAZON-ONT8.xlsx").exists()
 
 
 def test_engine_failure_publishes_no_files(

@@ -265,10 +265,10 @@ def test_warehouse_code_is_normalized_for_successful_channel_lookup(
     assert repository.get_recent_channel("LaX9") == ChannelRecord(channel_id, "Ocean Express")
     with closing(database.connect()) as connection:
         warehouse = connection.execute(
-            "SELECT code, address FROM fba_warehouses WHERE code = ?", ("LAX9",)
+            "SELECT code, address FROM fba_warehouses WHERE code = ?", ("AMAZON-LAX9",)
         ).fetchone()
     assert warehouse is not None
-    assert tuple(warehouse) == ("LAX9", "123 Harbor Road")
+    assert tuple(warehouse) == ("AMAZON-LAX9", "123 Harbor Road")
 
 
 def test_no_recent_channel_before_explicit_success_record(database: Database) -> None:
@@ -288,7 +288,7 @@ def test_duplicate_warehouse_does_not_overwrite_address(database: Database) -> N
 
     with closing(database.connect()) as connection:
         address = connection.execute(
-            "SELECT address FROM fba_warehouses WHERE code = ?", ("LAX9",)
+            "SELECT address FROM fba_warehouses WHERE code = ?", ("AMAZON-LAX9",)
         ).fetchone()
     assert address is not None
     assert address["address"] == "Original address"

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from fis.domain.models import BatchState
+from fis.domain.rules import canonical_amazon_warehouse_code
 from fis.storage.database import Database
 
 
@@ -357,7 +358,7 @@ class MasterDataRepository:
         return channel_id
 
     def create_fba_warehouse(self, code: str, address: str) -> None:
-        normalized_code = code.strip().upper()
+        normalized_code = canonical_amazon_warehouse_code(code)
         normalized_address = address.strip()
         if not normalized_code:
             raise ValueError("warehouse code must not be blank")
@@ -374,7 +375,7 @@ class MasterDataRepository:
             )
 
     def record_successful_channel(self, code: str, channel_id: int) -> None:
-        normalized_code = code.strip().upper()
+        normalized_code = canonical_amazon_warehouse_code(code)
         with self._database.transaction() as connection:
             cursor = connection.execute(
                 """
@@ -388,7 +389,7 @@ class MasterDataRepository:
                 raise KeyError(normalized_code)
 
     def get_recent_channel(self, code: str) -> ChannelRecord | None:
-        normalized_code = code.strip().upper()
+        normalized_code = canonical_amazon_warehouse_code(code)
         connection = self._database.connect()
         try:
             row = connection.execute(
@@ -605,7 +606,7 @@ class MasterDataRepository:
         ]
 
     def get_fba_warehouse(self, code: str) -> MasterFbaWarehouse | None:
-        normalized_code = code.strip().upper()
+        normalized_code = canonical_amazon_warehouse_code(code)
         connection = self._database.connect()
         try:
             row = connection.execute(
@@ -623,7 +624,7 @@ class MasterDataRepository:
     def update_fba_warehouse(
         self, code: str, *, name: str | None = None, address: str | None = None
     ) -> None:
-        normalized_code = code.strip().upper()
+        normalized_code = canonical_amazon_warehouse_code(code)
         assignments: list[str] = []
         params: list[object] = []
         if name is not None:
@@ -649,7 +650,7 @@ class MasterDataRepository:
                 raise KeyError(normalized_code)
 
     def set_fba_warehouse_active(self, code: str, active: bool) -> None:
-        normalized_code = code.strip().upper()
+        normalized_code = canonical_amazon_warehouse_code(code)
         with self._database.transaction() as connection:
             cursor = connection.execute(
                 "UPDATE fba_warehouses SET status = ?, updated_at = ? WHERE code = ?",
