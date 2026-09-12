@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
@@ -399,3 +399,132 @@ def _anchor_signature(anchor: Anchor) -> tuple[int, int, int, int, int, int, int
         anchor.to_row_off,
         anchor.to_col_off,
     )
+
+
+_REL_ID_ATTRIBUTE = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def _is_total_label(text: str) -> bool:
+    return "".join(text.split()).casefold() == "合计total".casefold()
+
+
+def _validate_combined_shipment(
+    root: etree._Element, shared_strings: tuple[str, ...], shipment_id: str
+) -> None:
+    """Every product row on one sheet must belong to that sheet's Shipment."""
+
+    found = False
+    for row in root.xpath("./main:sheetData/main:row", namespaces={"main": MAIN_NS}):
+        try:
+            number = int(row.get("r") or "0")
+        except ValueError:
+            continue
+        if number < STANDARD_V1.product_start_row:
+            continue
+        cells = [
+            item
+            for item in row
+            if item.tag == f"{{{MAIN_NS}}}c" and item.get("r") == f"A{number}"
+        ]
+        if not cells:
+            continue
+        text = _cell_text(cells[0], shared_strings).strip()
+        if not text:
+            continue
+        if _is_total_label(text):
+            break
+        if text != shipment_id:
+            raise WorkbookError(
+                "COMBINED_SHIPMENT_MISMATCH", "合并工作表包含其他货件的商品行", f"A{number}"
+            )
+        found = True
+    if not found:
+        raise WorkbookError("COMBINED_SHIPMENT_MISMATCH", "合并工作表缺少货件商品行", shipment_id)
+
+
+def _validate_combined_relationships(package: SafePackage, part: str) -> None:
+    """Every internal relationship reachable from one sheet must be readable."""
+
+    relation_part = str(PurePosixPath(part).parent / "_rels" / f"{PurePosixPath(part).name}.rels")
+    if relation_part not in package.names:
+        return
+    relations = package.read_xml(relation_part, MAX_ENTRY)
+    for relation in relations.findall(f"{{{_PACKAGE_REL_NS}}}Relationship"):
+        if (relation.get("TargetMode") or "Internal") == "External":
+            continue
+        target = package.resolve_relationship_target(part, relation.get("Target") or "")
+        package.read(target, MAX_ENTRY)
+        _validate_combined_relationships(package, target)
+
+
+def _validate_combined_print_areas(workbook: etree._Element, titles: Sequence[str]) -> None:
+    entries = [
+        name
+        for name in workbook.xpath(
+            "./main:definedNames/main:definedName", namespaces={"main": MAIN_NS}
+        )
+        if name.get("name") == "_xlnm.Print_Area"
+    ]
+    if not entries:
+        return
+    if len(entries) != len(titles):
+        raise WorkbookError("COMBINED_PRINT_AREA_MISMATCH", "合并工作簿打印区域数量不正确", "definedNames")
+    for position, (entry, title) in enumerate(zip(entries, titles, strict=True)):
+        if entry.get("localSheetId") != str(position):
+            raise WorkbookError(
+                "COMBINED_PRINT_AREA_MISMATCH", "合并工作簿打印区域作用域不正确", title
+            )
+        if not (entry.text or "").startswith(f"'{title}'!"):
+            raise WorkbookError(
+                "COMBINED_PRINT_AREA_MISMATCH", "合并工作簿打印区域引用不正确", title
+            )
+
+
+def validate_combined_workbook(
+    path: Path | str,
+    *,
+    titles: Sequence[str],
+    expectations: Sequence[tuple[str, Mapping[str, str]]],
+) -> ValidationReport:
+    """Verify an assembled multi-Shipment workbook as one coherent package.
+
+    Per-Shipment fidelity is already guaranteed by the single-Shipment
+    validator, so this checks only what assembly can break: worksheet order and
+    titles, Shipment ownership, logistics values, relationship resolution, and
+    print-area scoping.
+    """
+
+    try:
+        if len(titles) != len(expectations):
+            raise WorkbookError("COMBINED_VALIDATION_FAILED", "合并工作簿校验输入不一致")
+        with SafePackage.open(path) as package:
+            workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
+            sheets = workbook.xpath("./main:sheets/main:sheet", namespaces={"main": MAIN_NS})
+            actual = [sheet.get("name") or "" for sheet in sheets]
+            if actual != list(titles):
+                raise WorkbookError(
+                    "COMBINED_SHEET_MISMATCH", "合并工作簿工作表顺序或名称不正确", ",".join(actual)
+                )
+            relations = {
+                relation.get("Id"): relation.get("Target") or ""
+                for relation in package.read_xml("xl/_rels/workbook.xml.rels", MAX_ENTRY)
+            }
+            shared_strings = _shared_strings(package)
+            for sheet, (shipment_id, values) in zip(sheets, expectations, strict=True):
+                target = relations.get(sheet.get(_REL_ID_ATTRIBUTE) or "")
+                if not target:
+                    raise WorkbookError(
+                        "COMBINED_SHEET_MISMATCH", "合并工作表关系缺失", sheet.get("name")
+                    )
+                worksheet_part = package.resolve_relationship_target("xl/workbook.xml", target)
+                root = package.read_xml(worksheet_part, MAX_ENTRY)
+                _validate_combined_relationships(package, worksheet_part)
+                _validate_values(root, values, shared_strings)
+                _validate_combined_shipment(root, shared_strings, shipment_id)
+            _validate_combined_print_areas(workbook, titles)
+        return ValidationReport(ok=True)
+    except WorkbookError as exc:
+        return ValidationReport(ok=False, error=exc.message, location=exc.location)
+    except (OSError, ValueError, etree.XMLSyntaxError):
+        return ValidationReport(ok=False, error="合并工作簿结构校验失败", location=str(path))

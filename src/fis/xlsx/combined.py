@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import posixpath
 import re
+import tempfile
 from collections.abc import Sequence
 from io import BytesIO
 from pathlib import Path
@@ -12,8 +14,14 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 from lxml import etree  # type: ignore[import-untyped]
 
 from fis.xlsx.errors import WorkbookError
-from fis.xlsx.generator import ShipmentOutput
+from fis.xlsx.generator import (
+    ShipmentOutput,
+    generate_shipment_workbook_bytes,
+    request_values,
+)
+from fis.xlsx.package import MAX_ENTRY, SafePackage
 from fis.xlsx.template import STANDARD_V1
+from fis.xlsx.validate import validate_combined_workbook
 
 _FORBIDDEN_SHEET_CHARACTERS = re.compile(r"[\[\]:*?/\\]")
 _MAX_SHEET_TITLE = 31
@@ -465,9 +473,74 @@ def assemble_combined_workbook(payloads: Sequence[bytes], titles: Sequence[str])
     return _write_package(assembled)
 
 
+def combined_sheet_names(path: Path | str) -> tuple[str, ...]:
+    """Return the visible worksheet titles of a combined workbook, in order."""
+
+    with SafePackage.open(path) as package:
+        workbook = package.read_xml(_WORKBOOK_PART, MAX_ENTRY)
+        sheets = workbook.xpath("./main:sheets/main:sheet", namespaces={"main": MAIN_NS})
+        return tuple(str(sheet.get("name") or "") for sheet in sheets)
+
+
+def _validate_and_publish(
+    payload: bytes,
+    output_path: Path,
+    requests: Sequence[ShipmentOutput],
+    titles: Sequence[str],
+) -> Path:
+    """Write, validate and only then atomically publish the combined workbook."""
+
+    handle = tempfile.NamedTemporaryFile(  # noqa: SIM115 - closed by the with block below
+        dir=output_path.parent, prefix=".fis-combined-", suffix=".xlsx", delete=False
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        report = validate_combined_workbook(
+            temporary,
+            titles=tuple(titles),
+            expectations=tuple((request.shipment_id, request_values(request)) for request in requests),
+        )
+        if not report.ok:
+            raise _combined_error(
+                "COMBINED_VALIDATION_FAILED", report.error or "合并工作簿校验失败", report.location
+            )
+        os.replace(temporary, output_path)
+        return output_path
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def generate_combined_workbook(
+    source: Path | str,
+    requests: Sequence[ShipmentOutput],
+    output_dir: Path | str,
+    source_filename: str,
+) -> Path:
+    """Generate every Shipment and publish them as one validated workbook."""
+
+    if not requests:
+        raise _combined_error("INVALID_COMBINED_INPUT", "没有可生成的货件")
+    destination = Path(output_dir)
+    if not destination.is_dir():
+        raise _combined_error("OUTPUT_PATH_INVALID", "输出目录路径不是目录", str(destination))
+    titles = worksheet_titles(requests)
+    payloads = tuple(generate_shipment_workbook_bytes(source, request) for request in requests)
+    payload = assemble_combined_workbook(payloads, titles)
+    return _validate_and_publish(payload, next_output_path(destination, source_filename), requests, titles)
+
+
 __all__ = [
     "assemble_combined_workbook",
     "combined_filename",
+    "combined_sheet_names",
+    "generate_combined_workbook",
     "next_output_path",
     "worksheet_titles",
 ]

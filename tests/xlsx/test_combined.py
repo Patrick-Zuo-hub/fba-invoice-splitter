@@ -5,17 +5,21 @@ from pathlib import Path
 
 import pytest
 
+from fis.xlsx import combined
 from fis.xlsx.combined import (
     _merge_shared_strings,
     _remap_shared_string_indices,
     assemble_combined_workbook,
     combined_filename,
+    combined_sheet_names,
+    generate_combined_workbook,
     next_output_path,
     worksheet_titles,
 )
 from fis.xlsx.errors import WorkbookError
 from fis.xlsx.generator import ShipmentOutput, generate_shipment_workbook_bytes
 from fis.xlsx.package import MAX_ENTRY, SafePackage
+from fis.xlsx.validate import ValidationReport
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -201,3 +205,72 @@ def test_remap_rewrites_only_shared_string_cells() -> None:
     assert b'<c r="A1" t="s"><v>7</v></c>' in remapped
     assert b'<c r="B1"><v>1</v></c>' in remapped
     assert "原文".encode() in remapped
+
+
+def test_generate_combined_workbook_publishes_once_and_preserves_order(tmp_path: Path) -> None:
+    source = tmp_path / "invoice.xlsx"
+    build_standard_v1(source, {"S2": 1, "S1": 1}, [12, 13])
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    requests = (_request("S2", "IAH3"), _request("S1", "ONT8"))
+
+    path = generate_combined_workbook(source, requests, output_dir, "invoice.xlsx")
+
+    assert path.name == "已处理_invoice.xlsx"
+    assert combined_sheet_names(path) == ("IAH3-S2", "ONT8-S1")
+    assert [child.name for child in output_dir.iterdir()] == ["已处理_invoice.xlsx"]
+
+
+def test_generate_combined_workbook_uses_suffix_without_overwrite(tmp_path: Path) -> None:
+    source = tmp_path / "invoice.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    existing = output_dir / "已处理_invoice.xlsx"
+    existing.write_bytes(b"old")
+
+    result = generate_combined_workbook(
+        source, (_request("S1", "ONT8"),), output_dir, "invoice.xlsx"
+    )
+
+    assert result.name == "已处理_invoice_2.xlsx"
+    assert existing.read_bytes() == b"old"
+
+
+def test_failed_combined_validation_leaves_no_new_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "invoice.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    monkeypatch.setattr(
+        combined, "validate_combined_workbook", lambda *args, **kwargs: ValidationReport(False, "bad")
+    )
+
+    with pytest.raises(WorkbookError, match="bad"):
+        generate_combined_workbook(source, (_request("S1", "ONT8"),), output_dir, "invoice.xlsx")
+
+    assert list(output_dir.iterdir()) == []
+
+
+def test_generate_combined_workbook_rejects_missing_output_directory(tmp_path: Path) -> None:
+    source = tmp_path / "invoice.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+
+    with pytest.raises(WorkbookError) as caught:
+        generate_combined_workbook(source, (_request("S1", "ONT8"),), tmp_path / "missing", "invoice.xlsx")
+
+    assert caught.value.code == "OUTPUT_PATH_INVALID"
+
+
+def test_generate_combined_workbook_requires_at_least_one_shipment(tmp_path: Path) -> None:
+    source = tmp_path / "invoice.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    with pytest.raises(WorkbookError) as caught:
+        generate_combined_workbook(source, (), output_dir, "invoice.xlsx")
+
+    assert caught.value.code == "INVALID_COMBINED_INPUT"

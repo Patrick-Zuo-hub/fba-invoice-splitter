@@ -204,6 +204,12 @@ def _same_path(source: Path, output: Path) -> bool:
         return source.absolute() == output.absolute()
 
 
+def request_values(request: ShipmentOutput) -> dict[str, str]:
+    """Public view of the logistics values written into a generated workbook."""
+
+    return _request_values(request)
+
+
 def _request_values(request: ShipmentOutput) -> dict[str, str]:
     return {
         "warehouse_code": request.warehouse_code,
