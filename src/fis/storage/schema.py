@@ -82,4 +82,10 @@ CREATE TABLE app_defaults (
 );
 """
 
-__all__ = ["SCHEMA_V1"]
+SCHEMA_VERSION = 2
+
+MIGRATIONS: dict[int, tuple[str, ...]] = {
+    1: ("ALTER TABLE processing_batches ADD COLUMN output_path TEXT",),
+}
+
+__all__ = ["MIGRATIONS", "SCHEMA_V1", "SCHEMA_VERSION"]

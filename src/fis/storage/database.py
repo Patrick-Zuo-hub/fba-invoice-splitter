@@ -3,7 +3,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from fis.storage.schema import SCHEMA_V1
+from fis.storage.schema import MIGRATIONS, SCHEMA_V1, SCHEMA_VERSION
 
 
 def _iter_sql_statements(script: str) -> Iterator[str]:
@@ -41,18 +41,29 @@ class Database:
             if not exists:
                 for statement in _iter_sql_statements(SCHEMA_V1):
                     connection.execute(statement)
-            else:
-                version_rows = connection.execute("SELECT version FROM schema_version").fetchall()
-                if len(version_rows) != 1 or version_rows[0]["version"] != 1:
-                    raise RuntimeError(
-                        "schema_version must contain exactly one row with supported version 1"
-                    )
+            self._migrate(connection)
             connection.commit()
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        version_rows = connection.execute("SELECT version FROM schema_version").fetchall()
+        if len(version_rows) != 1:
+            raise RuntimeError("schema_version must contain exactly one row")
+        version = int(version_rows[0]["version"])
+        if version < 1 or version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"schema_version {version} is not supported by this build "
+                f"(expected 1 to {SCHEMA_VERSION})"
+            )
+        while version < SCHEMA_VERSION:
+            for statement in MIGRATIONS[version]:
+                connection.execute(statement)
+            version += 1
+            connection.execute("UPDATE schema_version SET version = ?", (version,))
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

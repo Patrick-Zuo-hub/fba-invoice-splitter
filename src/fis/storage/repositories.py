@@ -34,6 +34,7 @@ class HistoryEntry:
     error_code: str | None
     shipments: tuple[ShipmentHistory, ...]
     output_directory: str | None
+    output_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -189,9 +190,10 @@ class BatchRepository:
         filename: str,
         sha256: str,
         source_path: str,
+        output_path: str,
         shipment_count: int,
         item_count: int,
-        shipments: list[tuple[str, str, str]],
+        shipments: list[tuple[str, str]],
         now: datetime,
     ) -> None:
         timestamp = _timestamp(now)
@@ -201,9 +203,9 @@ class BatchRepository:
                 """
                 INSERT INTO processing_batches(
                     id, source_filename, source_sha256, template_type, template_version,
-                    state, shipment_count, item_count, source_path,
+                    state, shipment_count, item_count, source_path, output_path,
                     created_at, updated_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     batch_id,
@@ -215,18 +217,19 @@ class BatchRepository:
                     shipment_count,
                     item_count,
                     source_path,
+                    output_path,
                     timestamp,
                     timestamp,
                     timestamp,
                 ),
             )
-            for shipment_id, snapshot_json, output_path in shipments:
+            for shipment_id, snapshot_json in shipments:
                 connection.execute(
                     """
-                    INSERT INTO shipments(batch_id, shipment_id, snapshot_json, sailing_manual, output_path)
-                    VALUES (?, ?, ?, 0, ?)
+                    INSERT INTO shipments(batch_id, shipment_id, snapshot_json, sailing_manual)
+                    VALUES (?, ?, ?, 0)
                     """,
-                    (batch_id, shipment_id, snapshot_json, output_path),
+                    (batch_id, shipment_id, snapshot_json),
                 )
 
     def record_failed(
@@ -274,7 +277,7 @@ class BatchRepository:
         try:
             batch_rows = connection.execute(
                 """
-                SELECT id, source_filename, state, completed_at, error_code
+                SELECT id, source_filename, state, completed_at, error_code, output_path
                 FROM processing_batches
                 WHERE state IN (?, ?)
                 ORDER BY COALESCE(completed_at, updated_at) DESC, rowid DESC
@@ -296,11 +299,15 @@ class BatchRepository:
                     ShipmentHistory(row["shipment_id"], row["output_path"] or "")
                     for row in shipment_rows
                 )
+                batch_output = batch["output_path"] or None
                 directory: str | None = None
-                for row in shipment_rows:
-                    if row["output_path"]:
-                        directory = os.path.dirname(row["output_path"])
-                        break
+                if batch_output:
+                    directory = os.path.dirname(batch_output)
+                else:
+                    for row in shipment_rows:
+                        if row["output_path"]:
+                            directory = os.path.dirname(row["output_path"])
+                            break
                 entries.append(
                     HistoryEntry(
                         id=batch["id"],
@@ -310,6 +317,7 @@ class BatchRepository:
                         error_code=batch["error_code"],
                         shipments=shipments,
                         output_directory=directory,
+                        output_path=batch_output,
                     )
                 )
             return entries
@@ -321,12 +329,20 @@ class BatchRepository:
         try:
             row = connection.execute(
                 """
-                SELECT output_path FROM shipments
-                WHERE batch_id = ? AND output_path IS NOT NULL
-                LIMIT 1
+                SELECT output_path FROM processing_batches
+                WHERE id = ? AND output_path IS NOT NULL
                 """,
                 (batch_id,),
             ).fetchone()
+            if row is None or not row["output_path"]:
+                row = connection.execute(
+                    """
+                    SELECT output_path FROM shipments
+                    WHERE batch_id = ? AND output_path IS NOT NULL
+                    LIMIT 1
+                    """,
+                    (batch_id,),
+                ).fetchone()
         finally:
             connection.close()
         if row is None or not row["output_path"]:

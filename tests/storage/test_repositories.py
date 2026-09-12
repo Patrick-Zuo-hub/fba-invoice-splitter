@@ -358,3 +358,77 @@ def test_repository_read_connections_are_closed(database: Database) -> None:
     for connection in captured:
         with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
             connection.execute("SELECT 1")
+
+
+def test_record_completed_stores_one_batch_level_output_path(database: Database) -> None:
+    repository = BatchRepository(database)
+    now = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    create_batch(repository, "batch-1", now)
+
+    repository.record_completed(
+        batch_id="batch-1",
+        filename="invoice.xlsx",
+        sha256="a" * 64,
+        source_path="batches/batch-1/source.xlsx",
+        output_path="/out/已处理_invoice.xlsx",
+        shipment_count=2,
+        item_count=4,
+        shipments=[("S2", "{}"), ("S1", "{}")],
+        now=now,
+    )
+
+    with closing(database.connect()) as connection:
+        batch = connection.execute(
+            "SELECT output_path FROM processing_batches WHERE id = ?", ("batch-1",)
+        ).fetchone()
+        shipment_paths = connection.execute(
+            "SELECT output_path FROM shipments WHERE batch_id = ?", ("batch-1",)
+        ).fetchall()
+    assert batch["output_path"] == "/out/已处理_invoice.xlsx"
+    assert [row["output_path"] for row in shipment_paths] == [None, None]
+
+
+def test_history_entry_exposes_batch_output_path_and_directory(database: Database) -> None:
+    repository = BatchRepository(database)
+    now = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    create_batch(repository, "batch-1", now)
+
+    repository.record_completed(
+        batch_id="batch-1",
+        filename="invoice.xlsx",
+        sha256="a" * 64,
+        source_path="batches/batch-1/source.xlsx",
+        output_path="/out/已处理_invoice.xlsx",
+        shipment_count=1,
+        item_count=2,
+        shipments=[("S1", "{}")],
+        now=now,
+    )
+
+    entry = repository.list_history_entries()[0]
+
+    assert entry.output_path == "/out/已处理_invoice.xlsx"
+    assert entry.output_directory == "/out"
+    assert repository.output_directory("batch-1") == "/out"
+
+
+def test_legacy_shipment_output_paths_still_render_in_history(database: Database) -> None:
+    repository = BatchRepository(database)
+    now = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    create_batch(repository, "batch-1", now)
+    repository.set_state("batch-1", BatchState.COMPLETED, now)
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO shipments(batch_id, shipment_id, snapshot_json, output_path)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("batch-1", "S1", "{}", "/legacy/S1_AMAZON-ONT8.xlsx"),
+        )
+
+    entry = repository.list_history_entries()[0]
+
+    assert entry.output_path is None
+    assert entry.shipments[0].output_path == "/legacy/S1_AMAZON-ONT8.xlsx"
+    assert entry.output_directory == "/legacy"
+    assert repository.output_directory("batch-1") == "/legacy"

@@ -27,7 +27,7 @@ def test_initialize_creates_parent_directory_and_schema_version(tmp_path: Path) 
 
     assert database_path.parent.is_dir()
     with closing(sqlite3.connect(database_path)) as connection:
-        assert connection.execute("SELECT version FROM schema_version").fetchall() == [(1,)]
+        assert connection.execute("SELECT version FROM schema_version").fetchall() == [(2,)]
 
 
 def test_initialize_creates_required_tables(tmp_path: Path) -> None:
@@ -53,7 +53,7 @@ def test_initialize_is_idempotent(tmp_path: Path) -> None:
     database.initialize()
 
     with closing(sqlite3.connect(database_path)) as connection:
-        assert connection.execute("SELECT version FROM schema_version").fetchall() == [(1,)]
+        assert connection.execute("SELECT version FROM schema_version").fetchall() == [(2,)]
 
 
 def test_initialize_rolls_back_partial_schema_and_allows_clean_retry(
@@ -93,7 +93,7 @@ def test_initialize_rolls_back_partial_schema_and_allows_clean_retry(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert version_rows == [(1,)]
+    assert version_rows == [(2,)]
     assert EXPECTED_TABLES <= table_names
 
 
@@ -136,22 +136,24 @@ def test_concurrent_initialize_calls_both_succeed(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert version_rows == [(1,)]
+    assert version_rows == [(2,)]
     assert EXPECTED_TABLES <= table_names
 
 
 @pytest.mark.parametrize(
-    "versions",
+    ("versions", "message"),
     [
-        [],
-        [1, 1],
-        [2],
+        ([], r"schema_version must contain exactly one row"),
+        ([1, 1], r"schema_version must contain exactly one row"),
+        ([3], r"schema_version 3 is not supported"),
+        ([0], r"schema_version 0 is not supported"),
     ],
-    ids=["empty", "multiple-rows", "unsupported-version"],
+    ids=["empty", "multiple-rows", "future-version", "invalid-version"],
 )
 def test_initialize_rejects_invalid_schema_version_state(
     tmp_path: Path,
     versions: list[int],
+    message: str,
 ) -> None:
     database_path = tmp_path / "fis.db"
     with closing(sqlite3.connect(database_path)) as connection:
@@ -162,7 +164,7 @@ def test_initialize_rejects_invalid_schema_version_state(
         )
         connection.commit()
 
-    with pytest.raises(RuntimeError, match=r"schema_version.*exactly one row.*version 1"):
+    with pytest.raises(RuntimeError, match=message):
         Database(database_path).initialize()
 
 
@@ -307,3 +309,55 @@ def test_transaction_closes_its_connection(tmp_path: Path) -> None:
     assert transaction_connection is not None
     with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
         transaction_connection.execute("SELECT 1")
+
+
+def test_initialize_migrates_schema_v1_to_v2(tmp_path: Path) -> None:
+    database_path = tmp_path / "fis.db"
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executescript(database_module.SCHEMA_V1)
+        connection.execute(
+            """
+            INSERT INTO processing_batches(
+                id, source_filename, source_sha256, template_type, template_version,
+                state, source_path, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-batch",
+                "source.xlsx",
+                "a" * 64,
+                "fba-customs-standard",
+                "v1",
+                "completed",
+                "batches/legacy-batch/source.xlsx",
+                "2026-09-07T10:00:00Z",
+                "2026-09-07T10:00:00Z",
+            ),
+        )
+        connection.commit()
+
+    Database(database_path).initialize()
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchall() == [(2,)]
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(processing_batches)").fetchall()
+        }
+        preserved = connection.execute(
+            "SELECT id, output_path FROM processing_batches"
+        ).fetchall()
+    assert "output_path" in columns
+    assert preserved == [("legacy-batch", None)]
+
+
+def test_fresh_initialize_reports_current_schema_version(tmp_path: Path) -> None:
+    database_path = tmp_path / "fis.db"
+
+    Database(database_path).initialize()
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        assert connection.execute("SELECT version FROM schema_version").fetchall() == [(2,)]
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(processing_batches)").fetchall()
+        }
+    assert "output_path" in columns
