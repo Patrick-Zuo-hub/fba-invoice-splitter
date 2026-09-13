@@ -9,14 +9,15 @@ import os
 import re
 import secrets
 import stat
+import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
-from typing import Final, Protocol, Self, cast
+from typing import Any, Final, Protocol, Self, cast
 from urllib.request import ProxyHandler, build_opener
 
-if os.name != "nt":
+if sys.platform != "win32":
     import fcntl
 
 MAX_RECORD_BYTES: Final = 4096
@@ -159,7 +160,7 @@ class _PosixRuntimeDirectory:
         create: bool,
     ) -> _PosixRuntimeDirectory:
         required = ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
-        if os.name == "nt" or any(not hasattr(os, name) for name in required):
+        if sys.platform == "win32" or any(not hasattr(os, name) for name in required):
             raise StartupError("当前平台无法证明运行目录句柄安全，已拒绝启动")
         absolute = Path(os.path.abspath(runtime_dir))
         if absolute.parent == absolute:
@@ -208,19 +209,19 @@ class _PosixRuntimeDirectory:
         details = os.fstat(self._directory_fd)
         if (
             not stat.S_ISDIR(details.st_mode)
-            or details.st_uid != os.getuid()
+            or details.st_uid != os.getuid()  # type: ignore[attr-defined, unused-ignore]
             or details.st_nlink < 1
         ):
             raise StartupError("运行目录所有者不可信")
         try:
-            os.fchmod(self._directory_fd, 0o700)
+            os.fchmod(self._directory_fd, 0o700)  # type: ignore[attr-defined, unused-ignore]
         except OSError as exc:
             raise StartupError("无法收紧运行目录权限") from exc
         secured = os.fstat(self._directory_fd)
         if (
             not stat.S_ISDIR(secured.st_mode)
             or stat.S_IMODE(secured.st_mode) != 0o700
-            or secured.st_uid != os.getuid()
+            or secured.st_uid != os.getuid()  # type: ignore[attr-defined, unused-ignore]
             or secured.st_nlink < 1
         ):
             raise StartupError("运行目录权限不是当前用户专用")
@@ -243,8 +244,8 @@ class _PosixRuntimeDirectory:
         ):
             raise StartupError("运行目录已被替换")
         if (
-            opened.st_uid != os.getuid()
-            or named.st_uid != os.getuid()
+            opened.st_uid != os.getuid()  # type: ignore[attr-defined, unused-ignore]
+            or named.st_uid != os.getuid()  # type: ignore[attr-defined, unused-ignore]
             or stat.S_IMODE(opened.st_mode) != 0o700
             or stat.S_IMODE(named.st_mode) != 0o700
             or opened.st_nlink < 1
@@ -263,7 +264,7 @@ class _PosixRuntimeDirectory:
         if hook_stage is not None:
             self._hook(hook_stage)
         self.verify_identity()
-        secure_flags = flags | os.O_NOFOLLOW | os.O_CLOEXEC
+        secure_flags = flags | os.O_NOFOLLOW | os.O_CLOEXEC  # type: ignore[attr-defined, unused-ignore]
         try:
             descriptor = os.open(name, secure_flags, 0o600, dir_fd=self._directory_fd)
         except OSError as exc:
@@ -274,12 +275,12 @@ class _PosixRuntimeDirectory:
             details = os.fstat(descriptor)
             if not stat.S_ISREG(details.st_mode):
                 raise _UnsafeInstanceFile(f"{label} must be a regular file")
-            if details.st_uid != os.getuid():
+            if details.st_uid != os.getuid():  # type: ignore[attr-defined, unused-ignore]
                 raise _UnsafeInstanceFile(f"{label} has an unexpected owner")
             if details.st_nlink != 1:
                 raise _UnsafeInstanceFile(f"{label} must not be a hard link")
             try:
-                os.fchmod(descriptor, 0o600)
+                os.fchmod(descriptor, 0o600)  # type: ignore[attr-defined, unused-ignore]
             except OSError as exc:
                 raise StartupError(f"无法收紧{label}权限") from exc
             secured = os.fstat(descriptor)
@@ -438,14 +439,14 @@ class _PosixRuntimeDirectory:
     @staticmethod
     def lock(handle: int) -> bool:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[name-defined, unused-ignore]
         except BlockingIOError:
             return False
         return True
 
     @staticmethod
     def unlock(handle: int) -> None:
-        fcntl.flock(handle, fcntl.LOCK_UN)
+        fcntl.flock(handle, fcntl.LOCK_UN)  # type: ignore[name-defined, unused-ignore]
 
     @staticmethod
     def close_lock(handle: int) -> None:
@@ -806,8 +807,16 @@ class _CtypesWindowsApi:
     _DACL_SECURITY_INFORMATION = 0x4
     _SDDL_REVISION_1 = 1
 
+    # Declared, not inferred: on a non-Windows platform mypy proves the guard
+    # in __init__ always raises, so the assignments below it are unreachable
+    # and these attributes would have no type at all.
+    _kernel32: Any
+    _advapi32: Any
+    _security_descriptor: ctypes.c_void_p
+    _expected_sddl: str
+
     def __init__(self) -> None:
-        if os.name != "nt" or not hasattr(ctypes, "WinDLL"):
+        if sys.platform != "win32" or not hasattr(ctypes, "WinDLL"):
             raise StartupError("Windows 安全 API 不可用，已拒绝启动")
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -921,8 +930,8 @@ class _CtypesWindowsApi:
 
     @staticmethod
     def _error(context: str, code: int | None = None) -> OSError:
-        number = ctypes.get_last_error() if code is None else code  # type: ignore[attr-defined]
-        error = cast(OSError, ctypes.WinError(number))  # type: ignore[attr-defined]
+        number = ctypes.get_last_error() if code is None else code  # type: ignore[attr-defined, unused-ignore]
+        error = cast(OSError, ctypes.WinError(number))  # type: ignore[attr-defined, redundant-cast, unused-ignore]
         error.args = (number, f"{context}: {error.strerror}")
         return error
 
@@ -1062,7 +1071,7 @@ class _CtypesWindowsApi:
                 self._kernel32.CreateDirectoryW(self._long_path(current), ctypes.byref(attributes))
             )
             if not created:
-                code = ctypes.get_last_error()  # type: ignore[attr-defined]
+                code = ctypes.get_last_error()  # type: ignore[attr-defined, unused-ignore]
                 if code != self._ERROR_ALREADY_EXISTS:
                     raise self._error(f"CreateDirectoryW failed for {current}", code)
             handle, info = self.open_directory(current)
@@ -1089,7 +1098,7 @@ class _CtypesWindowsApi:
         flags = self._FILE_FLAG_OPEN_REPARSE_POINT
         if directory:
             flags |= self._FILE_FLAG_BACKUP_SEMANTICS
-        ctypes.set_last_error(0)  # type: ignore[attr-defined]
+        ctypes.set_last_error(0)  # type: ignore[attr-defined, unused-ignore]
         share_mode = self._FILE_SHARE_READ | self._FILE_SHARE_WRITE
         if share_delete:
             share_mode |= self._FILE_SHARE_DELETE
@@ -1104,7 +1113,7 @@ class _CtypesWindowsApi:
         )
         handle = self._value(raw_handle)
         if handle in {-1, self._INVALID_HANDLE_VALUE}:
-            code = ctypes.get_last_error()  # type: ignore[attr-defined]
+            code = ctypes.get_last_error()  # type: ignore[attr-defined, unused-ignore]
             if code in {2, 3}:
                 raise FileNotFoundError(path)
             if code == 80:
@@ -1248,7 +1257,7 @@ class _CtypesWindowsApi:
             ctypes.byref(overlapped),
         ):
             return True
-        code = ctypes.get_last_error()  # type: ignore[attr-defined]
+        code = ctypes.get_last_error()  # type: ignore[attr-defined, unused-ignore]
         if code in {self._ERROR_LOCK_VIOLATION, self._ERROR_SHARING_VIOLATION}:
             return False
         raise self._error("LockFileEx failed", code)
@@ -1266,7 +1275,7 @@ class _CtypesWindowsApi:
 def _open_runtime_directory(
     runtime_dir: Path, operation_hook: OperationHook | None, *, create: bool
 ) -> _PosixRuntimeDirectory | _WindowsRuntimeDirectory:
-    if os.name == "nt":
+    if sys.platform == "win32":
         return _WindowsRuntimeDirectory.open(runtime_dir, operation_hook, create=create)
     return _PosixRuntimeDirectory.open(runtime_dir, operation_hook, create=create)
 
@@ -1384,7 +1393,7 @@ def acquire_instance(
     probe: Probe = probe_fis,
     _operation_hook: OperationHook | None = None,
 ) -> InstanceLease | ExistingInstance:
-    if os.name == "nt":
+    if sys.platform == "win32":
         return _acquire_windows_instance(runtime_dir, probe=probe, _operation_hook=_operation_hook)
     directory = _open_runtime_directory(runtime_dir, _operation_hook, create=True)
     lock_descriptor = -1

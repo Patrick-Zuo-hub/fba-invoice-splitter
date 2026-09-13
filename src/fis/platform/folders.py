@@ -113,7 +113,7 @@ class NativeFolderPicker:
     def choose(self, initial: Path | None) -> Path | None:
         if sys.platform == "darwin":
             return choose_with_osascript(initial)
-        if os.name == "nt":
+        if sys.platform == "win32":
             return choose_with_powershell(initial)
         raise PlatformError("当前系统不支持文件夹选择窗口")
 
@@ -129,7 +129,7 @@ def open_with_system(folder: Path) -> None:
         raise PlatformError("文件已移动或删除")
     if sys.platform == "darwin":
         executable = ["/usr/bin/open", str(folder)]
-    elif os.name == "nt":
+    elif sys.platform == "win32":
         explorer = os.path.join(os.environ.get("SystemRoot", r"C:\\Windows"), "explorer.exe")
         executable = [explorer, str(folder)]
     else:

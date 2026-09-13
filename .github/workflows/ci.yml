@@ -36,8 +36,13 @@ jobs:
       - name: Lint
         run: python -m ruff check src tests
 
-      - name: Type-check
-        run: python -m mypy src/fis
+      # Once per supported platform, on every runner: mypy narrows sys.platform,
+      # so a single run only checks the half of the code that platform reaches.
+      - name: Type-check (macOS)
+        run: python -m mypy src/fis --platform darwin
+
+      - name: Type-check (Windows)
+        run: python -m mypy src/fis --platform win32
 
       # Windows is the reason this workflow exists: the named-mutex, directory
       # junction and directory-handle suites are skipped on every developer

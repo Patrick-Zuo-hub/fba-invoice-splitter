@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import lru_cache
@@ -14,7 +15,7 @@ _SAFE_BATCH_ID = re.compile(
     r"(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|batch-[a-z0-9-]+)"
 )
 _USE_DIRECTORY_FDS = (
-    os.name != "nt"
+    sys.platform != "win32"
     and shutil.rmtree.avoids_symlink_attacks
     and hasattr(os, "O_DIRECTORY")
     and hasattr(os, "O_NOFOLLOW")
@@ -55,7 +56,7 @@ class _WindowsFileDispositionInfoEx(ctypes.Structure):
 
 @lru_cache(maxsize=1)
 def _windows_api() -> tuple[Any, Any, Any, Any]:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined, unused-ignore]
 
     create_file = kernel32.CreateFileW
     create_file.argtypes = [
@@ -85,7 +86,7 @@ def _windows_api() -> tuple[Any, Any, Any, Any]:
 
 
 def _windows_error(error_code: int, context: str) -> OSError:
-    error = cast(OSError, ctypes.WinError(error_code))  # type: ignore[attr-defined]
+    error = cast(OSError, ctypes.WinError(error_code))  # type: ignore[attr-defined, redundant-cast, unused-ignore]
     error.args = (error_code, f"{context}: {error.strerror}")
     return error
 
@@ -116,7 +117,7 @@ def _windows_open_handle(
     )
     handle_value = getattr(handle, "value", handle)
     if handle_value is None or int(handle_value) in {-1, _INVALID_HANDLE_VALUE}:
-        error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
+        error_code = ctypes.get_last_error()  # type: ignore[attr-defined, unused-ignore]
         raise _windows_error(error_code, f"CreateFileW failed for {path}")
 
     handle_int = int(handle_value)
@@ -127,7 +128,7 @@ def _windows_open_handle(
         ctypes.byref(info),
         ctypes.sizeof(info),
     ):
-        error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
+        error_code = ctypes.get_last_error()  # type: ignore[attr-defined, unused-ignore]
         _windows_close_handle(handle_int)
         raise _windows_error(error_code, f"GetFileInformationByHandleEx failed for {path}")
     if info.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
@@ -148,7 +149,7 @@ def _windows_file_attributes(handle: int, path: Path) -> int:
         ctypes.byref(info),
         ctypes.sizeof(info),
     ):
-        error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
+        error_code = ctypes.get_last_error()  # type: ignore[attr-defined, unused-ignore]
         raise _windows_error(error_code, f"GetFileInformationByHandleEx failed for {path}")
     return int(info.file_attributes)
 
@@ -175,7 +176,7 @@ def _windows_mark_delete(handle: int, path: Path) -> None:
         ctypes.sizeof(disposition),
     ):
         return
-    error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
+    error_code = ctypes.get_last_error()  # type: ignore[attr-defined, unused-ignore]
     raise _windows_error(error_code, f"SetFileInformationByHandle failed for {path}")
 
 
@@ -412,7 +413,7 @@ class BatchFiles:
                     os.rename("work", "output", src_dir_fd=batch_fd, dst_dir_fd=batch_fd)
             except FileNotFoundError as error:
                 raise FileNotFoundError(work) from error
-        elif os.name == "nt":
+        elif sys.platform == "win32":
             self._windows_publish(batch_id, work, output)
         else:
             self._require_secure_directory_handles()
@@ -430,7 +431,7 @@ class BatchFiles:
                     BatchFiles._remove_child(batch_fd, path.name, f"batch {label} directory")
             except FileNotFoundError:
                 return
-        elif os.name == "nt":
+        elif sys.platform == "win32":
             self._windows_clear_directory(path.parent.name, path, label)
         else:
             self._require_secure_directory_handles()
@@ -453,7 +454,7 @@ class BatchFiles:
                     self._remove_child(batches_fd, batch.name, "batch directory")
             except FileNotFoundError:
                 return
-        elif os.name == "nt":
+        elif sys.platform == "win32":
             self._windows_delete_batch(batch_id, batch)
         else:
             self._require_secure_directory_handles()

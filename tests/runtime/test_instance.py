@@ -406,10 +406,10 @@ def test_record_swap_during_cleanup_does_not_delete_replacement(tmp_path: Path) 
 def test_windows_backend_fails_closed_when_handle_security_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # On a real Windows runner os.name is already "nt" and WinDLL exists, so
-    # patching only os.name tests nothing there. Remove the API as well to
-    # reach the branch this is about: refuse rather than fall back.
-    monkeypatch.setattr(instance_module.os, "name", "nt")
+    # On a real Windows runner the platform already matches and WinDLL exists,
+    # so patching only the platform tests nothing there. Remove the API as well
+    # to reach the branch this is about: refuse rather than fall back.
+    monkeypatch.setattr(instance_module.sys, "platform", "win32")
     monkeypatch.delattr(instance_module.ctypes, "WinDLL", raising=False)
 
     with pytest.raises(StartupError, match="Windows.*安全.*拒绝"):
