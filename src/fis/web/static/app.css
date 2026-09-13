@@ -65,9 +65,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .file-picker {
   min-width: 240px; min-height: 40px; display: flex; align-items: center; padding: 0 14px;
   border: 1px dashed #aebed3; border-radius: 8px; color: #536078; background: #f9fbfe;
+  cursor: pointer;
 }
+.file-picker:hover { border-color: #1769e0; color: #1769e0; }
+.file-picker.has-file { border-style: solid; border-color: #16a36a; color: #23634d; background: #f1f8f5; }
 .file-picker input { width: 1px; height: 1px; opacity: 0; position: absolute; }
-.status-line { grid-column: 1 / -1; color: #b1262e !important; }
+.status-line { grid-column: 1 / -1; color: #748095; }
+.status-line.is-error { color: #b1262e; }
 
 .workspace { display: grid; gap: 12px; }
 .file-bar, .mapping-panel {

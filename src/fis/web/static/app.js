@@ -296,15 +296,49 @@
     restoreTablePosition();
   }
 
+  var DEFAULT_FILE_LABEL = "选择 Excel 文件";
+
+  function setFileLabel(name) {
+    var label = document.querySelector("[data-file-label]");
+    var picker = document.querySelector(".file-picker");
+    if (!label || !picker) {
+      return;
+    }
+    label.textContent = name ? "已选择：" + name : DEFAULT_FILE_LABEL;
+    picker.classList.toggle("has-file", Boolean(name));
+  }
+
+  function setUploadStatus(status, message, isError) {
+    if (!status) {
+      return;
+    }
+    status.textContent = message;
+    status.classList.toggle("is-error", Boolean(isError));
+  }
+
+  var invoiceInput = document.getElementById("invoice");
+  if (invoiceInput) {
+    invoiceInput.addEventListener("change", function () {
+      var file = invoiceInput.files && invoiceInput.files[0];
+      setFileLabel(file ? file.name : "");
+      setUploadStatus(document.getElementById("upload-status"), "", false);
+    });
+  }
+
   var uploadForm = document.getElementById("invoice-form");
   if (uploadForm) {
     uploadForm.addEventListener("submit", async function (event) {
       event.preventDefault();
       var status = document.getElementById("upload-status");
-      status.textContent = "正在上传并解析…";
+      setUploadStatus(status, "正在上传并解析…", false);
       var response = await fisSend("/workspace/invoice", { body: new FormData(uploadForm) });
       if (await applyResponse(response, status)) {
+        setUploadStatus(status, "", false);
+        setFileLabel("");
+        uploadForm.reset();
         document.getElementById("upload").classList.add("is-collapsed");
+      } else {
+        status.classList.add("is-error");
       }
     });
   }
@@ -384,6 +418,8 @@
     }
     if (trigger.matches("[data-reupload]")) {
       document.getElementById("upload").classList.remove("is-collapsed");
+      setFileLabel("");
+      setUploadStatus(document.getElementById("upload-status"), "", false);
       document.getElementById("invoice").click();
       return;
     }

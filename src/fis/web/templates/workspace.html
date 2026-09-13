@@ -34,7 +34,7 @@
         <form id="invoice-form" action="/workspace/invoice" method="post"
               enctype="multipart/form-data">
           <label class="file-picker" for="invoice">
-            <span>选择 Excel 文件</span>
+            <span data-file-label>选择 Excel 文件</span>
             <input id="invoice" name="invoice" type="file" accept=".xlsx" required>
           </label>
           <button class="button primary" type="submit">上传并解析</button>
