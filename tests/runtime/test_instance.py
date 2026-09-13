@@ -20,6 +20,21 @@ from fis.runtime.instance import (
 )
 
 
+def _make_runtime_dir(path: Path) -> Path:
+    """Create a runtime directory the way FIS itself would, per platform.
+
+    A bare ``mkdir`` is POSIX thinking: on Windows it inherits the parent's
+    ACL, which the runtime directory check then correctly rejects. Production
+    never hits this because FIS creates the directory itself.
+    """
+
+    if os.name == "nt":
+        instance_module._CtypesWindowsApi().create_directory(path)
+    else:
+        path.mkdir(mode=0o700)
+    return path
+
+
 def _record(*, pid: int = 123, port: int = 8768) -> InstanceRecord:
     return InstanceRecord(pid=pid, port=port, started_at="2026-09-10T09:00:00+00:00")
 
@@ -60,8 +75,7 @@ def test_reading_missing_record_does_not_create_runtime_directory(tmp_path: Path
     ],
 )
 def test_record_rejects_malformed_or_unsafe_json(tmp_path: Path, payload: str) -> None:
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
+    runtime = _make_runtime_dir(tmp_path / "runtime")
     (runtime / "instance.json").write_text(payload)
 
     with pytest.raises(InvalidInstanceRecord):
@@ -69,8 +83,7 @@ def test_record_rejects_malformed_or_unsafe_json(tmp_path: Path, payload: str) -
 
 
 def test_record_rejects_oversize_and_symlink(tmp_path: Path) -> None:
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
+    runtime = _make_runtime_dir(tmp_path / "runtime")
     record_path = runtime / "instance.json"
     record_path.write_bytes(b"x" * 4097)
     with pytest.raises(InvalidInstanceRecord):
@@ -138,8 +151,7 @@ def test_held_lock_with_non_fis_service_is_not_treated_as_existing(tmp_path: Pat
 
 
 def test_stale_or_corrupt_record_is_removed_only_after_lock_acquired(tmp_path: Path) -> None:
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
+    runtime = _make_runtime_dir(tmp_path / "runtime")
     record_path = runtime / "instance.json"
     record_path.write_text("{")
 

@@ -32,6 +32,14 @@ _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _FILE_READ_ATTRIBUTES = 0x80
 _FILE_SHARE_READ = 0x1
+_FILE_SHARE_WRITE = 0x2
+_FILE_SHARE_DELETE = 0x4
+# These handles pin the directory chain's identity while an operation runs;
+# they are not the access control. Denying write and delete sharing does not
+# stop another process running as this user — ACLs do — but it does stop us:
+# renaming work/ to output/ has to open the batch directory for write, and a
+# read-only share on our own guard handle fails that with a sharing violation.
+_GUARD_SHARE_MODE = _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE
 _OPEN_EXISTING = 3
 _INVALID_HANDLE_VALUE = int(ctypes.c_void_p(-1).value or -1)
 
@@ -103,7 +111,7 @@ def _windows_open_handle(path: Path, *, require_directory: bool, delete: bool = 
     handle = create_file(
         str(path),
         desired_access,
-        _FILE_SHARE_READ,
+        _GUARD_SHARE_MODE,
         None,
         _OPEN_EXISTING,
         _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,

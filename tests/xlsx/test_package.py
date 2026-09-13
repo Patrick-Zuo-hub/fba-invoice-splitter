@@ -21,7 +21,17 @@ CORE_PARTS = {
 def write_package(path: Path, parts: dict[str, bytes] | None = None) -> Path:
     with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
         for name, content in (parts or CORE_PARTS).items():
-            archive.writestr(name, content)
+            if "\\" in name:
+                # ZipInfo.__init__ rewrites os.sep to "/", so on Windows a
+                # backslash entry would be normalised away before the reader
+                # ever sees it. Set the name after construction to keep the
+                # malformed entry intact on every platform.
+                info = ZipInfo(date_time=(2026, 1, 1, 0, 0, 0))
+                info.filename = name
+                info.compress_type = ZIP_DEFLATED
+                archive.writestr(info, content)
+            else:
+                archive.writestr(name, content)
     return path
 
 
