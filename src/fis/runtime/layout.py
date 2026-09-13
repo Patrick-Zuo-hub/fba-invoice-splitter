@@ -27,14 +27,26 @@ def _require_writable(data_root: Path) -> None:
     Falling back to the home directory would look like it worked, and the user
     would find out only after copying the folder to another machine and
     discovering their master data never travelled with it.
+
+    The check writes a probe file rather than asking ``os.access``: on Windows
+    that call ignores ACLs and answers yes for almost any directory, which is
+    precisely the platform where a Program Files install needs to be caught.
     """
 
-    probe = data_root if data_root.exists() else data_root.parent
-    if not os.access(probe, os.W_OK):
+    probe = data_root / ".fis-write-probe"
+    try:
+        data_root.mkdir(parents=True, exist_ok=True)
+        probe.touch()
+    except OSError as exc:
         raise StartupError(
             f"无法写入数据目录 {data_root}。"
             "请把 FIS 文件夹放在桌面、D 盘或用户目录下，不要放在 Program Files 中。"
-        )
+        ) from exc
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def resolve_layout(*, frozen: bool | None = None) -> Settings:

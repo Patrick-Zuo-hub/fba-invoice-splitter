@@ -65,17 +65,33 @@ def test_the_environment_still_overrides_the_data_root(
 def test_an_unwritable_data_root_is_reported_not_relocated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Falling back silently would leave the user copying a folder with no data."""
+    """Falling back silently would leave the user copying a folder with no data.
+
+    The obstruction is a file sitting where data/ needs to be, which blocks the
+    write on every platform. chmod would not: on Windows it does nothing to a
+    directory, so the read-only case simply would not arise.
+    """
 
     program = tmp_path / "Program Files" / "FIS"
     program.mkdir(parents=True)
-    program.chmod(0o500)
+    (program / "data").write_text("not a directory", encoding="utf-8")
     monkeypatch.delenv("FIS_DATA_ROOT", raising=False)
     monkeypatch.setattr(sys, "executable", str(program / "FIS.exe"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
 
-    try:
-        with pytest.raises(StartupError, match="无法写入"):
-            resolve_layout(frozen=True)
-    finally:
-        program.chmod(0o700)
+    with pytest.raises(StartupError, match="无法写入"):
+        resolve_layout(frozen=True)
+
+
+def test_a_writable_data_root_leaves_no_probe_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    program = tmp_path / "FIS"
+    program.mkdir()
+    monkeypatch.delenv("FIS_DATA_ROOT", raising=False)
+    monkeypatch.setattr(sys, "executable", str(program / "FIS.exe"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+
+    settings = resolve_layout(frozen=True)
+
+    assert list(settings.data_root.iterdir()) == []
