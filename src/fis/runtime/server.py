@@ -16,11 +16,12 @@ from fastapi import FastAPI
 from fis.config import Settings
 from fis.runtime.instance import (
     ExistingInstance,
+    HealthProbe,
     InstanceRecord,
-    Probe,
     StartupError,
     acquire_instance,
     probe_fis,
+    runtime_identity,
 )
 from fis.runtime.lifecycle import Lifecycle
 from fis.web.app import create_app
@@ -100,14 +101,19 @@ async def launch(
     settings: Settings,
     *,
     browser_open: Callable[[str], bool] = webbrowser.open,
-    probe: Probe = probe_fis,
+    probe: HealthProbe = probe_fis,
     lifecycle: Lifecycle | None = None,
     socket_factory: Callable[[], SocketLike] = _new_socket,
     server_factory: Callable[[FastAPI], ServerLike] = _default_server_factory,
     poll_interval: float = 0.05,
 ) -> LaunchResult:
     runtime_dir = settings.data_root / "runtime"
-    ownership = acquire_instance(runtime_dir, probe=probe)
+    # Only adopt an instance that serves this data root: a stale record's
+    # port may since have been taken by a FIS started elsewhere.
+    identity = runtime_identity(runtime_dir)
+    ownership = acquire_instance(
+        runtime_dir, probe=lambda port: probe(port, identity=identity)
+    )
     if isinstance(ownership, ExistingInstance):
         url = f"http://127.0.0.1:{ownership.port}/"
         try:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import json
 import ntpath
 import os
@@ -23,6 +24,14 @@ PRODUCT_MARKER: Final = "fba-invoice-splitter"
 RECORD_NAME: Final = "instance.json"
 LOCK_NAME: Final = "instance.lock"
 type Probe = Callable[[int], bool]
+"""What acquire_instance needs: is this port a live instance of ours?"""
+
+
+class HealthProbe(Protocol):
+    """The richer contract probe_fis itself offers, identity included."""
+
+    def __call__(self, port: int, *, identity: str | None = None) -> bool: ...
+
 type OperationHook = Callable[[str], None]
 type FileIdentity = tuple[int, int]
 
@@ -1286,19 +1295,40 @@ def write_instance_record(
         directory.close()
 
 
-def probe_fis(port: int, *, timeout: float = 0.35) -> bool:
+def runtime_identity(runtime_dir: Path | str) -> str:
+    """Fingerprint the data root an instance serves.
+
+    Two instances started against different data roots compete for the same
+    port range, so a healthy FIS answering on a recorded port is not
+    necessarily the one that wrote the record. The fingerprint lets a probe
+    tell them apart. It is a digest rather than the path itself so that
+    nothing on the wire describes the user's filesystem.
+    """
+
+    resolved = os.path.normcase(os.path.abspath(str(runtime_dir)))
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:32]
+
+
+def probe_fis(port: int, *, identity: str | None = None, timeout: float = 0.35) -> bool:
     if not 8765 <= port <= 8775:
         return False
     opener = build_opener(ProxyHandler({}))
     try:
         with opener.open(f"http://127.0.0.1:{port}/health", timeout=timeout) as response:
             body = response.read(MAX_RECORD_BYTES + 1)
-            return (
-                cast(int, response.status) == 200
-                and response.headers.get("X-FIS-Product") == PRODUCT_MARKER
-                and len(body) <= MAX_RECORD_BYTES
-                and json.loads(body) == {"status": "ok"}
-            )
+            if (
+                cast(int, response.status) != 200
+                or response.headers.get("X-FIS-Product") != PRODUCT_MARKER
+                or len(body) > MAX_RECORD_BYTES
+            ):
+                return False
+            payload = json.loads(body)
+            if not isinstance(payload, dict) or payload.get("status") != "ok":
+                return False
+            if identity is None:
+                return True
+            # A build that cannot name its data root is not provably ours.
+            return payload.get("instance") == identity
     except (OSError, ValueError, json.JSONDecodeError):
         return False
 

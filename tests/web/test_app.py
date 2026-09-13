@@ -4,6 +4,7 @@ from fastapi import Response
 from fastapi.testclient import TestClient
 
 from fis.config import Settings
+from fis.runtime.instance import runtime_identity
 from fis.web.app import create_app
 
 HOST = "127.0.0.1:8765"
@@ -57,12 +58,17 @@ def test_launch_route_is_removed(tmp_path: Path) -> None:
     assert "set-cookie" not in response.headers
 
 
-def test_health_returns_only_ok_status(tmp_path: Path) -> None:
+def test_health_reports_status_and_this_instance_only(tmp_path: Path) -> None:
     response = _client(tmp_path).get("/health", headers={"host": HOST})
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
     assert response.headers["x-fis-product"] == "fba-invoice-splitter"
+    body = response.json()
+    assert set(body) == {"status", "instance"}
+    assert body["status"] == "ok"
+    # A digest, so nothing on the wire describes the user's filesystem.
+    assert body["instance"] == runtime_identity(tmp_path / "data" / "runtime")
+    assert str(tmp_path) not in response.text
 
 
 def test_static_content_is_available_with_exact_host(tmp_path: Path) -> None:

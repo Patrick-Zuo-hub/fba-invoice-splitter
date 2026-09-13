@@ -193,7 +193,7 @@ async def test_existing_healthy_instance_only_opens_browser(tmp_path: Path) -> N
         result = await launch(
             Settings(data_root=tmp_path / "data"),
             browser_open=lambda url: opened.append(url) is None,
-            probe=lambda port: port == 8769,
+            probe=lambda port, *, identity=None: port == 8769,
             server_factory=server_factory,
         )
     finally:
@@ -203,3 +203,56 @@ async def test_existing_healthy_instance_only_opens_browser(tmp_path: Path) -> N
     assert result.port == 8769
     assert opened == ["http://127.0.0.1:8769/"]
     assert made_server is False
+
+
+@pytest.mark.asyncio
+async def test_stale_record_does_not_adopt_another_data_root_instance(
+    tmp_path: Path,
+) -> None:
+    """A killed instance leaves a record; that port may now be someone else's.
+
+    This is the failure seen in practice: a scratch data root's stale record
+    pointed at a port a different FIS had since taken, and the launcher opened
+    the browser onto that unrelated instance instead of starting its own.
+    """
+
+    from fis.runtime.instance import runtime_identity, write_instance_record
+
+    mine = tmp_path / "mine"
+    # A lease removes the record it owns on close, so write it directly: the
+    # point is a record left behind by a process that never cleaned up.
+    write_instance_record(
+        mine / "runtime",
+        InstanceRecord(pid=321, port=8769, started_at="2026-09-10T09:00:00+00:00"),
+    )
+
+    stranger = runtime_identity(tmp_path / "theirs" / "runtime")
+    opened: list[str] = []
+    made_server = False
+
+    def server_factory(app: Any) -> FakeServer:
+        nonlocal made_server
+        made_server = True
+        return FakeServer()
+
+    def probe(port: int, *, identity: str | None = None) -> bool:
+        # Models probe_fis: a healthy FIS answers on 8769, but it serves a
+        # different data root. Asking without an identity — which is what the
+        # launcher used to do — still says yes, so this fails without the fix.
+        if port != 8769:
+            return False
+        return identity is None or identity == stranger
+
+    result = await launch(
+        Settings(data_root=mine),
+        browser_open=lambda url: opened.append(url) is None,
+        probe=probe,
+        lifecycle=Lifecycle(clock=lambda: 100.0, grace_seconds=0),
+        server_factory=server_factory,
+        poll_interval=0,
+    )
+
+    assert result.started is True, "should start its own instance, not adopt the stranger"
+    assert result.port != 8769
+    assert made_server is True
+    assert opened == [f"http://127.0.0.1:{result.port}/"]

@@ -7,6 +7,7 @@ from fastapi.templating import Jinja2Templates
 
 from fis.config import Settings
 from fis.platform.folders import FolderPicker
+from fis.runtime.instance import runtime_identity
 from fis.runtime.lifecycle import Lifecycle
 from fis.services.batches import BatchService, WorkspaceStore
 from fis.storage.batch_files import BatchFiles
@@ -34,6 +35,7 @@ def create_app(
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
     app.state.bound_port = bound_port
+    app.state.runtime_identity = runtime_identity(settings.data_root / "runtime")
 
     database = Database(settings.database_path)
     database.initialize()
@@ -60,7 +62,9 @@ def create_app(
     @app.get("/health")
     def health(response: Response) -> dict[str, str]:
         response.headers["X-FIS-Product"] = "fba-invoice-splitter"
-        return {"status": "ok"}
+        # Naming the data root lets a probe tell this instance apart from
+        # another FIS that happens to hold a recorded port.
+        return {"status": "ok", "instance": app.state.runtime_identity}
 
     @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
     def index(request: Request) -> Response:

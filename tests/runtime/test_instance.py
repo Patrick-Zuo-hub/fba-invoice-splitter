@@ -16,6 +16,7 @@ from fis.runtime.instance import (
     acquire_instance,
     probe_fis,
     read_instance_record,
+    runtime_identity,
     write_instance_record,
 )
 
@@ -427,3 +428,67 @@ def test_windows_runtime_rejects_reparse_directory(tmp_path: Path) -> None:
 
     with pytest.raises(StartupError, match="reparse|junction|安全"):
         write_instance_record(runtime, _record())
+
+
+class _HealthResponse:
+    def __init__(self, body: bytes) -> None:
+        self.status = 200
+        self.headers = {"X-FIS-Product": "fba-invoice-splitter"}
+        self._body = body
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self, _limit: int) -> bytes:
+        return self._body
+
+
+def _serve_health(monkeypatch: pytest.MonkeyPatch, body: bytes) -> None:
+    class Opener:
+        def open(self, url: str, *, timeout: float) -> _HealthResponse:
+            return _HealthResponse(body)
+
+    monkeypatch.setattr("fis.runtime.instance.build_opener", lambda *_args: Opener())
+
+
+def test_runtime_identity_distinguishes_data_roots(tmp_path: Path) -> None:
+    first = runtime_identity(tmp_path / "one" / "runtime")
+    second = runtime_identity(tmp_path / "two" / "runtime")
+
+    assert first != second
+    assert first == runtime_identity(tmp_path / "one" / "runtime")
+    assert len(first) == 32
+
+
+def test_probe_rejects_a_healthy_instance_serving_another_data_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale record's port may now belong to a different FIS entirely."""
+
+    mine = runtime_identity(Path("/data/mine/runtime"))
+    theirs = runtime_identity(Path("/data/theirs/runtime"))
+    _serve_health(monkeypatch, json.dumps({"status": "ok", "instance": theirs}).encode())
+
+    assert probe_fis(8768, identity=mine) is False
+    assert probe_fis(8768, identity=theirs) is True
+
+
+def test_probe_without_an_expected_identity_accepts_any_fis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve_health(monkeypatch, b'{"status":"ok","instance":"whatever"}')
+
+    assert probe_fis(8768) is True
+
+
+def test_probe_rejects_an_instance_that_cannot_prove_its_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older build answers without the field; do not adopt it."""
+
+    _serve_health(monkeypatch, b'{"status":"ok"}')
+
+    assert probe_fis(8768, identity=runtime_identity(Path("/data/mine/runtime"))) is False
