@@ -26,6 +26,7 @@ _FILE_ATTRIBUTE_TAG_INFO = 9
 _FILE_DISPOSITION_INFO = 4
 _FILE_DISPOSITION_INFO_EX = 21
 _FILE_RENAME_INFO = 3
+_FILE_RENAME_INFORMATION = 10  # NT FILE_INFORMATION_CLASS
 _FILE_DISPOSITION_FLAG_DELETE = 1
 _FILE_LIST_DIRECTORY = 0x1
 _FILE_TRAVERSE = 0x20
@@ -82,6 +83,36 @@ def _windows_api() -> tuple[Any, Any, Any, Any]:
     set_file_info.restype = ctypes.c_int
 
     return create_file, get_file_info, close_handle, set_file_info
+
+
+@lru_cache(maxsize=1)
+def _windows_nt_api() -> Any:
+    """NtSetInformationFile, the only renamer that honours RootDirectory.
+
+    The Win32 wrapper refuses a RootDirectory handle (ERROR_INVALID_PARAMETER),
+    reads a bare name as another volume (ERROR_NOT_SAME_DEVICE) and opens the
+    parent for an absolute path (ERROR_SHARING_VIOLATION). The native call
+    renames through the directory handle itself, opening nothing.
+    """
+
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)  # type: ignore[attr-defined]
+    set_information = ntdll.NtSetInformationFile
+    set_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_int,
+    ]
+    set_information.restype = ctypes.c_long
+    return set_information
+
+
+class _WindowsIoStatusBlock(ctypes.Structure):
+    _fields_ = [
+        ("status", ctypes.c_void_p),
+        ("information", ctypes.c_size_t),
+    ]
 
 
 def _windows_error(error_code: int, context: str) -> OSError:
@@ -177,51 +208,54 @@ def _windows_mark_delete(handle: int, path: Path) -> None:
     raise _windows_error(error_code, f"SetFileInformationByHandle failed for {path}")
 
 
-def _windows_rename_directory(source: Path, destination: Path) -> None:
-    """Rename in place through the source handle, never through a fresh open.
+def _windows_rename_directory(source: Path, destination: Path, parent_handle: int) -> None:
+    """Rename through handles already held, so nothing else is opened.
 
-    MoveFileEx, and FileRenameInfo given an absolute path, both have to open
-    the destination's parent directory to place the new name — which the guard
-    handle's read-only share mode refuses. That share mode is deliberate:
-    `test_windows_protected_directory_rejects_write_handle` pins it, and it
-    stops another process running as this user from touching the batch
-    directory mid-operation, which ACLs cannot do.
+    The guard handle keeps the batch directory open with a read-only share on
+    purpose — `test_windows_protected_directory_rejects_write_handle` pins it,
+    and it stops another process running as this user from touching the
+    directory mid-operation, which ACLs cannot do. Every Win32 route to the
+    rename has to open that directory again and is refused by it.
 
-    A bare name with a null RootDirectory renames within the source's own
-    directory, which the kernel resolves from the source file object rather
-    than by opening anything. RootDirectory is for moving across directories
-    and SetFileInformationByHandle rejects it here with ERROR_INVALID_PARAMETER.
+    Naming the target relative to the directory handle we already hold means
+    the kernel opens nothing, so the protection holds for the whole operation
+    and the target cannot be redirected by swapping a path component.
     """
 
     if source.parent != destination.parent:
         raise ValueError("Windows rename is limited to one directory")
 
-    _, _, _, set_file_info = _windows_api()
+    set_information = _windows_nt_api()
     target = destination.name
-    buffer_length = len(target) + 1
+    name_bytes = target.encode("utf-16-le")
 
-    class _WindowsFileRenameInfo(ctypes.Structure):
+    class _WindowsFileRenameInformation(ctypes.Structure):
         _fields_ = [
             ("replace_if_exists", ctypes.c_ubyte),
             ("root_directory", ctypes.c_void_p),
             ("file_name_length", ctypes.c_ulong),
-            ("file_name", ctypes.c_wchar * buffer_length),
+            ("file_name", ctypes.c_char * len(name_bytes)),
         ]
 
-    info = _WindowsFileRenameInfo()
+    info = _WindowsFileRenameInformation()
     info.replace_if_exists = 0
-    info.root_directory = None
-    info.file_name_length = len(target) * 2  # bytes, excluding the terminator
-    info.file_name = target
+    info.root_directory = ctypes.c_void_p(parent_handle)
+    info.file_name_length = len(name_bytes)
+    info.file_name = name_bytes
 
     handle = _windows_open_handle(source, require_directory=True, delete=True)
     try:
-        if not set_file_info(
-            handle, _FILE_RENAME_INFO, ctypes.byref(info), ctypes.sizeof(info)
-        ):
-            error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
-            raise _windows_error(
-                error_code, f"SetFileInformationByHandle rename failed for {source}"
+        status_block = _WindowsIoStatusBlock()
+        status = set_information(
+            ctypes.c_void_p(handle),
+            ctypes.byref(status_block),
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            _FILE_RENAME_INFORMATION,
+        )
+        if status != 0:
+            raise OSError(
+                f"NtSetInformationFile rename failed for {source}: status 0x{status & 0xFFFFFFFF:08X}"
             )
     finally:
         _windows_close_handle(handle)
@@ -385,11 +419,11 @@ class BatchFiles:
                 _windows_close_handle(child_handle)
 
     def _windows_publish(self, batch_id: str, work: Path, output: Path) -> None:
-        with self._windows_batch_handles(batch_id):
+        with self._windows_batch_handles(batch_id) as batch_handle:
             self._windows_validate_directory(work, "batch work directory")
             if self._is_redirect(output) or output.exists():
                 raise FileExistsError("Batch output already exists")
-            _windows_rename_directory(work, output)
+            _windows_rename_directory(work, output, batch_handle)
 
     def _windows_clear_directory(self, batch_id: str, path: Path, label: str) -> None:
         with self._windows_batch_handles(batch_id):
