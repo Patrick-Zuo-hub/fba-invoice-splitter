@@ -1,0 +1,12 @@
+# cmd.exe is unreliable with bare LF, so the Windows launcher must keep CRLF
+# on every checkout regardless of the developer's core.autocrlf setting.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# The macOS launcher must stay LF for the same reason, in reverse.
+*.command text eol=lf
+
+# Spreadsheets are binary: never run line-ending or diff translation on them.
+*.xlsx binary
+*.xlsm binary
+*.xltx binary
