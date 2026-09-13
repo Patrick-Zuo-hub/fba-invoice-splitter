@@ -25,8 +25,6 @@ _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_ATTRIBUTE_TAG_INFO = 9
 _FILE_DISPOSITION_INFO = 4
 _FILE_DISPOSITION_INFO_EX = 21
-_FILE_RENAME_INFO = 3
-_FILE_RENAME_INFORMATION = 10  # NT FILE_INFORMATION_CLASS
 _FILE_DISPOSITION_FLAG_DELETE = 1
 _FILE_LIST_DIRECTORY = 0x1
 _FILE_TRAVERSE = 0x20
@@ -35,6 +33,7 @@ _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _FILE_READ_ATTRIBUTES = 0x80
 _FILE_SHARE_READ = 0x1
+_FILE_SHARE_WRITE = 0x2
 _OPEN_EXISTING = 3
 _INVALID_HANDLE_VALUE = int(ctypes.c_void_p(-1).value or -1)
 
@@ -85,36 +84,6 @@ def _windows_api() -> tuple[Any, Any, Any, Any]:
     return create_file, get_file_info, close_handle, set_file_info
 
 
-@lru_cache(maxsize=1)
-def _windows_nt_api() -> Any:
-    """NtSetInformationFile, the only renamer that honours RootDirectory.
-
-    The Win32 wrapper refuses a RootDirectory handle (ERROR_INVALID_PARAMETER),
-    reads a bare name as another volume (ERROR_NOT_SAME_DEVICE) and opens the
-    parent for an absolute path (ERROR_SHARING_VIOLATION). The native call
-    renames through the directory handle itself, opening nothing.
-    """
-
-    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)  # type: ignore[attr-defined]
-    set_information = ntdll.NtSetInformationFile
-    set_information.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_ulong,
-        ctypes.c_int,
-    ]
-    set_information.restype = ctypes.c_long
-    return set_information
-
-
-class _WindowsIoStatusBlock(ctypes.Structure):
-    _fields_ = [
-        ("status", ctypes.c_void_p),
-        ("information", ctypes.c_size_t),
-    ]
-
-
 def _windows_error(error_code: int, context: str) -> OSError:
     error = cast(OSError, ctypes.WinError(error_code))  # type: ignore[attr-defined]
     error.args = (error_code, f"{context}: {error.strerror}")
@@ -126,7 +95,9 @@ def _windows_close_handle(handle: int) -> None:
     close_handle(handle)
 
 
-def _windows_open_handle(path: Path, *, require_directory: bool, delete: bool = False) -> int:
+def _windows_open_handle(
+    path: Path, *, require_directory: bool, delete: bool = False, share_write: bool = False
+) -> int:
     create_file, get_file_info, _, _ = _windows_api()
     desired_access = _FILE_READ_ATTRIBUTES
     if require_directory:
@@ -137,7 +108,7 @@ def _windows_open_handle(path: Path, *, require_directory: bool, delete: bool = 
     handle = create_file(
         str(path),
         desired_access,
-        _FILE_SHARE_READ,
+        _FILE_SHARE_READ | (_FILE_SHARE_WRITE if share_write else 0),
         None,
         _OPEN_EXISTING,
         _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
@@ -182,8 +153,8 @@ def _windows_file_attributes(handle: int, path: Path) -> int:
     return int(info.file_attributes)
 
 
-def _windows_open_directory(path: Path) -> int:
-    return _windows_open_handle(path, require_directory=True)
+def _windows_open_directory(path: Path, *, share_write: bool = False) -> int:
+    return _windows_open_handle(path, require_directory=True, share_write=share_write)
 
 
 def _windows_mark_delete(handle: int, path: Path) -> None:
@@ -206,59 +177,6 @@ def _windows_mark_delete(handle: int, path: Path) -> None:
         return
     error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
     raise _windows_error(error_code, f"SetFileInformationByHandle failed for {path}")
-
-
-def _windows_rename_directory(source: Path, destination: Path, parent_handle: int) -> None:
-    """Rename through handles already held, so nothing else is opened.
-
-    The guard handle keeps the batch directory open with a read-only share on
-    purpose — `test_windows_protected_directory_rejects_write_handle` pins it,
-    and it stops another process running as this user from touching the
-    directory mid-operation, which ACLs cannot do. Every Win32 route to the
-    rename has to open that directory again and is refused by it.
-
-    Naming the target relative to the directory handle we already hold means
-    the kernel opens nothing, so the protection holds for the whole operation
-    and the target cannot be redirected by swapping a path component.
-    """
-
-    if source.parent != destination.parent:
-        raise ValueError("Windows rename is limited to one directory")
-
-    set_information = _windows_nt_api()
-    target = destination.name
-    name_bytes = target.encode("utf-16-le")
-
-    class _WindowsFileRenameInformation(ctypes.Structure):
-        _fields_ = [
-            ("replace_if_exists", ctypes.c_ubyte),
-            ("root_directory", ctypes.c_void_p),
-            ("file_name_length", ctypes.c_ulong),
-            ("file_name", ctypes.c_char * len(name_bytes)),
-        ]
-
-    info = _WindowsFileRenameInformation()
-    info.replace_if_exists = 0
-    info.root_directory = ctypes.c_void_p(parent_handle)
-    info.file_name_length = len(name_bytes)
-    info.file_name = name_bytes
-
-    handle = _windows_open_handle(source, require_directory=True, delete=True)
-    try:
-        status_block = _WindowsIoStatusBlock()
-        status = set_information(
-            ctypes.c_void_p(handle),
-            ctypes.byref(status_block),
-            ctypes.byref(info),
-            ctypes.sizeof(info),
-            _FILE_RENAME_INFORMATION,
-        )
-        if status != 0:
-            raise OSError(
-                f"NtSetInformationFile rename failed for {source}: status 0x{status & 0xFFFFFFFF:08X}"
-            )
-    finally:
-        _windows_close_handle(handle)
 
 
 def _windows_path_prefixes(path: Path) -> tuple[Path, ...]:
@@ -383,9 +301,11 @@ class BatchFiles:
                 _windows_close_handle(batches_handle)
 
     @contextmanager
-    def _windows_batch_handles(self, batch_id: str) -> Iterator[int]:
+    def _windows_batch_handles(self, batch_id: str, *, share_write: bool = False) -> Iterator[int]:
         with self._windows_batch_parent_handles():
-            batch_handle = _windows_open_directory(self.batches_root / batch_id)
+            batch_handle = _windows_open_directory(
+                self.batches_root / batch_id, share_write=share_write
+            )
             try:
                 yield batch_handle
             finally:
@@ -419,11 +339,21 @@ class BatchFiles:
                 _windows_close_handle(child_handle)
 
     def _windows_publish(self, batch_id: str, work: Path, output: Path) -> None:
-        with self._windows_batch_handles(batch_id) as batch_handle:
+        # Renaming work/ to output/ modifies the batch directory, and a
+        # read-only share on our own guard handle refuses that to every API:
+        # MoveFileEx and an absolute FileRenameInfo raise a sharing violation,
+        # a bare name reads as another volume, the Win32 wrapper rejects a
+        # RootDirectory handle, and NtSetInformationFile still returns
+        # STATUS_SHARING_VIOLATION. The guard cannot both forbid writes to this
+        # directory and let us write to it, so the batch level permits writes
+        # during publish while data/ and batches/ stay strict. work/ itself
+        # keeps its read-only share, so the directory being published is still
+        # protected from concurrent modification.
+        with self._windows_batch_handles(batch_id, share_write=True):
             self._windows_validate_directory(work, "batch work directory")
             if self._is_redirect(output) or output.exists():
                 raise FileExistsError("Batch output already exists")
-            _windows_rename_directory(work, output, batch_handle)
+            os.replace(work, output)
 
     def _windows_clear_directory(self, batch_id: str, path: Path, label: str) -> None:
         with self._windows_batch_handles(batch_id):
