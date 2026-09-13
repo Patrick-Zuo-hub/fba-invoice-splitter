@@ -101,16 +101,21 @@ def test_launcher_fails_without_a_virtualenv(tmp_path: Path) -> None:
     project.mkdir()
     shutil.copy2(LAUNCHER, project / LAUNCHER.name)
 
+    # DEVNULL rather than input=: `pause` returns at once on a closed stdin,
+    # and the encoding is pinned to match the launcher's `chcp 65001`.
     result = subprocess.run(
         [str(project / LAUNCHER.name)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
-        input="\r\n",
     )
 
     assert result.returncode != 0
-    assert "未找到项目运行环境" in result.stdout
+    assert "未找到项目运行环境" in (result.stdout or ""), repr(result.stdout)
 
 
 def test_launcher_keeps_chinese_text_out_of_a_parsed_block() -> None:

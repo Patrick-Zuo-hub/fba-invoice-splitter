@@ -961,7 +961,23 @@ class _CtypesWindowsApi:
             sddl, self._SDDL_REVISION_1, ctypes.byref(descriptor), None
         ):
             raise self._error("ConvertStringSecurityDescriptorToSecurityDescriptorW failed")
-        return descriptor, sddl
+        # Render the expectation through the same converter used to read a
+        # descriptor back. Windows abbreviates well-known SIDs — the built-in
+        # Administrator (RID 500) comes back as "LA" — so comparing against the
+        # hand-built string rejects a directory whose ACL is in fact identical.
+        return descriptor, self._render_descriptor(descriptor)
+
+    def _render_descriptor(self, descriptor: ctypes.c_void_p) -> str:
+        requested = self._OWNER_SECURITY_INFORMATION | self._DACL_SECURITY_INFORMATION
+        text = ctypes.c_wchar_p()
+        if not self._advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor, self._SDDL_REVISION_1, requested, ctypes.byref(text), None
+        ):
+            raise self._error("ConvertSecurityDescriptorToStringSecurityDescriptorW failed")
+        try:
+            return text.value or ""
+        finally:
+            self._kernel32.LocalFree(text)
 
     def __del__(self) -> None:
         descriptor = getattr(self, "_security_descriptor", None)
