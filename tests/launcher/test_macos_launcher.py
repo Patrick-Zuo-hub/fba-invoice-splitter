@@ -4,10 +4,17 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "启动 FIS.command"
+
+# The launcher is a zsh script with a POSIX executable bit: neither exists on
+# Windows, where the .bat launcher is the counterpart under test.
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX launcher")
 
 
 def test_launcher_is_executable_and_uses_project_virtualenv() -> None:

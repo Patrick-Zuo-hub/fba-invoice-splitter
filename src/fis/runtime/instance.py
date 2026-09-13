@@ -36,6 +36,8 @@ class _WindowsFileInfo:
     link_count: int
     size: int
     acl_safe: bool
+    acl_detail: str = ""
+    """Rendered vs expected SDDL, populated only when ``acl_safe`` is False."""
 
 
 class _WindowsApi(Protocol):
@@ -493,7 +495,9 @@ class _WindowsRuntimeDirectory:
             if info.is_reparse or not info.is_directory:
                 raise StartupError("Windows 运行目录是 reparse point 或非目录对象")
             if not info.acl_safe:
-                raise StartupError("Windows 运行目录权限不是当前用户专用")
+                raise StartupError(
+                    f"Windows 运行目录权限不是当前用户专用：{info.acl_detail}"
+                )
             if _windows_normalize_final_path(info.final_path) != _windows_normalize_final_path(
                 str(safe_path)
             ):
@@ -525,7 +529,10 @@ class _WindowsRuntimeDirectory:
             ):
                 raise StartupError("运行目录已被替换")
             if not opened.acl_safe or not named.acl_safe:
-                raise StartupError("Windows 运行目录权限不是当前用户专用")
+                raise StartupError(
+                    "Windows 运行目录权限不是当前用户专用："
+                    f"{opened.acl_detail or named.acl_detail}"
+                )
             if (
                 _windows_normalize_final_path(opened.final_path) != self._final_path
                 or _windows_normalize_final_path(named.final_path) != self._final_path
@@ -966,7 +973,7 @@ class _CtypesWindowsApi:
             ctypes.sizeof(_WinSecurityAttributes), self._security_descriptor, 0
         )
 
-    def _acl_safe(self, handle: int) -> bool:
+    def _acl_safe(self, handle: int) -> tuple[bool, str]:
         requested = self._OWNER_SECURITY_INFORMATION | self._DACL_SECURITY_INFORMATION
         needed = ctypes.c_ulong()
         self._advapi32.GetKernelObjectSecurity(handle, requested, None, 0, ctypes.byref(needed))
@@ -985,12 +992,14 @@ class _CtypesWindowsApi:
         try:
             rendered = text.value or ""
             expected_owner, expected_dacl = self._expected_sddl.split("D:P", 1)
+            detail = f"实际 {rendered} / 期望 {self._expected_sddl}"
             if not rendered.startswith(expected_owner) or "D:P" not in rendered:
-                return False
+                return False, detail
             rendered_dacl = rendered.split("D:P", 1)[1]
-            return sorted(re.findall(r"\([^)]*\)", rendered_dacl)) == sorted(
+            matched = sorted(re.findall(r"\([^)]*\)", rendered_dacl)) == sorted(
                 re.findall(r"\([^)]*\)", expected_dacl)
             )
+            return matched, "" if matched else detail
         finally:
             self._kernel32.LocalFree(text)
 
@@ -1036,7 +1045,9 @@ class _CtypesWindowsApi:
                 if info.is_reparse or not info.is_directory:
                     raise StartupError("Windows 运行目录路径包含 reparse point/junction")
                 if created and not info.acl_safe:
-                    raise StartupError("新建 Windows 运行目录权限不是当前用户专用")
+                    raise StartupError(
+                        f"新建 Windows 运行目录权限不是当前用户专用：{info.acl_detail}"
+                    )
             finally:
                 self.close(handle)
 
@@ -1119,6 +1130,7 @@ class _CtypesWindowsApi:
         final_buffer = ctypes.create_unicode_buffer(needed + 1)
         if not self._kernel32.GetFinalPathNameByHandleW(handle, final_buffer, len(final_buffer), 0):
             raise self._error("GetFinalPathNameByHandleW failed")
+        acl_safe, acl_detail = self._acl_safe(handle)
         return _WindowsFileInfo(
             identity=(
                 int(basic.volume_serial),
@@ -1129,7 +1141,8 @@ class _CtypesWindowsApi:
             is_reparse=bool(tag.attributes & self._FILE_ATTRIBUTE_REPARSE_POINT),
             link_count=int(basic.link_count),
             size=(int(basic.size_high) << 32) | int(basic.size_low),
-            acl_safe=self._acl_safe(handle),
+            acl_safe=acl_safe,
+            acl_detail=acl_detail,
         )
 
     def read(self, handle: int, limit: int) -> bytes:

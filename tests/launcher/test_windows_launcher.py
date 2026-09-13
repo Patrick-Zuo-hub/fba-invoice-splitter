@@ -91,11 +91,8 @@ def test_launcher_passes_working_directory_and_environment(tmp_path: Path) -> No
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert capture.read_text(encoding="utf-8").splitlines() == [
-        str(project),
-        str(project / "src"),
-        "",
-    ]
+    recorded = capture.read_text(encoding="utf-8").split("\n")
+    assert recorded == [str(project), str(project / "src"), ""]
 
 
 @windows_only

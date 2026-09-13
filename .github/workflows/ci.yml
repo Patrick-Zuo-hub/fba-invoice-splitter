@@ -42,5 +42,7 @@ jobs:
       # Windows is the reason this workflow exists: the named-mutex, directory
       # junction and directory-handle suites are skipped on every developer
       # machine, so this is the only place they actually run.
+      # -ra, not -rs: -rs reports skips only, which leaves the summary without
+      # the failing test names when the run goes red.
       - name: Test
-        run: python -m pytest -q -rs
+        run: python -m pytest -q -ra
