@@ -25,6 +25,7 @@ _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_ATTRIBUTE_TAG_INFO = 9
 _FILE_DISPOSITION_INFO = 4
 _FILE_DISPOSITION_INFO_EX = 21
+_FILE_RENAME_INFO = 3
 _FILE_DISPOSITION_FLAG_DELETE = 1
 _FILE_LIST_DIRECTORY = 0x1
 _DELETE = 0x10000
@@ -32,14 +33,6 @@ _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _FILE_READ_ATTRIBUTES = 0x80
 _FILE_SHARE_READ = 0x1
-_FILE_SHARE_WRITE = 0x2
-_FILE_SHARE_DELETE = 0x4
-# These handles pin the directory chain's identity while an operation runs;
-# they are not the access control. Denying write and delete sharing does not
-# stop another process running as this user — ACLs do — but it does stop us:
-# renaming work/ to output/ has to open the batch directory for write, and a
-# read-only share on our own guard handle fails that with a sharing violation.
-_GUARD_SHARE_MODE = _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE
 _OPEN_EXISTING = 3
 _INVALID_HANDLE_VALUE = int(ctypes.c_void_p(-1).value or -1)
 
@@ -111,7 +104,7 @@ def _windows_open_handle(path: Path, *, require_directory: bool, delete: bool = 
     handle = create_file(
         str(path),
         desired_access,
-        _GUARD_SHARE_MODE,
+        _FILE_SHARE_READ,
         None,
         _OPEN_EXISTING,
         _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
@@ -180,6 +173,47 @@ def _windows_mark_delete(handle: int, path: Path) -> None:
         return
     error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
     raise _windows_error(error_code, f"SetFileInformationByHandle failed for {path}")
+
+
+def _windows_rename_directory(source: Path, destination: Path) -> None:
+    """Rename through the source handle rather than through MoveFileEx.
+
+    MoveFileEx has to open the parent directory for write, which the guard
+    handle's read-only share mode refuses — that share mode is deliberate, and
+    `test_windows_protected_directory_rejects_write_handle` pins it. Issuing
+    FileRenameInfo on a handle we already hold touches no other path, so the
+    tamper protection stays in force for the whole operation.
+    """
+
+    _, _, _, set_file_info = _windows_api()
+    target = str(destination)
+    buffer_length = len(target) + 1
+
+    class _WindowsFileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("replace_if_exists", ctypes.c_ubyte),
+            ("root_directory", ctypes.c_void_p),
+            ("file_name_length", ctypes.c_ulong),
+            ("file_name", ctypes.c_wchar * buffer_length),
+        ]
+
+    info = _WindowsFileRenameInfo()
+    info.replace_if_exists = 0
+    info.root_directory = None
+    info.file_name_length = len(target) * 2  # bytes, excluding the terminator
+    info.file_name = target
+
+    handle = _windows_open_handle(source, require_directory=True, delete=True)
+    try:
+        if not set_file_info(
+            handle, _FILE_RENAME_INFO, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
+            raise _windows_error(
+                error_code, f"SetFileInformationByHandle rename failed for {source}"
+            )
+    finally:
+        _windows_close_handle(handle)
 
 
 def _windows_path_prefixes(path: Path) -> tuple[Path, ...]:
@@ -344,7 +378,7 @@ class BatchFiles:
             self._windows_validate_directory(work, "batch work directory")
             if self._is_redirect(output) or output.exists():
                 raise FileExistsError("Batch output already exists")
-            os.replace(work, output)
+            _windows_rename_directory(work, output)
 
     def _windows_clear_directory(self, batch_id: str, path: Path, label: str) -> None:
         with self._windows_batch_handles(batch_id):

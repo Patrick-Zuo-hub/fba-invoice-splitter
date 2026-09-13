@@ -20,6 +20,50 @@ from fis.runtime.instance import (
 )
 
 
+def _assert_owner_only(path: Path) -> None:
+    """Assert only the owner can reach ``path``, however the platform says it.
+
+    POSIX mode bits are meaningless on Windows — os.stat reports 0o777 for
+    every directory — so check the ACL the runtime actually enforces there.
+    """
+
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o077 == 0
+        return
+    api = instance_module._CtypesWindowsApi()
+    if path.is_dir():
+        handle, info = api.open_directory(path)
+    else:
+        handle, info = api.open_file(path, access="read", creation="open_existing")
+    try:
+        assert info.acl_safe, info.acl_detail
+    finally:
+        api.close(handle)
+
+
+def _plant_record(runtime: Path, payload: bytes) -> Path:
+    """Leave a record behind the way a previous FIS run would have.
+
+    Writing it with plain Python gives the file whatever ACL it inherits, and
+    the runtime correctly refuses a record it cannot prove is private — so the
+    fixture has to create it through the same API production uses.
+    """
+
+    record = runtime / "instance.json"
+    if os.name != "nt":
+        record.write_bytes(payload)
+        record.chmod(0o600)
+        return record
+    api = instance_module._CtypesWindowsApi()
+    handle, _ = api.open_file(record, access="write", creation="create_new")
+    try:
+        api.write(handle, payload)
+        api.flush(handle)
+    finally:
+        api.close(handle)
+    return record
+
+
 def _make_runtime_dir(path: Path) -> Path:
     """Create a runtime directory the way FIS itself would, per platform.
 
@@ -44,8 +88,8 @@ def test_record_round_trip_is_private_and_exact(tmp_path: Path) -> None:
     write_instance_record(runtime, _record())
 
     assert read_instance_record(runtime) == _record()
-    assert runtime.stat().st_mode & 0o077 == 0
-    assert (runtime / "instance.json").stat().st_mode & 0o077 == 0
+    _assert_owner_only(runtime)
+    _assert_owner_only(runtime / "instance.json")
     assert set(json.loads((runtime / "instance.json").read_text()).keys()) == {
         "pid",
         "port",
@@ -132,7 +176,7 @@ def test_held_lock_with_healthy_fis_returns_existing_instance(tmp_path: Path) ->
     owner = acquire_instance(runtime, probe=lambda port: False)
     owner.write_record(_record())
     try:
-        assert (runtime / "instance.lock").stat().st_mode & 0o077 == 0
+        _assert_owner_only(runtime / "instance.lock")
         result = acquire_instance(runtime, probe=lambda port: port == 8768)
         assert result == ExistingInstance(port=8768)
     finally:
@@ -152,8 +196,7 @@ def test_held_lock_with_non_fis_service_is_not_treated_as_existing(tmp_path: Pat
 
 def test_stale_or_corrupt_record_is_removed_only_after_lock_acquired(tmp_path: Path) -> None:
     runtime = _make_runtime_dir(tmp_path / "runtime")
-    record_path = runtime / "instance.json"
-    record_path.write_text("{")
+    record_path = _plant_record(runtime, b"{")
 
     lease = acquire_instance(runtime, probe=lambda port: False)
     try:
@@ -362,7 +405,11 @@ def test_record_swap_during_cleanup_does_not_delete_replacement(tmp_path: Path) 
 def test_windows_backend_fails_closed_when_handle_security_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # On a real Windows runner os.name is already "nt" and WinDLL exists, so
+    # patching only os.name tests nothing there. Remove the API as well to
+    # reach the branch this is about: refuse rather than fall back.
     monkeypatch.setattr(instance_module.os, "name", "nt")
+    monkeypatch.delattr(instance_module.ctypes, "WinDLL", raising=False)
 
     with pytest.raises(StartupError, match="Windows.*安全.*拒绝"):
         write_instance_record(tmp_path / "runtime", _record())
