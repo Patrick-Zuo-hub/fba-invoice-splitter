@@ -25,3 +25,5 @@ samples/**/*.xlsx
 *.xlsx
 *.xlsm
 *.xltx
+# PyInstaller 构建产物
+*.spec.bak

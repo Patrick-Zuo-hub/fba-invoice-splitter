@@ -51,3 +51,29 @@ jobs:
       # the failing test names when the run goes red.
       - name: Test
         run: python -m pytest -q -ra
+
+  portable:
+    name: Windows portable build
+    needs: test
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build the one-folder bundle
+        shell: pwsh
+        run: ./scripts/build_windows.ps1
+
+      # Uploading the folder is the only way to get at it: this workflow can
+      # prove the build succeeds, but not that it runs on a machine without
+      # Python. That check is manual, on a clean Windows box.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FIS-windows-portable
+          path: dist/FIS
+          retention-days: 14

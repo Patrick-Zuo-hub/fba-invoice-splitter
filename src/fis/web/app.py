@@ -45,7 +45,7 @@ def create_app(
     app.state.database = database
     app.state.lifecycle = Lifecycle()
     app.state.batch_service = BatchService(
-        BatchFiles(settings.data_root),
+        BatchFiles(settings.work_root),
         WorkspaceStore(),
         database=database,
         folder_picker=folder_picker,

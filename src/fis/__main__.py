@@ -1,25 +1,21 @@
 """Console entry point: start the local FIS server and open the browser.
 
-Run with ``python -m fis``. The data directory (SQLite database, temporary
-batch files) defaults to ``~/.fba-invoice-splitter`` and can be overridden
-with the ``FIS_DATA_ROOT`` environment variable.
+Run with ``python -m fis``. In development the data directory defaults to
+``~/.fba-invoice-splitter``; a packaged build keeps it beside the executable.
+``FIS_DATA_ROOT`` overrides either. See ``fis.runtime.layout``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
-from pathlib import Path
 
-from fis.config import Settings
+from fis.runtime.layout import resolve_layout
 from fis.runtime.server import StartupError, launch
 
 
 def main() -> int:
-    default_root = Path.home() / ".fba-invoice-splitter"
-    data_root = Path(os.environ.get("FIS_DATA_ROOT", default_root)).expanduser()
-    settings = Settings(data_root=data_root)
     try:
+        settings = resolve_layout()
         result = asyncio.run(launch(settings))
     except StartupError as error:
         print(f"FIS 启动失败：{error}")
