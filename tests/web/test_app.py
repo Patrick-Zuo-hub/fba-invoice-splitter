@@ -113,3 +113,20 @@ def test_unhandled_exception_returns_generic_secured_500(tmp_path: Path) -> None
     assert response.text == "内部服务器错误"
     assert "sensitive-customer-value" not in response.text
     _assert_security_headers(response)
+
+
+def test_startup_clears_batch_working_files_left_by_a_previous_run(
+    tmp_path: Path,
+) -> None:
+    """The maintenance existed but nothing called it; keep it wired."""
+
+    from fis.storage.batch_files import BatchFiles
+
+    data_root = tmp_path / "data"
+    files = BatchFiles(data_root)
+    (files.create("batch-leftover") / "source.xlsx").write_bytes(b"upload")
+    assert files.list_batch_ids() == ("batch-leftover",)
+
+    create_app(Settings(data_root=data_root), bound_port=8765)
+
+    assert files.list_batch_ids() == ()

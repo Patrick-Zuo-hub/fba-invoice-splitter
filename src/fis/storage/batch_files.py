@@ -379,6 +379,20 @@ class BatchFiles:
     def output_path(self, batch_id: str) -> Path:
         return self._batch(batch_id) / "output"
 
+    def list_batch_ids(self) -> tuple[str, ...]:
+        """Every batch directory currently on disk, in sorted order."""
+
+        try:
+            entries = sorted(os.scandir(self.batches_root), key=lambda entry: entry.name)
+        except FileNotFoundError:
+            return ()
+        return tuple(
+            entry.name
+            for entry in entries
+            if entry.is_dir(follow_symlinks=False)
+            and _SAFE_BATCH_ID.fullmatch(entry.name) is not None
+        )
+
     def create(self, batch_id: str) -> Path:
         work = self._batch(batch_id) / "work"
         self._validate_path(work, "batch work directory")

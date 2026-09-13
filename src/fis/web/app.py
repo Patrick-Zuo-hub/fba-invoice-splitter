@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
@@ -12,6 +13,8 @@ from fis.runtime.lifecycle import Lifecycle
 from fis.services.batches import BatchService, WorkspaceStore
 from fis.storage.batch_files import BatchFiles
 from fis.storage.database import Database
+from fis.storage.recovery import run_startup_maintenance
+from fis.storage.repositories import BatchRepository
 from fis.web.routes import history as history_routes
 from fis.web.routes import masters as masters_routes
 from fis.web.routes import runtime as runtime_routes
@@ -40,12 +43,18 @@ def create_app(
     database = Database(settings.database_path)
     database.initialize()
 
+    files = BatchFiles(settings.work_root)
+    # Settle whatever the previous run left behind. This was written but never
+    # wired in, so interrupted batches stayed stuck in a running state and
+    # their working directories were never reclaimed.
+    run_startup_maintenance(BatchRepository(database), files, datetime.now(UTC))
+
     templates = Jinja2Templates(directory=_WEB_ROOT / "templates")
     app.state.templates = templates
     app.state.database = database
     app.state.lifecycle = Lifecycle()
     app.state.batch_service = BatchService(
-        BatchFiles(settings.work_root),
+        files,
         WorkspaceStore(),
         database=database,
         folder_picker=folder_picker,

@@ -7,7 +7,7 @@ import pytest
 from fis.domain.models import BatchState
 from fis.storage.batch_files import BatchFiles
 from fis.storage.database import Database
-from fis.storage.recovery import recover_interrupted
+from fis.storage.recovery import recover_interrupted, run_startup_maintenance
 from fis.storage.repositories import BatchRepository
 
 FIXED_NOW = datetime(2026, 9, 7, 9, 0, tzinfo=UTC)
@@ -145,3 +145,79 @@ def test_windows_recovery_clears_work_and_marks_batch_incomplete(
 
     assert repository.get("batch-1").state is BatchState.INCOMPLETE
     assert not work.exists()
+
+
+def test_startup_maintenance_discards_every_batch_working_directory(database: Database, tmp_path: Path) -> None:
+    """After a restart no workspace references them: WorkspaceStore is per-process.
+
+    Nothing rebuilds a workspace from the database, so a batch directory that
+    survives a restart can never be read again — it is pure accumulation.
+    """
+
+    repository = BatchRepository(database)
+    files = BatchFiles(tmp_path / "data")
+    for batch_id in ("batch-alpha", "batch-beta", "batch-gamma"):
+        _create_batch(repository, batch_id)
+        (files.create(batch_id) / "source.xlsx").write_bytes(b"upload")
+    repository.set_state("batch-alpha", BatchState.COMPLETED, FIXED_NOW)
+
+    run_startup_maintenance(repository, files, FIXED_NOW)
+
+    assert files.list_batch_ids() == ()
+    assert not files.batches_root.exists() or list(files.batches_root.iterdir()) == []
+
+
+def test_startup_maintenance_keeps_history_readable(database: Database, tmp_path: Path) -> None:
+    """Removing the working files must not remove the record of the batch."""
+
+    repository = BatchRepository(database)
+    files = BatchFiles(tmp_path / "data")
+    _create_batch(repository, "batch-alpha")
+    files.create("batch-alpha")
+    repository.set_state("batch-alpha", BatchState.COMPLETED, FIXED_NOW)
+
+    run_startup_maintenance(repository, files, FIXED_NOW)
+
+    assert [record.id for record in repository.list_history()] == ["batch-alpha"]
+
+
+def test_startup_maintenance_still_marks_interrupted_batches(database: Database, tmp_path: Path) -> None:
+    repository = BatchRepository(database)
+    files = BatchFiles(tmp_path / "data")
+    _create_batch(repository, "batch-alpha")
+    files.create("batch-alpha")
+    repository.set_state("batch-alpha", BatchState.GENERATING, FIXED_NOW)
+
+    run_startup_maintenance(repository, files, FIXED_NOW)
+
+    assert repository.get("batch-alpha").state is BatchState.INCOMPLETE
+
+
+def test_startup_maintenance_removes_a_directory_with_no_record(database: Database, tmp_path: Path) -> None:
+    """A crash between mkdir and insert leaves an orphan nobody would notice."""
+
+    repository = BatchRepository(database)
+    files = BatchFiles(tmp_path / "data")
+    files.create("batch-orphan")
+
+    run_startup_maintenance(repository, files, FIXED_NOW)
+
+    assert files.list_batch_ids() == ()
+
+
+def test_startup_maintenance_survives_a_directory_it_cannot_remove(
+    database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cleanup is housekeeping: it must never stop the application starting."""
+
+    repository = BatchRepository(database)
+    files = BatchFiles(tmp_path / "data")
+    _create_batch(repository, "batch-alpha")
+    files.create("batch-alpha")
+
+    def refuse(batch_id: str) -> None:
+        raise OSError("busy")
+
+    monkeypatch.setattr(files, "delete_batch", refuse)
+
+    run_startup_maintenance(repository, files, FIXED_NOW)
