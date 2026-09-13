@@ -48,3 +48,10 @@ target-version = "py312"
 python_version = "3.12"
 strict = true
 packages = ["fis"]
+# The runtime branches on os.name, which mypy does not narrow, so it checks the
+# POSIX and Windows paths on every platform and typeshed decides which symbols
+# exist from sys.platform. Left unpinned, the same source yields 31 errors on a
+# Windows runner and none on macOS, and every `type: ignore` is correct for one
+# platform and unused on the other. Pin the platform so the check is a property
+# of the code rather than of the machine running it.
+platform = "darwin"
