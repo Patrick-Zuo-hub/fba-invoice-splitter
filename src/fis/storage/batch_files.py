@@ -177,8 +177,8 @@ def _windows_mark_delete(handle: int, path: Path) -> None:
     raise _windows_error(error_code, f"SetFileInformationByHandle failed for {path}")
 
 
-def _windows_rename_directory(source: Path, destination: Path, parent_handle: int) -> None:
-    """Rename through handles we already hold, never through a fresh open.
+def _windows_rename_directory(source: Path, destination: Path) -> None:
+    """Rename in place through the source handle, never through a fresh open.
 
     MoveFileEx, and FileRenameInfo given an absolute path, both have to open
     the destination's parent directory to place the new name — which the guard
@@ -187,10 +187,14 @@ def _windows_rename_directory(source: Path, destination: Path, parent_handle: in
     stops another process running as this user from touching the batch
     directory mid-operation, which ACLs cannot do.
 
-    Naming the destination relative to the parent handle avoids the open
-    entirely, so the protection stays in force. It also resolves the target
-    against a directory already validated, leaving no path to swap.
+    A bare name with a null RootDirectory renames within the source's own
+    directory, which the kernel resolves from the source file object rather
+    than by opening anything. RootDirectory is for moving across directories
+    and SetFileInformationByHandle rejects it here with ERROR_INVALID_PARAMETER.
     """
+
+    if source.parent != destination.parent:
+        raise ValueError("Windows rename is limited to one directory")
 
     _, _, _, set_file_info = _windows_api()
     target = destination.name
@@ -206,7 +210,7 @@ def _windows_rename_directory(source: Path, destination: Path, parent_handle: in
 
     info = _WindowsFileRenameInfo()
     info.replace_if_exists = 0
-    info.root_directory = ctypes.c_void_p(parent_handle)
+    info.root_directory = None
     info.file_name_length = len(target) * 2  # bytes, excluding the terminator
     info.file_name = target
 
@@ -381,11 +385,11 @@ class BatchFiles:
                 _windows_close_handle(child_handle)
 
     def _windows_publish(self, batch_id: str, work: Path, output: Path) -> None:
-        with self._windows_batch_handles(batch_id) as batch_handle:
+        with self._windows_batch_handles(batch_id):
             self._windows_validate_directory(work, "batch work directory")
             if self._is_redirect(output) or output.exists():
                 raise FileExistsError("Batch output already exists")
-            _windows_rename_directory(work, output, batch_handle)
+            _windows_rename_directory(work, output)
 
     def _windows_clear_directory(self, batch_id: str, path: Path, label: str) -> None:
         with self._windows_batch_handles(batch_id):
