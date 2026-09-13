@@ -20,3 +20,8 @@ generated/
 _wip/
 samples/*.xlsx
 samples/**/*.xlsx
+# 仓库任意位置的表格一律忽略：测试夹具由 tests/fixtures/standard_v1_builder.py
+# 程序化生成，无需提交任何 xlsx。确需提交时用 git add -f 并先确认已脱敏。
+*.xlsx
+*.xlsm
+*.xltx
