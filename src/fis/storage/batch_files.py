@@ -28,6 +28,7 @@ _FILE_DISPOSITION_INFO_EX = 21
 _FILE_RENAME_INFO = 3
 _FILE_DISPOSITION_FLAG_DELETE = 1
 _FILE_LIST_DIRECTORY = 0x1
+_FILE_TRAVERSE = 0x20
 _DELETE = 0x10000
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -98,7 +99,8 @@ def _windows_open_handle(path: Path, *, require_directory: bool, delete: bool = 
     create_file, get_file_info, _, _ = _windows_api()
     desired_access = _FILE_READ_ATTRIBUTES
     if require_directory:
-        desired_access |= _FILE_LIST_DIRECTORY
+        # FILE_TRAVERSE lets this handle serve as a rename's RootDirectory.
+        desired_access |= _FILE_LIST_DIRECTORY | _FILE_TRAVERSE
     if delete:
         desired_access |= _DELETE
     handle = create_file(
@@ -175,18 +177,23 @@ def _windows_mark_delete(handle: int, path: Path) -> None:
     raise _windows_error(error_code, f"SetFileInformationByHandle failed for {path}")
 
 
-def _windows_rename_directory(source: Path, destination: Path) -> None:
-    """Rename through the source handle rather than through MoveFileEx.
+def _windows_rename_directory(source: Path, destination: Path, parent_handle: int) -> None:
+    """Rename through handles we already hold, never through a fresh open.
 
-    MoveFileEx has to open the parent directory for write, which the guard
-    handle's read-only share mode refuses — that share mode is deliberate, and
-    `test_windows_protected_directory_rejects_write_handle` pins it. Issuing
-    FileRenameInfo on a handle we already hold touches no other path, so the
-    tamper protection stays in force for the whole operation.
+    MoveFileEx, and FileRenameInfo given an absolute path, both have to open
+    the destination's parent directory to place the new name — which the guard
+    handle's read-only share mode refuses. That share mode is deliberate:
+    `test_windows_protected_directory_rejects_write_handle` pins it, and it
+    stops another process running as this user from touching the batch
+    directory mid-operation, which ACLs cannot do.
+
+    Naming the destination relative to the parent handle avoids the open
+    entirely, so the protection stays in force. It also resolves the target
+    against a directory already validated, leaving no path to swap.
     """
 
     _, _, _, set_file_info = _windows_api()
-    target = str(destination)
+    target = destination.name
     buffer_length = len(target) + 1
 
     class _WindowsFileRenameInfo(ctypes.Structure):
@@ -199,7 +206,7 @@ def _windows_rename_directory(source: Path, destination: Path) -> None:
 
     info = _WindowsFileRenameInfo()
     info.replace_if_exists = 0
-    info.root_directory = None
+    info.root_directory = ctypes.c_void_p(parent_handle)
     info.file_name_length = len(target) * 2  # bytes, excluding the terminator
     info.file_name = target
 
@@ -374,11 +381,11 @@ class BatchFiles:
                 _windows_close_handle(child_handle)
 
     def _windows_publish(self, batch_id: str, work: Path, output: Path) -> None:
-        with self._windows_batch_handles(batch_id):
+        with self._windows_batch_handles(batch_id) as batch_handle:
             self._windows_validate_directory(work, "batch work directory")
             if self._is_redirect(output) or output.exists():
                 raise FileExistsError("Batch output already exists")
-            _windows_rename_directory(work, output)
+            _windows_rename_directory(work, output, batch_handle)
 
     def _windows_clear_directory(self, batch_id: str, path: Path, label: str) -> None:
         with self._windows_batch_handles(batch_id):
