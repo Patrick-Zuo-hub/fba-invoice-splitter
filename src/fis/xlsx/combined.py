@@ -7,6 +7,7 @@ import posixpath
 import re
 import tempfile
 from collections.abc import Sequence
+from importlib import resources
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
@@ -25,6 +26,11 @@ from fis.xlsx.validate import validate_combined_workbook
 
 _FORBIDDEN_SHEET_CHARACTERS = re.compile(r"[\[\]:*?/\\]")
 _MAX_SHEET_TITLE = 31
+
+REFERENCE_SHEET_TITLE = "渠道分解&Fba编码"
+"""Title of the reference worksheet appended after every Shipment worksheet."""
+
+_REFERENCE_ASSET = "渠道分解&Fba编码.xlsx"
 
 
 def combined_filename(source_filename: str) -> str:
@@ -57,7 +63,7 @@ def next_output_path(output_dir: Path, source_filename: str) -> Path:
 def worksheet_titles(requests: Sequence[ShipmentOutput]) -> tuple[str, ...]:
     """Allocate legal, deterministic and case-insensitively unique Sheet titles."""
 
-    occupied: set[str] = set()
+    occupied: set[str] = {REFERENCE_SHEET_TITLE.casefold()}
     result: list[str] = []
     for request in requests:
         preferred = f"{request.warehouse_code}-{request.shipment_id}"
@@ -160,7 +166,9 @@ def _closure(parts: Parts, part: str) -> set[str]:
     return seen
 
 
-def _selected_worksheet(parts: Parts) -> str:
+def _selected_worksheet(parts: Parts, sheet_name: str | None = STANDARD_V1.sheet_name) -> str:
+    """Resolve one worksheet part by title, or the first worksheet when None."""
+
     workbook = _parse(parts, _WORKBOOK_PART)
     rels = _parse(parts, _rels_part(_WORKBOOK_PART))
     targets = {
@@ -168,14 +176,14 @@ def _selected_worksheet(parts: Parts) -> str:
         for relation in rels.findall(f"{{{PACKAGE_REL_NS}}}Relationship")
     }
     for sheet in workbook.iterfind(f"{{{MAIN_NS}}}sheets/{{{MAIN_NS}}}sheet"):
-        if sheet.get("name") != STANDARD_V1.sheet_name:
+        if sheet_name is not None and sheet.get("name") != sheet_name:
             continue
         target = targets.get(sheet.get(f"{{{OFFICE_REL_NS}}}id") or "")
         if target is None:
             break
         return _resolve(_WORKBOOK_PART, target)
     raise _combined_error(
-        "INVALID_COMBINED_INPUT", "货件工作簿缺少标准工作表", STANDARD_V1.sheet_name
+        "INVALID_COMBINED_INPUT", "货件工作簿缺少标准工作表", sheet_name or _WORKBOOK_PART
     )
 
 
@@ -308,6 +316,32 @@ def _clone_sheet_graph(
     return renames[worksheet_part]
 
 
+def _load_reference_package() -> tuple[Parts, str]:
+    """Load the bundled reference workbook and return its parts and worksheet.
+
+    The reference worksheet carries its own ``styles.xml``, whose indices mean
+    something different in the assembled workbook. It declares no custom number
+    formats, so dropping the cell style indices loses only fonts, fills and
+    borders while every value — and the column widths — survive intact.
+    """
+
+    asset = resources.files("fis.xlsx.assets").joinpath(_REFERENCE_ASSET)
+    try:
+        payload = asset.read_bytes()
+    except (OSError, ModuleNotFoundError) as error:
+        raise _combined_error(
+            "REFERENCE_SHEET_MISSING", "缺少随附的渠道分解参考页", _REFERENCE_ASSET
+        ) from error
+
+    package = _read_parts(payload)
+    worksheet_part = _selected_worksheet(package, sheet_name=None)
+    worksheet = _parse(package, worksheet_part)
+    for cell in worksheet.iter(f"{{{MAIN_NS}}}c"):
+        cell.attrib.pop("s", None)
+    package[worksheet_part] = _serialize(worksheet)
+    return package, worksheet_part
+
+
 def _print_area_reference(workbook: etree._Element) -> str | None:
     for name in workbook.iterfind(f"{{{MAIN_NS}}}definedNames/{{{MAIN_NS}}}definedName"):
         if name.get("name") == "_xlnm.Print_Area" and name.text and "!" in name.text:
@@ -437,13 +471,23 @@ def _write_package(parts: Parts) -> bytes:
 
 
 def assemble_combined_workbook(payloads: Sequence[bytes], titles: Sequence[str]) -> bytes:
-    """Build one workbook exposing every Shipment worksheet in the given order."""
+    """Build one workbook exposing every Shipment worksheet in the given order.
+
+    The bundled reference worksheet is always appended after the last Shipment,
+    because the downstream logistics system reads it from the final position.
+    """
 
     if not payloads or len(payloads) != len(titles):
         raise _combined_error("INVALID_COMBINED_INPUT", "合并工作簿输入无效")
 
     packages = [_read_parts(payload) for payload in payloads]
     worksheets = [_selected_worksheet(package) for package in packages]
+
+    reference_package, reference_worksheet = _load_reference_package()
+    packages.append(reference_package)
+    worksheets.append(reference_worksheet)
+    titles = [*titles, REFERENCE_SHEET_TITLE]
+
     shared_table, mappings = _merge_shared_strings(packages)
 
     base = packages[0]
@@ -510,6 +554,7 @@ def _validate_and_publish(
             temporary,
             titles=tuple(titles),
             expectations=tuple((request.shipment_id, request_values(request)) for request in requests),
+            reference_title=REFERENCE_SHEET_TITLE,
         )
         if not report.ok:
             raise _combined_error(

@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from fis.config import Settings
 from fis.storage.repositories import BatchRepository, DefaultsRepository, MasterDataRepository
 from fis.web.app import create_app
-from fis.xlsx.combined import combined_sheet_names
+from fis.xlsx.combined import REFERENCE_SHEET_TITLE, combined_sheet_names
 from fis.xlsx.errors import WorkbookError
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
@@ -121,6 +121,7 @@ def test_generation_publishes_one_workbook_to_selected_folder(
     assert combined_sheet_names(output_dir / "已处理_invoice.xlsx") == (
         "AMAZON-ONT8-S1",
         "AMAZON-ONT8-S2",
+        REFERENCE_SHEET_TITLE,
     )
 
 

@@ -2,7 +2,7 @@ from urllib.parse import urlsplit
 
 from playwright.sync_api import Page, expect
 
-from fis.xlsx.combined import combined_sheet_names
+from fis.xlsx.combined import REFERENCE_SHEET_TITLE, combined_sheet_names
 from tests.browser.conftest import BrowserApp, apply_mapping, upload
 
 
@@ -46,6 +46,7 @@ def test_primary_single_page_flow_uses_loopback_only(
     assert combined_sheet_names(browser_app.output / "已处理_source.xlsx") == (
         "AMAZON-ONT8-S1",
         "AMAZON-IAH3-S2",
+        REFERENCE_SHEET_TITLE,
     )
 
     page.get_by_role("button", name="历史记录").click()

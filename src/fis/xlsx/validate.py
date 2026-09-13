@@ -486,6 +486,7 @@ def validate_combined_workbook(
     *,
     titles: Sequence[str],
     expectations: Sequence[tuple[str, Mapping[str, str]]],
+    reference_title: str | None = None,
 ) -> ValidationReport:
     """Verify an assembled multi-Shipment workbook as one coherent package.
 
@@ -502,16 +503,20 @@ def validate_combined_workbook(
             workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
             sheets = workbook.xpath("./main:sheets/main:sheet", namespaces={"main": MAIN_NS})
             actual = [sheet.get("name") or "" for sheet in sheets]
-            if actual != list(titles):
+            expected = list(titles)
+            if reference_title is not None:
+                expected.append(reference_title)
+            if actual != expected:
                 raise WorkbookError(
                     "COMBINED_SHEET_MISMATCH", "合并工作簿工作表顺序或名称不正确", ",".join(actual)
                 )
+            shipment_sheets = sheets[: len(titles)]
             relations = {
                 relation.get("Id"): relation.get("Target") or ""
                 for relation in package.read_xml("xl/_rels/workbook.xml.rels", MAX_ENTRY)
             }
             shared_strings = _shared_strings(package)
-            for sheet, (shipment_id, values) in zip(sheets, expectations, strict=True):
+            for sheet, (shipment_id, values) in zip(shipment_sheets, expectations, strict=True):
                 target = relations.get(sheet.get(_REL_ID_ATTRIBUTE) or "")
                 if not target:
                     raise WorkbookError(
@@ -522,6 +527,20 @@ def validate_combined_workbook(
                 _validate_combined_relationships(package, worksheet_part)
                 _validate_values(root, values, shared_strings)
                 _validate_combined_shipment(root, shared_strings, shipment_id)
+            if reference_title is not None:
+                reference_sheet = sheets[len(titles)]
+                target = relations.get(reference_sheet.get(_REL_ID_ATTRIBUTE) or "")
+                if not target:
+                    raise WorkbookError(
+                        "COMBINED_SHEET_MISMATCH", "参考页工作表关系缺失", reference_title
+                    )
+                reference_part = package.resolve_relationship_target("xl/workbook.xml", target)
+                reference_root = package.read_xml(reference_part, MAX_ENTRY)
+                _validate_combined_relationships(package, reference_part)
+                if not reference_root.xpath("//main:c", namespaces={"main": MAIN_NS}):
+                    raise WorkbookError(
+                        "COMBINED_SHEET_MISMATCH", "参考页工作表为空", reference_title
+                    )
             _validate_combined_print_areas(workbook, titles)
         return ValidationReport(ok=True)
     except WorkbookError as exc:

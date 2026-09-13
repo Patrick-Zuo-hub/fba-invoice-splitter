@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from fis.config import Settings
 from fis.storage.repositories import MasterDataRepository
 from fis.web.app import create_app
-from fis.xlsx.combined import combined_sheet_names
+from fis.xlsx.combined import REFERENCE_SHEET_TITLE, combined_sheet_names
 from tests.fixtures.standard_v1_builder import build_standard_v1
 
 PORT = 8765
@@ -101,6 +101,7 @@ def test_address_auto_derived_and_generation_succeeds(
     assert combined_sheet_names(output_dir / "已处理_invoice.xlsx") == (
         "AMAZON-ONT8-S1",
         "AMAZON-IAH3-S2",
+        REFERENCE_SHEET_TITLE,
     )
 
 

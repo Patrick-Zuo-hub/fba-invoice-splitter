@@ -9,6 +9,7 @@ from lxml import etree
 
 from fis.xlsx import combined
 from fis.xlsx.combined import (
+    REFERENCE_SHEET_TITLE,
     _merge_shared_strings,
     _remap_shared_string_indices,
     assemble_combined_workbook,
@@ -108,7 +109,9 @@ def test_assembly_creates_ordered_isolated_sheet_relationship_graphs(tmp_path: P
             "AMAZON-IAH3-S2",
             "AMAZON-ONT8-S1",
             "AMAZON-LAX9-S3",
+            REFERENCE_SHEET_TITLE,
         ]
+        sheets = sheets[:3]
 
         workbook_rels = package.read_xml("xl/_rels/workbook.xml.rels", MAX_ENTRY)
         relations = {relation.get("Id"): relation for relation in workbook_rels}
@@ -224,7 +227,11 @@ def test_generate_combined_workbook_publishes_once_and_preserves_order(tmp_path:
     path = generate_combined_workbook(source, requests, output_dir, "invoice.xlsx")
 
     assert path.name == "已处理_invoice.xlsx"
-    assert combined_sheet_names(path) == ("AMAZON-IAH3-S2", "AMAZON-ONT8-S1")
+    assert combined_sheet_names(path) == (
+        "AMAZON-IAH3-S2",
+        "AMAZON-ONT8-S1",
+        REFERENCE_SHEET_TITLE,
+    )
     assert [child.name for child in output_dir.iterdir()] == ["已处理_invoice.xlsx"]
 
 
@@ -359,3 +366,73 @@ def test_combined_workbook_without_print_area_declares_no_defined_names(tmp_path
     with SafePackage.open(path) as package:
         workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
     assert workbook.xpath("./main:definedNames", namespaces={"main": MAIN_NS}) == []
+
+
+def test_reference_sheet_is_appended_last_to_every_workbook(tmp_path: Path) -> None:
+    source = tmp_path / "invoice.xlsx"
+    build_standard_v1(source, {"S2": 1, "S1": 1}, [12, 13])
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    requests = (_request("S2", "IAH3"), _request("S1", "ONT8"))
+
+    path = generate_combined_workbook(source, requests, output_dir, "invoice.xlsx")
+
+    assert combined_sheet_names(path) == (
+        "AMAZON-IAH3-S2",
+        "AMAZON-ONT8-S1",
+        REFERENCE_SHEET_TITLE,
+    )
+
+
+def test_reference_sheet_is_appended_even_for_a_single_shipment(tmp_path: Path) -> None:
+    source = tmp_path / "invoice.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    path = generate_combined_workbook(source, (_request("S1", "ONT8"),), output_dir, "invoice.xlsx")
+
+    assert combined_sheet_names(path) == ("AMAZON-ONT8-S1", REFERENCE_SHEET_TITLE)
+
+
+def test_reference_sheet_keeps_its_rows_and_drops_foreign_style_indices(tmp_path: Path) -> None:
+    source = tmp_path / "invoice.xlsx"
+    build_standard_v1(source, {"S1": 1}, [12])
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    path = generate_combined_workbook(source, (_request("S1", "ONT8"),), output_dir, "invoice.xlsx")
+
+    with SafePackage.open(path) as package:
+        workbook = package.read_xml("xl/workbook.xml", MAX_ENTRY)
+        rels = {
+            relation.get("Id"): relation.get("Target") or ""
+            for relation in package.read_xml("xl/_rels/workbook.xml.rels", MAX_ENTRY)
+        }
+        sheet = workbook.xpath("./main:sheets/main:sheet", namespaces={"main": MAIN_NS})[-1]
+        part = package.resolve_relationship_target(
+            "xl/workbook.xml", rels[sheet.get(f"{{{OFFICE_REL_NS}}}id")]
+        )
+        worksheet = package.read_xml(part, MAX_ENTRY)
+
+    cells = worksheet.xpath("//main:c", namespaces={"main": MAIN_NS})
+    assert len(cells) > 2000
+    assert not any(cell.get("s") for cell in cells), "外来样式索引应被剥离，否则格式会错乱"
+    assert worksheet.xpath("./main:cols", namespaces={"main": MAIN_NS}), "列宽应保留"
+
+
+def test_shipment_title_cannot_collide_with_the_reference_sheet() -> None:
+    titles = worksheet_titles((_request(REFERENCE_SHEET_TITLE, ""),))
+
+    assert titles[0] != REFERENCE_SHEET_TITLE
+
+
+def test_reference_asset_is_importable_as_package_data() -> None:
+    """The repo-wide *.xlsx ignore must not hide the bundled asset."""
+
+    from importlib import resources
+
+    asset = resources.files("fis.xlsx.assets").joinpath("渠道分解&Fba编码.xlsx")
+
+    assert asset.is_file()
+    assert len(asset.read_bytes()) > 1000
