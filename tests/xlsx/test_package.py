@@ -572,3 +572,30 @@ def test_open_failure_closes_the_archive(tmp_path: Path, monkeypatch: pytest.Mon
 
     assert error_code(lambda: SafePackage.open(path)) == "TOO_MANY_ENTRIES"
     assert created[0].fp is None
+
+
+def test_accepts_explicit_directory_entries(tmp_path: Path) -> None:
+    """Many writers emit zero-length directory entries; they are not parts."""
+
+    path = tmp_path / "with-dirs.xlsx"
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for directory in ("_rels/", "xl/", "xl/worksheets/"):
+            archive.writestr(ZipInfo(directory), b"")
+        for name, content in CORE_PARTS.items():
+            archive.writestr(name, content)
+
+    with SafePackage.open(path) as package:
+        assert "xl/" not in package.names
+        assert "xl/workbook.xml" in package.names
+
+
+def test_rejects_a_directory_entry_carrying_data(tmp_path: Path) -> None:
+    """A directory with content is not a directory; do not wave it through."""
+
+    path = tmp_path / "fat-dir.xlsx"
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr(ZipInfo("xl/"), b"payload")
+        for name, content in CORE_PARTS.items():
+            archive.writestr(name, content)
+
+    assert error_code(lambda: SafePackage.open(path)) == "UNSAFE_PATH"

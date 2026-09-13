@@ -1,10 +1,16 @@
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from fis.domain.models import BatchState
 from fis.domain.rules import canonical_amazon_warehouse_code
 from fis.storage.database import Database
+
+if TYPE_CHECKING:
+    from fis.xlsx.masters import MasterData
 
 
 @dataclass(frozen=True)
@@ -351,6 +357,21 @@ class BatchRepository:
 
 
 
+@dataclass(frozen=True, slots=True)
+class MasterImportCounts:
+    added: int = 0
+    updated: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class MasterImportSummary:
+    """What one master-data import changed. Unchanged rows count as neither."""
+
+    fba_warehouses: MasterImportCounts
+    channels: MasterImportCounts
+    delivery_warehouses: MasterImportCounts
+
+
 class MasterDataRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
@@ -389,6 +410,93 @@ class MasterDataRepository:
                 """,
                 (normalized_code, normalized_address, timestamp, timestamp),
             )
+
+    def import_master_data(self, data: MasterData) -> MasterImportSummary:
+        """Upsert a whole master-data workbook in one transaction.
+
+        The uploaded file is authoritative for anything it names, so a changed
+        address overwrites the stored one — deliberately unlike
+        ``create_fba_warehouse``, which refuses to. Anything the file omits is
+        left untouched: history references channels and warehouses by name, so
+        removing them would orphan existing records. Status is never touched
+        either, because deactivating an entry is a deliberate local action.
+        """
+
+        timestamp = _current_timestamp()
+        warehouses = MasterImportCounts()
+        channels = MasterImportCounts()
+        delivery = MasterImportCounts()
+
+        with self._database.transaction() as connection:
+            added = updated = 0
+            for code, address in data.fba_warehouses:
+                normalized_code = canonical_amazon_warehouse_code(code)
+                normalized_address = address.strip()
+                if not normalized_code or not normalized_address:
+                    raise ValueError("FBA 仓库需要仓代码与地址")
+                row = connection.execute(
+                    "SELECT address FROM fba_warehouses WHERE code = ?", (normalized_code,)
+                ).fetchone()
+                if row is None:
+                    connection.execute(
+                        """
+                        INSERT INTO fba_warehouses(code, address, created_at, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (normalized_code, normalized_address, timestamp, timestamp),
+                    )
+                    added += 1
+                elif row["address"] != normalized_address:
+                    connection.execute(
+                        "UPDATE fba_warehouses SET address = ?, updated_at = ? WHERE code = ?",
+                        (normalized_address, timestamp, normalized_code),
+                    )
+                    updated += 1
+            warehouses = MasterImportCounts(added=added, updated=updated)
+
+            added = 0
+            for name in data.channels:
+                normalized = name.strip()
+                if not normalized:
+                    raise ValueError("运输渠道名称不能为空")
+                existing = connection.execute(
+                    "SELECT id FROM shipping_channels WHERE name = ?", (normalized,)
+                ).fetchone()
+                if existing is None:
+                    connection.execute(
+                        """
+                        INSERT INTO shipping_channels(name, created_at, updated_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (normalized, timestamp, timestamp),
+                    )
+                    added += 1
+            channels = MasterImportCounts(added=added)
+
+            added = 0
+            for name in data.delivery_warehouses:
+                normalized = name.strip()
+                if not normalized:
+                    raise ValueError("送货仓库名称不能为空")
+                existing = connection.execute(
+                    "SELECT id FROM delivery_warehouses WHERE name = ?", (normalized,)
+                ).fetchone()
+                if existing is None:
+                    # The sheet carries names only; never read that as a blank
+                    # address for a warehouse that already has one.
+                    connection.execute(
+                        """
+                        INSERT INTO delivery_warehouses(name, address, created_at, updated_at)
+                        VALUES (?, '', ?, ?)
+                        """,
+                        (normalized, timestamp, timestamp),
+                    )
+                    added += 1
+            delivery = MasterImportCounts(added=added)
+
+        return MasterImportSummary(
+            fba_warehouses=warehouses, channels=channels, delivery_warehouses=delivery
+        )
 
     def record_successful_channel(self, code: str, channel_id: int) -> None:
         normalized_code = canonical_amazon_warehouse_code(code)

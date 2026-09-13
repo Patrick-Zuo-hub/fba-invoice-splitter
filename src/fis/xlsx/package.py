@@ -218,6 +218,16 @@ class SafePackage:
                 raise WorkbookError(
                     "UNSUPPORTED_COMPRESSION", "XLSX 包含不支持的压缩算法", entry_name
                 )
+            if info.is_dir():
+                # Common writers emit zero-length directory entries. They carry
+                # no content and are never resolved as parts, so skip them
+                # rather than fail the package on their trailing slash — but a
+                # "directory" with data in it is not one, so reject that.
+                if info.file_size:
+                    raise WorkbookError(
+                        "UNSAFE_PATH", "XLSX 包含不安全的文件路径", entry_name
+                    )
+                continue
             canonical_name = self._canonical_part_name(entry_name)
             if canonical_name in canonical_names:
                 raise WorkbookError("DUPLICATE_ENTRY", "XLSX 包含重复的文件条目", entry_name)

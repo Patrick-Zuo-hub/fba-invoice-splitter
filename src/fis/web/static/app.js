@@ -343,6 +343,46 @@
     });
   }
 
+  // The masters drawer is re-rendered on every change, so its import form is
+  // bound by delegation rather than by a reference taken at load time.
+  document.addEventListener("change", function (event) {
+    var input = event.target;
+    if (!(input instanceof HTMLInputElement) || input.id !== "masters-file") {
+      return;
+    }
+    var label = document.querySelector("[data-masters-file-label]");
+    var file = input.files && input.files[0];
+    if (label) {
+      label.textContent = file ? "已选择：" + file.name : "选择主数据表格";
+    }
+  });
+
+  document.addEventListener("submit", async function (event) {
+    var form = event.target;
+    if (!(form instanceof HTMLFormElement) || form.id !== "masters-import-form") {
+      return;
+    }
+    event.preventDefault();
+    var status = document.getElementById("masters-import-status");
+    if (status) {
+      status.textContent = "正在导入…";
+      status.classList.remove("is-error");
+    }
+    var response = await fisSend("/masters/import", { body: new FormData(form) });
+    var body = await response.text();
+    if (response.ok) {
+      var target = document.getElementById("masters-body");
+      if (target) {
+        target.innerHTML = body;
+      }
+      return;
+    }
+    if (status) {
+      status.textContent = body;
+      status.classList.add("is-error");
+    }
+  });
+
   document.addEventListener("change", function (event) {
     var control = event.target.closest && event.target.closest("[data-cell-save]");
     if (control) {

@@ -1,6 +1,22 @@
 <section id="masters" aria-live="polite">
   <h2>主数据</h2>
 
+  <div class="master-import">
+    <form id="masters-import-form" action="/masters/import" method="post"
+          enctype="multipart/form-data">
+      <label class="file-picker compact" for="masters-file">
+        <span data-masters-file-label>选择主数据表格</span>
+        <input id="masters-file" name="masters" type="file" accept=".xlsx" required>
+      </label>
+      <button class="button secondary compact" type="submit">导入</button>
+    </form>
+    <p class="hint">表格需含「FBA仓代码&amp;详细地址」「渠道」「国内交货仓」三个工作表。以表格为准覆盖，不删除表格中没有的条目。</p>
+    {% if import_summary %}
+    <p class="import-summary" role="status">{{ import_summary }}</p>
+    {% endif %}
+    <p id="masters-import-status" class="status-line" role="alert" aria-live="polite"></p>
+  </div>
+
   <h3>运输渠道</h3>
   <ul class="channels">
     {% for channel in view.channels %}
