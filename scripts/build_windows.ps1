@@ -23,12 +23,18 @@ try {
         throw "FIS.exe was not produced"
     }
 
-    # The three collected resource trees are what a frozen build most often
-    # loses, and losing them fails only at runtime. Check them here instead.
+    # Beside FIS.exe, not inside _internal: whoever receives this folder has
+    # no access to the repository and so has never seen the README.
+    Copy-Item -LiteralPath (Join-Path $projectRoot "packaging/使用说明.txt") `
+              -Destination (Join-Path $bundle "使用说明.txt") -Force
+
+    # The collected resource trees are what a frozen build most often loses,
+    # and losing them fails only at runtime. Check them here instead.
     foreach ($required in @(
         "_internal/fis/web/templates/workspace.html",
         "_internal/fis/web/static/app.js",
-        "_internal/fis/xlsx/assets/渠道分解&Fba编码.xlsx"
+        "_internal/fis/xlsx/assets/渠道分解&Fba编码.xlsx",
+        "使用说明.txt"
     )) {
         $path = Join-Path $bundle $required
         if (-not (Test-Path -LiteralPath $path)) {
