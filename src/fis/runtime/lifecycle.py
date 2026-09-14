@@ -20,7 +20,13 @@ class Lifecycle:
         self,
         *,
         clock: Callable[[], float] = time.monotonic,
-        heartbeat_seconds: float = 15,
+        # How stale a page's last heartbeat may be before that page is treated
+        # as gone — not how often the page beats, which is every five seconds.
+        # Thirty minutes because browsers throttle a hidden tab's timers, often
+        # to once a minute: at fifteen seconds FIS exited while the user was
+        # merely looking at another window. Closing a page does not wait for
+        # this; pagehide reports it directly and the grace period applies.
+        heartbeat_seconds: float = 30 * 60,
         grace_seconds: float = 30,
     ) -> None:
         self._clock = clock
