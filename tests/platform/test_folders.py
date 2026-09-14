@@ -1,4 +1,6 @@
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -88,3 +90,132 @@ def test_native_picker_rejects_unsupported_platform(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(folders.PlatformError):
         folders.NativeFolderPicker().choose(None)
+
+
+def test_powershell_does_not_append_the_path_after_a_command_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """powershell -Command joins everything after it into the command itself.
+
+    An argument placed there never reaches $args; it is concatenated onto the
+    script text, so the dialog opened with no initial directory and PowerShell
+    then tried to run the path as a command.
+    """
+
+    captured: dict[str, object] = {}
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["args"] = args
+        captured["env"] = kwargs.get("env")
+        return _completed(str(tmp_path))
+
+    monkeypatch.setattr(folders.subprocess, "run", fake_run)
+
+    folders.choose_with_powershell(tmp_path)
+
+    args = captured["args"]
+    assert isinstance(args, list)
+    command_index = args.index("-Command")
+    assert command_index == len(args) - 2, "-Command 后只能跟脚本本身"
+    assert str(tmp_path) not in args
+
+
+def test_powershell_passes_the_initial_directory_through_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not interpolated into the script either: a path must never become code."""
+
+    captured: dict[str, object] = {}
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["args"] = args
+        captured["env"] = kwargs.get("env")
+        return _completed(str(tmp_path))
+
+    monkeypatch.setattr(folders.subprocess, "run", fake_run)
+
+    folders.choose_with_powershell(tmp_path)
+
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert environment[folders.INITIAL_DIRECTORY_VARIABLE] == str(tmp_path)
+    args = captured["args"]
+    assert isinstance(args, list)
+    assert all(str(tmp_path) not in argument for argument in args)
+
+
+def test_powershell_clears_a_stale_initial_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise an inherited value would silently steer the dialog."""
+
+    captured: dict[str, object] = {}
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["env"] = kwargs.get("env")
+        return _completed(str(tmp_path))
+
+    monkeypatch.setenv(folders.INITIAL_DIRECTORY_VARIABLE, "C:\\stale")
+    monkeypatch.setattr(folders.subprocess, "run", fake_run)
+
+    folders.choose_with_powershell(None)
+
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert folders.INITIAL_DIRECTORY_VARIABLE not in environment
+
+
+def test_powershell_reads_its_output_as_utf8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Chinese folder name comes back mangled under the console code page."""
+
+    captured: dict[str, object] = {}
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["encoding"] = kwargs.get("encoding")
+        return _completed(str(tmp_path))
+
+    monkeypatch.setattr(folders.subprocess, "run", fake_run)
+
+    folders.choose_with_powershell(None)
+
+    assert captured["encoding"] == "utf-8"
+    assert "[Console]::OutputEncoding" in folders._WINDOWS_SCRIPT
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real PowerShell invocation")
+def test_powershell_really_receives_the_directory_and_returns_utf8(
+    tmp_path: Path,
+) -> None:
+    """Drive real PowerShell the way the picker does, minus the dialog.
+
+    Everything this exercises — that -Command leaves the environment intact,
+    that the script can read the variable, and that a non-ASCII path survives
+    the round trip — is invisible on a developer machine.
+    """
+
+    chinese = tmp_path / "输出文件夹 测试"
+    chinese.mkdir()
+    probe = (
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+        f"$start = [Environment]::GetEnvironmentVariable('{folders.INITIAL_DIRECTORY_VARIABLE}')\n"
+        "if ($start -and (Test-Path -LiteralPath $start)) "
+        "{ [Console]::Out.Write($start) } else { [Console]::Out.Write('MISSING') }\n"
+    )
+    environment = dict(os.environ)
+    environment[folders.INITIAL_DIRECTORY_VARIABLE] = str(chinese)
+
+    completed = subprocess.run(
+        [folders.powershell_executable(), "-NoProfile", "-STA", "-Command", probe],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == str(chinese)
+    assert folders._validate_directory(completed.stdout) == chinese

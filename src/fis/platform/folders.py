@@ -35,11 +35,29 @@ _MAC_SCRIPT = (
     "end run"
 )
 
+INITIAL_DIRECTORY_VARIABLE = "FIS_INITIAL_DIRECTORY"
+
+# The starting directory arrives in the environment. `powershell -Command`
+# treats everything after it as part of the command, so an argument appended
+# there never reaches $args — it is concatenated onto the script text, which
+# both lost the initial directory and left PowerShell trying to run the path
+# as a command.
+#
+# The dialog is shown over a top-most owner window. Without one it can open
+# behind the browser, which looks exactly like the button doing nothing.
+#
+# Output is forced to UTF-8; the default console code page mangles any
+# non-ASCII folder name on its way back.
 _WINDOWS_SCRIPT = (
     "Add-Type -AssemblyName System.Windows.Forms\n"
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
     "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog\n"
-    "if ($args.Count -gt 0) { $dialog.SelectedPath = $args[0] }\n"
-    "$result = $dialog.ShowDialog()\n"
+    "$start = [Environment]::GetEnvironmentVariable('" + "FIS_INITIAL_DIRECTORY" + "')\n"
+    "if ($start -and (Test-Path -LiteralPath $start)) { $dialog.SelectedPath = $start }\n"
+    "$owner = New-Object System.Windows.Forms.Form\n"
+    "$owner.TopMost = $true\n"
+    "$owner.ShowInTaskbar = $false\n"
+    "try { $result = $dialog.ShowDialog($owner) } finally { $owner.Dispose() }\n"
     "if ($result -eq [System.Windows.Forms.DialogResult]::OK) "
     "{ [Console]::Out.Write($dialog.SelectedPath) }\n"
 )
@@ -81,26 +99,37 @@ def choose_with_osascript(initial: Path | None) -> Path | None:
     return _validate_directory(completed.stdout)
 
 
-def choose_with_powershell(initial: Path | None) -> Path | None:
-    executable = os.path.join(
+def powershell_executable() -> str:
+    """The in-box Windows PowerShell, by absolute path rather than via PATH."""
+
+    return os.path.join(
         os.environ.get("SystemRoot", r"C:\\Windows"),
         "System32",
         "WindowsPowerShell",
         "v1.0",
         "powershell.exe",
     )
-    arguments = [
-        executable,
-        "-NoProfile",
-        "-NonInteractive",
-        "-STA",
-        "-Command",
-        _WINDOWS_SCRIPT,
-    ]
+
+
+def choose_with_powershell(initial: Path | None) -> Path | None:
+    executable = powershell_executable()
+    # -Command must come last: PowerShell reads everything after it as the
+    # command. -NonInteractive is deliberately absent — this opens a dialog.
+    arguments = [executable, "-NoProfile", "-STA", "-Command", _WINDOWS_SCRIPT]
+    environment = dict(os.environ)
     if initial is not None:
-        arguments.append(str(initial))
+        environment[INITIAL_DIRECTORY_VARIABLE] = str(initial)
+    else:
+        # An inherited value would silently steer the dialog somewhere else.
+        environment.pop(INITIAL_DIRECTORY_VARIABLE, None)
     completed = subprocess.run(
-        arguments, capture_output=True, text=True, check=False
+        arguments,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
     )
     if completed.returncode != 0:
         raise PlatformError("无法打开文件夹选择窗口")
@@ -147,6 +176,7 @@ class NativeFolderOpener:
 
 
 __all__ = [
+    "INITIAL_DIRECTORY_VARIABLE",
     "FolderOpener",
     "FolderPicker",
     "NativeFolderOpener",
@@ -155,4 +185,5 @@ __all__ = [
     "choose_with_osascript",
     "choose_with_powershell",
     "open_with_system",
+    "powershell_executable",
 ]
