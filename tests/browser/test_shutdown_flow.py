@@ -58,3 +58,58 @@ def test_thirty_second_grace_refresh_recovery_and_active_job_delay() -> None:
     assert lifecycle.should_exit() is False
     lifecycle.end_job()
     assert lifecycle.should_exit() is True
+
+
+def test_a_second_tab_keeps_the_server_alive(page: Page, browser_app: BrowserApp) -> None:
+    """Closing one window only stops FIS if it was the last one: each tab
+    heartbeats under its own id."""
+
+    lifecycle = browser_app.app.state.lifecycle
+    second = page.context.new_page()
+    second.goto(browser_app.url)
+
+    deadline = time.monotonic() + 2
+    while lifecycle.snapshot().live_pages != 2:
+        if time.monotonic() >= deadline:
+            raise AssertionError("the second tab did not register")
+        time.sleep(0.01)
+
+    page.close()
+    deadline = time.monotonic() + 2
+    while lifecycle.snapshot().live_pages != 1:
+        if time.monotonic() >= deadline:
+            raise AssertionError("closing one tab should leave the other")
+        time.sleep(0.01)
+    assert lifecycle.should_exit() is False
+
+    second.close()
+    deadline = time.monotonic() + 2
+    while lifecycle.snapshot().live_pages != 0:
+        if time.monotonic() >= deadline:
+            raise AssertionError("closing the last tab did not remove it")
+        time.sleep(0.01)
+
+
+def test_closing_mid_generation_waits_for_the_job(page: Page, browser_app: BrowserApp) -> None:
+    """A close during generation must not cut the workbook short."""
+
+    lifecycle = browser_app.app.state.lifecycle
+    deadline = time.monotonic() + 2
+    while lifecycle.snapshot().live_pages != 1:
+        if time.monotonic() >= deadline:
+            raise AssertionError("page never registered")
+        time.sleep(0.01)
+
+    lifecycle.begin_job()
+    page.close()
+    deadline = time.monotonic() + 2
+    while lifecycle.snapshot().live_pages != 0:
+        if time.monotonic() >= deadline:
+            raise AssertionError("page close did not remove the live page")
+        time.sleep(0.01)
+
+    snapshot = lifecycle.snapshot()
+    assert snapshot.active_jobs == 1
+    assert snapshot.exit_eligible is False, "生成进行中不应退出"
+
+    lifecycle.end_job()
