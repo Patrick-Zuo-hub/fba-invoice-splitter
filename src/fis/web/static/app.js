@@ -481,22 +481,21 @@
     if (!input) {
       return;
     }
-    var combo = input.closest("[data-combo]");
-    if (event.key === "Escape") {
-      input.value = combo.dataset.previousValue || "";
-      closeCombo(combo);
-      return;
-    }
-    if (event.key === "Enter") {
-      event.preventDefault();
-      var visible = comboOptions(combo).filter(function (option) {
-        return !option.hidden;
-      });
-      if (visible.length > 0) {
-        commitCombo(combo, visible[0].textContent.trim());
-      }
+    // Enter is deliberately not handled here. Typing Latin letters with a
+    // Chinese IME leaves its candidate bar open, and Enter there means "commit
+    // what I typed" — taking it to mean "pick the first suggestion" chose a
+    // channel the user never looked at. Choosing is by click, or by typing a
+    // name in full, which the exact match on blur accepts.
+    if (event.key === "Escape" && !event.isComposing) {
+      // Escape dismisses the IME's candidates too; only act once that is done.
+      input.value = combo(input).dataset.previousValue || "";
+      closeCombo(combo(input));
     }
   });
+
+  function combo(input) {
+    return input.closest("[data-combo]");
+  }
 
   var DEFAULT_FILE_LABEL = "选择 Excel 文件";
 

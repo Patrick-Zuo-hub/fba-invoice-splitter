@@ -148,3 +148,57 @@ def test_bulk_fill_offers_the_same_filtered_list(page: Page, browser_app: Browse
         expect(
             page.locator(f'[data-shipment-row="{row}"] [data-combo-input]')
         ).to_have_value("MATSON Express")
+
+
+def test_enter_does_not_choose_an_option(page: Page, browser_app: BrowserApp) -> None:
+    """With a Chinese IME, Enter commits the candidate text — it is the IME's
+    key, not ours. Claiming it selected the first row of the list instead."""
+
+    _open(page, browser_app)
+    row = page.locator('[data-shipment-row="S1"]')
+    combo = row.locator("[data-combo-input]")
+
+    combo.click()
+    # "ma" matches MATSON Express, so Enter had something to wrongly select.
+    combo.fill("ma")
+    combo.press("Enter")
+
+    # What the user typed stays put; nothing was chosen behind their back.
+    expect(combo).to_have_value("ma")
+    expect(row.locator("[data-combo-list]")).to_be_visible()
+
+
+def test_escape_while_composing_leaves_the_text_alone(
+    page: Page, browser_app: BrowserApp
+) -> None:
+    """The IME uses Escape to dismiss its candidates; resetting the field then
+    would throw away what the user was in the middle of typing."""
+
+    _open(page, browser_app)
+    combo = page.locator('[data-shipment-row="S1"] [data-combo-input]')
+    combo.click()
+    combo.fill("ca")
+
+    combo.evaluate(
+        "el => el.dispatchEvent(new KeyboardEvent('keydown', "
+        "{key: 'Escape', isComposing: true, bubbles: true}))"
+    )
+
+    expect(combo).to_have_value("ca")
+
+
+def test_typing_a_full_name_still_saves_without_enter(
+    page: Page, browser_app: BrowserApp
+) -> None:
+    """Enter is gone, so the exact-match-on-blur path has to carry the weight."""
+
+    _open(page, browser_app)
+    row = page.locator('[data-shipment-row="S1"]')
+    combo = row.locator("[data-combo-input]")
+
+    combo.click()
+    combo.fill("MATSON Express")
+    page.locator("h1").click()
+
+    expect(combo).to_have_value("MATSON Express")
+    expect(page.locator("#save-status")).to_have_text("已保存")
