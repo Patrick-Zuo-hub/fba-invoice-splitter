@@ -9,16 +9,18 @@ from fis.domain.rules import (
 )
 
 
-def test_pickup_is_the_next_thursday_and_today_counts() -> None:
-    assert default_dates(date(2026, 9, 7))[0] == date(2026, 9, 10)   # Monday
-    assert default_dates(date(2026, 9, 10))[0] == date(2026, 9, 10)  # Thursday itself
-    assert default_dates(date(2026, 9, 11))[0] == date(2026, 9, 17)  # Friday rolls on
+def test_pickup_is_the_thursday_strictly_after_today() -> None:
+    """On a Thursday the cut-off has passed, so pickup is the following week."""
+
+    assert default_dates(date(2026, 9, 14))[0] == date(2026, 9, 17)  # Monday
+    assert default_dates(date(2026, 9, 17))[0] == date(2026, 9, 24)  # Thursday rolls on
+    assert default_dates(date(2026, 9, 18))[0] == date(2026, 9, 24)  # Friday
 
 
 def test_sailing_is_the_first_monday_after_pickup() -> None:
-    assert default_dates(date(2026, 9, 7)) == (date(2026, 9, 10), date(2026, 9, 14))
-    assert default_dates(date(2026, 9, 10)) == (date(2026, 9, 10), date(2026, 9, 14))
-    assert default_dates(date(2026, 9, 11)) == (date(2026, 9, 17), date(2026, 9, 21))
+    assert default_dates(date(2026, 9, 14)) == (date(2026, 9, 17), date(2026, 9, 21))
+    assert default_dates(date(2026, 9, 17)) == (date(2026, 9, 24), date(2026, 9, 28))
+    assert default_dates(date(2026, 9, 18)) == (date(2026, 9, 24), date(2026, 9, 28))
 
 
 def test_sailing_always_follows_pickup_and_lands_on_a_monday() -> None:
@@ -26,9 +28,11 @@ def test_sailing_always_follows_pickup_and_lands_on_a_monday() -> None:
     pickup for anyone opening the tool late in the week."""
 
     for offset in range(400):
-        delivery, sailing = default_dates(date(2026, 9, 7) + timedelta(days=offset))
+        today = date(2026, 9, 7) + timedelta(days=offset)
+        delivery, sailing = default_dates(today)
         assert delivery.weekday() == 3, delivery
         assert sailing.weekday() == 0, sailing
+        assert delivery > today, (today, delivery)
         assert sailing > delivery
 
 
