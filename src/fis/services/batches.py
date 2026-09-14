@@ -14,7 +14,7 @@ import os
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,7 @@ from fis.domain.rules import (
     canonical_amazon_warehouse_code,
     default_dates,
     parse_warehouse_mapping,
+    sailing_after,
 )
 from fis.platform.folders import (
     FolderOpener,
@@ -390,7 +391,7 @@ class BatchService:
         if delivery_changed and not manual.get(scope, False):
             delivery = merged.delivery_date
             if delivery is not None:
-                merged = replace(merged, sailing_date=delivery + timedelta(days=7))
+                merged = replace(merged, sailing_date=sailing_after(delivery))
         return merged
 
     # -- resolution -------------------------------------------------------
@@ -449,7 +450,7 @@ class BatchService:
         delivery_date = pick("delivery_date") or delivery
         sailing_date = pick("sailing_date")
         if sailing_date is None:
-            sailing_date = delivery_date + timedelta(days=7) if delivery_date else sailing_default
+            sailing_date = sailing_after(delivery_date) if delivery_date else sailing_default
         channel = pick("channel") or self._default_channel(code)
         return {
             "warehouse_code": warehouse_code,

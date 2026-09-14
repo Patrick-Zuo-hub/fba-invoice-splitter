@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fis.config import Settings
+from fis.domain.rules import sailing_after
 from fis.storage.repositories import MasterDataRepository
 from fis.web.app import create_app
 from tests.fixtures.standard_v1_builder import build_standard_v1
@@ -109,7 +110,11 @@ def test_auto_sailing_follows_delivery_change(
 
     service = app.state.batch_service
     workspace = service.get(uploaded_batch)
-    assert service.effective_fields(workspace, "S1")["sailing_date"] == date(2026, 9, 27)
+    # The first Monday after the new pickup date, by the one shared rule.
+    assert service.effective_fields(workspace, "S1")["sailing_date"] == date(2026, 9, 21)
+    assert service.effective_fields(workspace, "S1")["sailing_date"] == sailing_after(
+        date(2026, 9, 20)
+    )
 
 
 def test_manual_sailing_date_survives_later_delivery_change(
@@ -346,3 +351,20 @@ def test_inline_address_cannot_overwrite_existing_master(
 
     assert response.status_code == 422
     assert MasterDataRepository(app.state.database).get_fba_warehouse("ONT8").address == "Original"
+
+
+def test_the_page_shows_the_sailing_date_the_rule_says(
+    app: FastAPI, uploaded_batch: str
+) -> None:
+    """The workspace computed sailing itself instead of asking the rule, so
+    changing the rule left what the page actually shows on the old behaviour."""
+
+    service = app.state.batch_service
+    workspace = service.get(uploaded_batch)
+
+    for shipment in workspace.parsed.shipments:
+        fields = service.effective_fields(workspace, shipment.shipment_id)
+        delivery = fields["delivery_date"]
+        assert isinstance(delivery, date)
+        assert fields["sailing_date"] == sailing_after(delivery)
+        assert fields["sailing_date"] != delivery + timedelta(days=7)

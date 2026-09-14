@@ -12,6 +12,18 @@ def canonical_amazon_warehouse_code(value: str) -> str:
     return f"{_AMAZON_WAREHOUSE_PREFIX}{normalized}"
 
 
+def sailing_after(delivery: date) -> date:
+    """The first Monday strictly after a pickup date.
+
+    Stated here once because three places needed it: the defaults, the
+    workspace view, and the follow-up when a user edits the pickup date. It
+    had been written out at each of them, so changing one left the other two
+    on the old rule.
+    """
+
+    return delivery + timedelta(days=(0 - delivery.weekday()) % 7 or 7)
+
+
 def default_dates(today: date) -> tuple[date, date]:
     """Pickup on the next Thursday, sailing on the first Monday after it.
 
@@ -27,10 +39,7 @@ def default_dates(today: date) -> tuple[date, date]:
     # `or 7` is what keeps today off the list when today is a Thursday.
     days_until_thursday = (3 - today.weekday()) % 7 or 7
     delivery = today + timedelta(days=days_until_thursday)
-    # Computed rather than a fixed +4 so it stays correct if pickup ever moves
-    # off Thursday; `or 7` keeps it strictly after a pickup that is a Monday.
-    days_until_monday = (0 - delivery.weekday()) % 7 or 7
-    return delivery, delivery + timedelta(days=days_until_monday)
+    return delivery, sailing_after(delivery)
 
 
 def parse_warehouse_mapping(text: str) -> dict[str, str]:

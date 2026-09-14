@@ -6,6 +6,7 @@ from fis.domain.rules import (
     canonical_amazon_warehouse_code,
     default_dates,
     parse_warehouse_mapping,
+    sailing_after,
 )
 
 
@@ -91,3 +92,26 @@ def test_mapping_accepts_chinese_header_after_leading_blank_lines() -> None:
 def test_mapping_rejects_malformed_recognized_header() -> None:
     with pytest.raises(ValueError, match="Invalid mapping row 1"):
         parse_warehouse_mapping("Warehouse Code\tShipment ID\tExtra")
+
+
+def test_sailing_after_is_the_rule_on_its_own() -> None:
+    """The workspace needs this separately: when a user edits the pickup date,
+    sailing has to follow that date rather than today's default."""
+
+    assert sailing_after(date(2026, 9, 17)) == date(2026, 9, 21)  # Thursday
+    assert sailing_after(date(2026, 9, 21)) == date(2026, 9, 28)  # Monday moves on
+    assert sailing_after(date(2026, 9, 20)) == date(2026, 9, 21)  # Sunday
+    for offset in range(400):
+        pickup = date(2026, 9, 7) + timedelta(days=offset)
+        sailing = sailing_after(pickup)
+        assert sailing.weekday() == 0, sailing
+        assert sailing > pickup
+
+
+def test_default_dates_uses_the_same_rule() -> None:
+    """Stated once. It was written out three times and a change to one of them
+    left the other two behind."""
+
+    for offset in range(400):
+        delivery, sailing = default_dates(date(2026, 9, 7) + timedelta(days=offset))
+        assert sailing == sailing_after(delivery)
