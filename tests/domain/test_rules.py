@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -9,9 +9,27 @@ from fis.domain.rules import (
 )
 
 
-def test_default_date_uses_nearest_thursday() -> None:
-    assert default_dates(date(2026, 9, 7)) == (date(2026, 9, 10), date(2026, 9, 17))
-    assert default_dates(date(2026, 9, 10)) == (date(2026, 9, 10), date(2026, 9, 17))
+def test_pickup_is_the_next_thursday_and_today_counts() -> None:
+    assert default_dates(date(2026, 9, 7))[0] == date(2026, 9, 10)   # Monday
+    assert default_dates(date(2026, 9, 10))[0] == date(2026, 9, 10)  # Thursday itself
+    assert default_dates(date(2026, 9, 11))[0] == date(2026, 9, 17)  # Friday rolls on
+
+
+def test_sailing_is_the_first_monday_after_pickup() -> None:
+    assert default_dates(date(2026, 9, 7)) == (date(2026, 9, 10), date(2026, 9, 14))
+    assert default_dates(date(2026, 9, 10)) == (date(2026, 9, 10), date(2026, 9, 14))
+    assert default_dates(date(2026, 9, 11)) == (date(2026, 9, 17), date(2026, 9, 21))
+
+
+def test_sailing_always_follows_pickup_and_lands_on_a_monday() -> None:
+    """Anchored to pickup, not to today: anchoring to today puts sailing before
+    pickup for anyone opening the tool late in the week."""
+
+    for offset in range(400):
+        delivery, sailing = default_dates(date(2026, 9, 7) + timedelta(days=offset))
+        assert delivery.weekday() == 3, delivery
+        assert sailing.weekday() == 0, sailing
+        assert sailing > delivery
 
 
 def test_mapping_trims_and_uppercases_codes() -> None:

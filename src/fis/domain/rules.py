@@ -13,9 +13,19 @@ def canonical_amazon_warehouse_code(value: str) -> str:
 
 
 def default_dates(today: date) -> tuple[date, date]:
+    """Pickup on the coming Thursday, sailing on the first Monday after it.
+
+    Both are anchored to the pickup date rather than to today. Anchored to
+    today, sailing would fall before pickup for anyone opening the tool from
+    Friday onwards, when pickup has already rolled to the following week.
+    """
+
     days_until_thursday = (3 - today.weekday()) % 7
     delivery = today + timedelta(days=days_until_thursday)
-    return delivery, delivery + timedelta(days=7)
+    # Computed rather than a fixed +4 so it stays correct if pickup ever moves
+    # off Thursday; `or 7` keeps it strictly after a pickup that is a Monday.
+    days_until_monday = (0 - delivery.weekday()) % 7 or 7
+    return delivery, delivery + timedelta(days=days_until_monday)
 
 
 def parse_warehouse_mapping(text: str) -> dict[str, str]:
