@@ -63,13 +63,22 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .upload-card form { display: flex; align-items: center; gap: 10px; }
 .upload-card.is-collapsed { display: none; }
 .file-picker {
+  /* Positioned so the hidden input below cannot escape the label and stretch
+     across the form, where it would swallow clicks meant for other controls. */
+  position: relative;
   min-width: 240px; min-height: 40px; display: flex; align-items: center; padding: 0 14px;
   border: 1px dashed #aebed3; border-radius: 8px; color: #536078; background: #f9fbfe;
   cursor: pointer;
 }
 .file-picker:hover { border-color: #1769e0; color: #1769e0; }
 .file-picker.has-file { border-style: solid; border-color: #16a36a; color: #23634d; background: #f1f8f5; }
-.file-picker input { width: 1px; height: 1px; opacity: 0; position: absolute; }
+/* [type=file] rather than a bare descendant selector: `.drawer-body input`
+   has the same specificity and comes later, so it won this and inflated the
+   input to the full width of the drawer. */
+.file-picker input[type="file"] {
+  width: 1px; height: 1px; min-height: 0; padding: 0; border: 0;
+  opacity: 0; position: absolute; left: 0; top: 0;
+}
 .status-line { grid-column: 1 / -1; color: #748095; }
 .status-line.is-error { color: #b1262e; }
 

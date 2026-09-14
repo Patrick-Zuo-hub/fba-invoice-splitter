@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.browser.conftest import BrowserApp
 from tests.fixtures.master_data_builder import (
@@ -9,6 +9,28 @@ from tests.fixtures.master_data_builder import (
     FBA_SHEET,
     build_master_data,
 )
+
+
+def _assert_reaches_the_pointer(locator: Locator) -> None:
+    """Fail if something else sits on top of this control.
+
+    Playwright's own click passed while the hidden file input covered the
+    import button — it set the file programmatically and the click still
+    landed — so occlusion has to be asserted directly.
+    """
+
+    locator.scroll_into_view_if_needed()
+    covered = locator.evaluate(
+        "el => {"
+        "  const b = el.getBoundingClientRect();"
+        "  const x = b.x + b.width / 2, y = b.y + b.height / 2;"
+        "  if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return 'viewport';"
+        "  const hit = document.elementFromPoint(x, y);"
+        "  return hit === el || el.contains(hit) ? null :"
+        "    (hit ? hit.tagName + (hit.id ? '#' + hit.id : '') : 'nothing');"
+        "}"
+    )
+    assert covered is None, f"控件被 {covered} 遮挡"
 
 
 def test_master_data_import_reports_counts_in_the_drawer(
@@ -31,6 +53,10 @@ def test_master_data_import_reports_counts_in_the_drawer(
     page.get_by_role("button", name="主数据").click()
     drawer = page.get_by_role("complementary").filter(has_text="主数据")
     expect(drawer.locator("[data-masters-file-label]")).to_have_text("选择主数据表格")
+
+    _assert_reaches_the_pointer(drawer.get_by_role("button", name="导入"))
+    # The picker only opens if a click on the label reaches the label.
+    _assert_reaches_the_pointer(drawer.locator(".file-picker"))
 
     page.locator("#masters-file").set_input_files(source)
     expect(drawer.locator("[data-masters-file-label]")).to_have_text("已选择：masters.xlsx")
