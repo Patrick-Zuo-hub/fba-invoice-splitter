@@ -189,7 +189,21 @@
     if (!badge || !folder || !button) {
       return;
     }
-    button.disabled = badge.dataset.completeCount !== badge.dataset.totalCount || folder.dataset.folderSelected !== "true";
+    // A dead button with no explanation reads as a broken one: say what is
+    // missing rather than leaving the user clicking at nothing.
+    var reasons = [];
+    if (badge.dataset.completeCount !== badge.dataset.totalCount) {
+      reasons.push("仍有货件未填写完整");
+    }
+    if (folder.dataset.folderSelected !== "true") {
+      reasons.push("尚未选择输出文件夹");
+    }
+    button.disabled = reasons.length > 0;
+    button.title = reasons.length > 0 ? "暂时无法生成：" + reasons.join("；") : "";
+    var hint = document.getElementById("generation-hint");
+    if (hint) {
+      hint.textContent = reasons.join("；");
+    }
   }
 
   async function saveCell(control) {
@@ -295,6 +309,135 @@
     }
     restoreTablePosition();
   }
+
+  // --- searchable channel picker -------------------------------------------
+  // A plain <select> with 279 channels means scrolling to find one. This keeps
+  // the same saved value and the same [data-cell-save] path, but filters the
+  // list to whatever the user has typed.
+
+  function comboOptions(combo) {
+    return Array.prototype.slice.call(combo.querySelectorAll("[data-combo-option]"));
+  }
+
+  function filterCombo(combo) {
+    var input = combo.querySelector("[data-combo-input]");
+    var needle = input.value.trim().toLowerCase();
+    var shown = 0;
+    comboOptions(combo).forEach(function (option) {
+      // Contains, not starts-with, and case-insensitive. An empty box shows all.
+      var match = needle === "" || option.textContent.toLowerCase().indexOf(needle) !== -1;
+      option.hidden = !match;
+      if (match) {
+        shown += 1;
+      }
+    });
+    return shown;
+  }
+
+  function openCombo(combo) {
+    var list = combo.querySelector("[data-combo-list]");
+    var input = combo.querySelector("[data-combo-input]");
+    combo.dataset.previousValue = input.value;
+    filterCombo(combo);
+    list.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+  }
+
+  function closeCombo(combo) {
+    var list = combo.querySelector("[data-combo-list]");
+    var input = combo.querySelector("[data-combo-input]");
+    list.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+  }
+
+  function commitCombo(combo, value) {
+    var input = combo.querySelector("[data-combo-input]");
+    var previous = combo.dataset.previousValue || "";
+    input.value = value;
+    closeCombo(combo);
+    if (value !== previous) {
+      void saveCell(input);
+    }
+  }
+
+  function exactOption(combo, value) {
+    var wanted = value.trim().toLowerCase();
+    var found = null;
+    comboOptions(combo).forEach(function (option) {
+      if (option.textContent.toLowerCase() === wanted) {
+        found = option.textContent;
+      }
+    });
+    return found;
+  }
+
+  document.addEventListener("focusin", function (event) {
+    var input = event.target.closest && event.target.closest("[data-combo-input]");
+    document.querySelectorAll("[data-combo]").forEach(function (combo) {
+      if (!input || combo !== input.closest("[data-combo]")) {
+        closeCombo(combo);
+      }
+    });
+    if (input) {
+      openCombo(input.closest("[data-combo]"));
+    }
+  });
+
+  document.addEventListener("input", function (event) {
+    var input = event.target.closest && event.target.closest("[data-combo-input]");
+    if (input) {
+      filterCombo(input.closest("[data-combo]"));
+    }
+  });
+
+  document.addEventListener("mousedown", function (event) {
+    var option = event.target.closest && event.target.closest("[data-combo-option]");
+    if (!option) {
+      return;
+    }
+    // mousedown, not click: blur would close the list first.
+    event.preventDefault();
+    commitCombo(option.closest("[data-combo]"), option.textContent.trim());
+  });
+
+  document.addEventListener("focusout", function (event) {
+    var input = event.target.closest && event.target.closest("[data-combo-input]");
+    if (!input) {
+      return;
+    }
+    var combo = input.closest("[data-combo]");
+    window.setTimeout(function () {
+      if (combo.contains(document.activeElement)) {
+        return;
+      }
+      // Half-typed text is not a channel; sending it would only earn a
+      // rejection from the server, so put back what was there.
+      var exact = input.value.trim() === "" ? "" : exactOption(combo, input.value);
+      commitCombo(combo, exact === null ? combo.dataset.previousValue || "" : exact);
+    }, 0);
+  });
+
+  document.addEventListener("keydown", function (event) {
+    var input = event.target.closest && event.target.closest("[data-combo-input]");
+    if (!input) {
+      return;
+    }
+    var combo = input.closest("[data-combo]");
+    if (event.key === "Escape") {
+      input.value = combo.dataset.previousValue || "";
+      closeCombo(combo);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      var visible = comboOptions(combo).filter(function (option) {
+        return !option.hidden;
+      });
+      if (visible.length > 0) {
+        commitCombo(combo, visible[0].textContent.trim());
+      }
+    }
+  });
 
   var DEFAULT_FILE_LABEL = "选择 Excel 文件";
 

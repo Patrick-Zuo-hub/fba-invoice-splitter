@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import uvicorn
 from fastapi import FastAPI
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Locator, Page, sync_playwright
 
 from fis.config import Settings
 from fis.storage.repositories import MasterDataRepository
@@ -56,6 +56,8 @@ def browser_app(tmp_path: Path) -> BrowserApp:
     masters = MasterDataRepository(app.state.database)
     masters.add_channel("美森正班")
     masters.add_channel("空运")
+    # Latin-script too, so the case-insensitive filter is testable.
+    masters.add_channel("MATSON Express")
     masters.add_delivery_warehouse("义乌仓", "浙江省义乌市测试路 1 号")
     masters.create_fba_warehouse("ONT8", "Ontario, CA 91761")
 
@@ -99,6 +101,13 @@ def page(browser_app: BrowserApp) -> Page:
 def upload(page: Page, path: Path) -> None:
     page.locator("#invoice").set_input_files(path)
     page.get_by_role("button", name="上传并解析").click()
+
+
+def choose_channel(row: Locator, name: str) -> None:
+    """Pick a channel from the filtered list, the way a user does."""
+
+    row.locator("[data-combo-input]").click()
+    row.locator("[data-combo-list] li", has_text=name).first.click()
 
 
 def apply_mapping(page: Page, text: str) -> None:

@@ -3,7 +3,7 @@ from urllib.parse import urlsplit
 from playwright.sync_api import Page, expect
 
 from fis.xlsx.combined import REFERENCE_SHEET_TITLE, combined_sheet_names
-from tests.browser.conftest import BrowserApp, apply_mapping, upload
+from tests.browser.conftest import BrowserApp, apply_mapping, choose_channel, upload
 
 
 def test_primary_single_page_flow_uses_loopback_only(
@@ -24,14 +24,14 @@ def test_primary_single_page_flow_uses_loopback_only(
     s2.locator("[data-save-address]").click()
     expect(s2.locator(".address-cell")).to_contain_text("Houston, TX 77032")
 
-    s1.locator('[data-field="channel"]').select_option(label="空运")
+    choose_channel(s1, "空运")
     expect(s1.locator('[data-field="channel"]')).to_have_value("空运")
     page.locator('[data-bulk-field="delivery_warehouse"]').click()
     page.locator("#bulk-value").select_option(label="义乌仓")
     page.locator("[data-bulk-confirm]").click()
     expect(s1.locator('[data-field="delivery_warehouse"]')).to_have_value("义乌仓")
     expect(s2.locator('[data-field="delivery_warehouse"]')).to_have_value("义乌仓")
-    s2.locator('[data-field="channel"]').select_option(label="美森正班")
+    choose_channel(s2, "美森正班")
     expect(page.get_by_text("2 / 2 完整")).to_be_visible()
 
     page.get_by_role("button", name="选择输出文件夹").click()

@@ -2,7 +2,7 @@ import re
 
 from playwright.sync_api import Page, expect
 
-from tests.browser.conftest import BrowserApp, apply_mapping, upload
+from tests.browser.conftest import BrowserApp, apply_mapping, choose_channel, upload
 
 
 def test_error_recovery_preserves_valid_row_values(
@@ -29,7 +29,7 @@ def test_error_recovery_preserves_valid_row_values(
     s2.locator("[data-save-address]").click()
     expect(s2.locator(".address-cell")).to_contain_text("New warehouse test address")
 
-    s1.locator('[data-field="channel"]').select_option(label="空运")
+    choose_channel(s1, "空运")
     expect(s1.locator('[data-field="channel"]')).to_have_value("空运")
     result = page.evaluate(
         """async () => {

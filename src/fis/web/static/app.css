@@ -21,7 +21,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   top: 0;
   z-index: 40;
   height: 72px;
-  padding: 0 4vw;
+  padding: 0 24px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -51,7 +51,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   padding: 0; border: 0; color: #1769e0; background: transparent; font-weight: 600;
 }
 
-.app-main { width: min(1440px, 94vw); margin: 24px auto 112px; }
+/* Width from the containing block, not the viewport: the body has a px
+   min-width, so a vw-based width shrank below it and `margin: auto` then
+   centred the work area inside a body wider than the window — leaving a
+   gap down the left and pushing everything out of reach to the right.
+   Left-aligned for the same reason: the sticky columns should start where
+   the eye does. */
+.app-main { width: min(1440px, 100% - 48px); margin: 24px 24px 112px; }
 .upload-card {
   display: grid; grid-template-columns: 1fr auto; gap: 20px; align-items: center;
   padding: 26px 28px; background: #fff; border: 1px solid #e2e7ef; border-radius: 12px;
@@ -243,3 +249,18 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .file-picker.compact { min-width: 180px; min-height: 32px; font-size: 13px; }
 .master-import .hint { margin: 0; color: #748095; font-size: 12px; line-height: 1.5; }
 .import-summary { margin: 0; color: #23634d; font-size: 13px; font-weight: 600; }
+
+.combo { position: relative; }
+.combo-input { width: 100%; }
+.combo-list {
+  position: absolute; left: 0; top: calc(100% + 2px); z-index: 60; margin: 0; padding: 4px 0;
+  max-height: 240px; min-width: 100%; overflow-y: auto; list-style: none;
+  border: 1px solid #cfd7e3; border-radius: 8px; background: #fff;
+  box-shadow: 0 10px 24px rgb(23 32 51 / 16%);
+}
+.combo-list li { padding: 7px 12px; color: #3e4a5f; font-size: 12px; white-space: nowrap; cursor: pointer; }
+.combo-list li:hover { color: #1769e0; background: #eef4fd; }
+.combo-list li[hidden] { display: none; }
+
+.generation-hint { margin: 4px 0 0; color: #9a650d; font-size: 11px; text-align: center; }
+.generation-hint:empty { display: none; }

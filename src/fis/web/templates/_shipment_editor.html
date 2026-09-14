@@ -59,10 +59,16 @@
             {% endif %}
           </td>
           <td class="editable-cell {% if row.errors.channel %}field-incomplete{% endif %}">
-            <select data-cell-save data-field="channel" aria-label="{{ row.shipment_id }} 运输渠道">
-              <option value="">请选择</option>
-              {% for id, name in view.channel_choices %}<option value="{{ name }}" {% if row.fields.channel == name %}selected{% endif %}>{{ name }}</option>{% endfor %}
-            </select>
+            <div class="combo" data-combo>
+              <input type="text" class="combo-input" data-combo-input data-cell-save
+                     data-field="channel" value="{{ row.fields.channel }}"
+                     placeholder="请选择" autocomplete="off" role="combobox"
+                     aria-expanded="false" aria-autocomplete="list"
+                     aria-label="{{ row.shipment_id }} 运输渠道">
+              <ul class="combo-list" data-combo-list role="listbox" hidden>
+                {% for id, name in view.channel_choices %}<li role="option" data-combo-option>{{ name }}</li>{% endfor %}
+              </ul>
+            </div>
           </td>
           <td class="editable-cell {% if row.errors.delivery_date %}field-incomplete{% endif %}">
             <input type="date" data-cell-save data-field="delivery_date" aria-label="{{ row.shipment_id }} 提货日期" value="{{ row.fields.delivery_date }}">
@@ -112,6 +118,7 @@
           生成工作簿
         </button>
       </form>
+      <p id="generation-hint" class="generation-hint" aria-live="polite"></p>
     </div>
   </div>
 </section>
