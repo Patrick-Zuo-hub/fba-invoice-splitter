@@ -253,8 +253,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .combo { position: relative; }
 .combo-input { width: 100%; }
 .combo-list {
-  position: absolute; left: 0; top: calc(100% + 2px); z-index: 60; margin: 0; padding: 4px 0;
-  max-height: 240px; min-width: 100%; overflow-y: auto; list-style: none;
+  /* Fixed, not absolute: the table scroller clips its own children. */
+  position: fixed; z-index: 95; margin: 0; padding: 4px 0;
+  max-height: 240px; overflow-y: auto; list-style: none;
   border: 1px solid #cfd7e3; border-radius: 8px; background: #fff;
   box-shadow: 0 10px 24px rgb(23 32 51 / 16%);
 }

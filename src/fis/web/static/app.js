@@ -249,14 +249,27 @@
     var host = popover.querySelector("[data-bulk-control]");
     host.innerHTML = "";
     var source = document.querySelector('[data-cell-save][data-field="' + activeBulkField + '"]');
-    var input = source && source.tagName === "SELECT" ? source.cloneNode(true) : document.createElement("input");
+    var combo = source && source.closest("[data-combo]");
+    var input;
+    if (combo) {
+      // Reuse the row control wholesale so batch filling filters exactly the
+      // way the per-row field does, rather than falling back to a bare box.
+      var copy = combo.cloneNode(true);
+      copy.removeAttribute("data-previous-value");
+      input = copy.querySelector("[data-combo-input]");
+      input.value = "";
+      copy.querySelector("[data-combo-list]").hidden = true;
+      host.appendChild(copy);
+    } else {
+      input = source && source.tagName === "SELECT" ? source.cloneNode(true) : document.createElement("input");
+      host.appendChild(input);
+    }
     input.id = "bulk-value";
     input.removeAttribute("data-cell-save");
     input.removeAttribute("aria-label");
     if (activeBulkField.indexOf("date") !== -1) {
       input.type = "date";
     }
-    host.appendChild(input);
     var rect = trigger.getBoundingClientRect();
     popover.style.left = Math.max(16, Math.min(window.innerWidth - 292, rect.left - 80)) + "px";
     popover.style.top = Math.min(window.innerHeight - 230, rect.bottom + 8) + "px";
@@ -334,14 +347,57 @@
     return shown;
   }
 
+  var COMBO_LIST_MAX_HEIGHT = 240;
+
+  function positionCombo(combo) {
+    // Fixed to the viewport, because the table scroller clips anything
+    // positioned inside it and the list only showed two and a half options.
+    var input = combo.querySelector("[data-combo-input]");
+    var list = combo.querySelector("[data-combo-list]");
+    var box = input.getBoundingClientRect();
+    var below = window.innerHeight - box.bottom;
+    list.style.left = box.left + "px";
+    list.style.minWidth = box.width + "px";
+    if (below < COMBO_LIST_MAX_HEIGHT && box.top > below) {
+      list.style.top = "auto";
+      list.style.bottom = window.innerHeight - box.top + 2 + "px";
+      list.style.maxHeight = Math.min(COMBO_LIST_MAX_HEIGHT, box.top - 8) + "px";
+    } else {
+      list.style.bottom = "auto";
+      list.style.top = box.bottom + 2 + "px";
+      list.style.maxHeight = Math.min(COMBO_LIST_MAX_HEIGHT, below - 8) + "px";
+    }
+  }
+
   function openCombo(combo) {
     var list = combo.querySelector("[data-combo-list]");
     var input = combo.querySelector("[data-combo-input]");
     combo.dataset.previousValue = input.value;
     filterCombo(combo);
     list.hidden = false;
+    positionCombo(combo);
     input.setAttribute("aria-expanded", "true");
   }
+
+  function openCombos() {
+    return Array.prototype.slice.call(document.querySelectorAll("[data-combo]")).filter(
+      function (combo) {
+        return !combo.querySelector("[data-combo-list]").hidden;
+      }
+    );
+  }
+
+  // Scrolling the table moves the input but not a viewport-fixed list.
+  window.addEventListener(
+    "scroll",
+    function () {
+      openCombos().forEach(positionCombo);
+    },
+    true
+  );
+  window.addEventListener("resize", function () {
+    openCombos().forEach(positionCombo);
+  });
 
   function closeCombo(combo) {
     var list = combo.querySelector("[data-combo-list]");
@@ -354,6 +410,9 @@
     var input = combo.querySelector("[data-combo-input]");
     var previous = combo.dataset.previousValue || "";
     input.value = value;
+    // Without this the next revert would fall back past this choice, to
+    // whatever was there when the list was first opened.
+    combo.dataset.previousValue = value;
     closeCombo(combo);
     if (value !== previous) {
       void saveCell(input);
