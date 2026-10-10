@@ -43,7 +43,7 @@ async def _read_bounded(upload: UploadFile, limit: int) -> list[bytes]:
             break
         total += len(chunk)
         if total > limit:
-            raise UploadRejected(413, "发票文件超过 50 MiB 上限")
+            raise UploadRejected(413, "发票文件超过 100 MiB 上限")
         chunks.append(chunk)
     return chunks
 

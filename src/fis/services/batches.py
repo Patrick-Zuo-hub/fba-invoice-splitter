@@ -46,7 +46,7 @@ from fis.xlsx.errors import WorkbookError
 from fis.xlsx.generator import ShipmentOutput
 from fis.xlsx.parser import ParsedBundle, parse_invoice_bundle
 
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 _SOURCE_FILENAME = "source.xlsx"
 
 _TEXT_FIELDS = ("warehouse_code", "warehouse_address", "channel", "delivery_warehouse")
@@ -183,7 +183,7 @@ def _stream_to_file(destination: Path, chunks: Iterable[bytes], limit: int) -> s
         for chunk in chunks:
             written += len(chunk)
             if written > limit:
-                raise UploadRejected(413, "发票文件超过 50 MiB 上限")
+                raise UploadRejected(413, "发票文件超过 100 MiB 上限")
             hasher.update(chunk)
             handle.write(chunk)
     if written == 0:
