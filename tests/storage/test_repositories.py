@@ -136,7 +136,7 @@ def test_create_persists_standard_template_state_and_source_metadata(
 
 def test_batch_repository_rejects_naive_datetimes(database: Database) -> None:
     repository = BatchRepository(database)
-    naive = datetime(2026, 9, 7, 9, 0)  # noqa: DTZ001 - deliberately invalid input
+    naive = datetime(2026, 9, 7, 9, 0, tzinfo=UTC).replace(tzinfo=None)
 
     with pytest.raises(ValueError, match="timezone-aware"):
         create_batch(repository, "batch-1", naive)

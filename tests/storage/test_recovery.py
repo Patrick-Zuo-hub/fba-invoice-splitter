@@ -121,7 +121,7 @@ def test_recovery_rejects_naive_now_before_changing_batches(
     files = BatchFiles(tmp_path / "data")
     _create_batch(repository, "batch-1")
     files.create("batch-1")
-    naive = datetime(2026, 9, 7, 9, 0)  # noqa: DTZ001 - deliberately invalid input
+    naive = datetime(2026, 9, 7, 9, 0, tzinfo=UTC).replace(tzinfo=None)
 
     with pytest.raises(ValueError, match="timezone-aware"):
         recover_interrupted(repository, files, naive)
