@@ -66,6 +66,7 @@ class ParsedBundle:
     product_rows: tuple[int, ...]
     separator_row: int
     total_row: int
+    template_type: str = "standard-v1"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "shipments", tuple(self.shipments))

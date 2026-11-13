@@ -215,11 +215,17 @@ async def save_bulk_field(request: Request, batch_id: str) -> Response:
         return PlainTextResponse("请求体必须是 JSON 对象", status_code=400)
     service = _service(request)
     try:
+        selected = payload.get("shipment_ids")
+        if selected is not None and (
+            not isinstance(selected, list) or any(not isinstance(s, str) for s in selected)
+        ):
+            raise ValueError("所选货件应为货件号列表")
         workspace, errors = await run_in_threadpool(
             service.save_bulk_field,
             batch_id,
             str(payload.get("field", "")),
             payload.get("value"),
+            selected,
         )
     except KeyError:
         return PlainTextResponse("未找到该批次", status_code=404)
@@ -288,6 +294,42 @@ async def apply_mapping(request: Request, batch_id: str) -> Response:
     except ValueError as error:
         return PlainTextResponse(f"映射解析失败：{error}", status_code=422)
     return _summary_response(request, workspace, report)
+
+
+@router.patch("/workspace/{batch_id}/equator-settings")
+async def save_equator_settings(request: Request, batch_id: str) -> Response:
+    service = _service(request)
+    try:
+        workspace = service.require(batch_id)
+        if workspace.equator is None:
+            return PlainTextResponse("不是赤道 2.0 批次", status_code=422)
+        changes = await request.json()
+        if not isinstance(changes, dict):
+            return PlainTextResponse("公共字段应为对象", status_code=422)
+        workspace.equator.save_settings(changes)
+        view = service.editor_view(workspace)
+        return JSONResponse({"rows": view["rows"], "complete_count": view["complete_count"], "total_count": view["total_count"]})
+    except KeyError:
+        return PlainTextResponse("未找到该批次", status_code=404)
+    except ValueError as error:
+        return PlainTextResponse(str(error), status_code=422)
+
+
+@router.get("/workspace/{batch_id}/equator-preview")
+async def equator_preview(request: Request, batch_id: str) -> Response:
+    try:
+        workspace = _service(request).require(batch_id)
+    except KeyError:
+        return PlainTextResponse("未找到该批次", status_code=404)
+    state = workspace.equator
+    if state is None:
+        return PlainTextResponse("不是赤道 2.0 批次", status_code=422)
+    rows = []
+    items = sorted((i for s in workspace.parsed.shipments for i in s.items), key=lambda i: i.source_row)
+    for n, item in enumerate(items, 5):
+        fields = state.fields(item.shipment_id)
+        rows.append([n, item.shipment_id, fields["customer_code"], item.shipment_id, fields["channel_code"], fields["channel"], fields["warehouse_code"], fields.get("address_R", ""), fields["delivery_warehouse"], fields["arrival_time"], item.cells.get("X", ""), item.cells.get("AD", ""), item.cells.get("AK", ""), item.cells.get("AM", "")])
+    return _templates(request).TemplateResponse(request=request, name="_equator_preview.html", context={"rows": rows})
 
 
 __all__ = ["router"]

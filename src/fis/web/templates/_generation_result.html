@@ -1,5 +1,5 @@
 <section id="generation-result" class="generation-toast" role="status" aria-live="polite">
-  <strong>已生成 1 个工作簿，共包含 {{ sheet_count }} 个货件 Sheet</strong>
+  <strong>{% if result.single_sheet %}已生成 1 个工作簿，全部 {{ result.item_count }} 条明细位于“模版”Sheet{% else %}已生成 1 个工作簿，共包含 {{ sheet_count }} 个货件 Sheet{% endif %}</strong>
   <span>{{ filename }} 已保存至 {{ output_directory }}</span>
 </section>
 <div id="generation-action">

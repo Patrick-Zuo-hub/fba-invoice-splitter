@@ -31,7 +31,7 @@ dev = [
 # The repo-wide *.xlsx ignore keeps customer spreadsheets out of commits, but it
 # also hides this bundled asset from Hatchling's VCS file discovery. Name it
 # explicitly so the reference worksheet ships inside the wheel.
-artifacts = ["src/fis/xlsx/assets/*.xlsx"]
+artifacts = ["src/fis/xlsx/assets/*.xlsx", "src/fis/xlsx/assets/*.json"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fis"]

@@ -34,6 +34,7 @@ try {
         "_internal/fis/web/templates/workspace.html",
         "_internal/fis/web/static/app.js",
         "_internal/fis/xlsx/assets/渠道分解&Fba编码.xlsx",
+        "_internal/fis/xlsx/assets/equator-catalog.json",
         "使用说明.txt"
     )) {
         $path = Join-Path $bundle $required

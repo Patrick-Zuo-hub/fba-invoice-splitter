@@ -201,6 +201,8 @@ class BatchRepository:
         item_count: int,
         shipments: list[tuple[str, str]],
         now: datetime,
+        template_type: str = "fba-customs-standard",
+        template_version: str = "v1",
     ) -> None:
         timestamp = _timestamp(now)
         with self._database.transaction() as connection:
@@ -217,8 +219,8 @@ class BatchRepository:
                     batch_id,
                     filename,
                     sha256,
-                    "fba-customs-standard",
-                    "v1",
+                    template_type,
+                    template_version,
                     BatchState.COMPLETED.value,
                     shipment_count,
                     item_count,

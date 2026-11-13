@@ -1,0 +1,2 @@
+<p>仅预览关键列；正式输出保留全部 50 列及商品图片。客户单号逐行填写所属 FBA 主单号，同一货件的多条明细使用同一个客户单号。</p>
+<table class="shipment-table"><thead><tr><th>Excel 行</th><th>货件</th><th>客户编码 A</th><th>客户单号 B</th><th>服务产品 G</th><th>产品名称 H</th><th>仓库 J</th><th>地址 R</th><th>国内仓 E</th><th>到仓时间 F</th><th>箱数 X</th><th>品名 AD</th><th>数量 AK</th><th>货值 AM</th></tr></thead><tbody>{% for row in rows %}<tr>{% for value in row %}<td>{{ value }}</td>{% endfor %}</tr>{% endfor %}</tbody></table>

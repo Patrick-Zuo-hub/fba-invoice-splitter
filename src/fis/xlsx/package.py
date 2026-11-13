@@ -65,6 +65,7 @@ class SafePackage:
 
     path: Path
     archive: ZipFile
+    allow_external_workbook_links: bool = False
     _entries: dict[str, ZipInfo] = field(default_factory=dict, init=False, repr=False)
     _canonical_entries: dict[str, ZipInfo] = field(default_factory=dict, init=False, repr=False)
     _content_types_cache: tuple[Mapping[str, str], Mapping[str, str]] | None = field(
@@ -74,7 +75,9 @@ class SafePackage:
     _closed: bool = field(default=False, init=False, repr=False)
 
     @classmethod
-    def open(cls, path: Path | str) -> SafePackage:
+    def open(
+        cls, path: Path | str, *, allow_external_workbook_links: bool = False
+    ) -> SafePackage:
         package_path = Path(path)
         if package_path.suffix.lower() != ".xlsx" or not package_path.is_file():
             raise WorkbookError("INVALID_PATH", "请选择存在的 .xlsx 工作簿文件")
@@ -83,7 +86,10 @@ class SafePackage:
         validated = False
         try:
             archive = ZipFile(package_path, "r")
-            package = cls(path=package_path, archive=archive)
+            package = cls(
+                path=package_path, archive=archive,
+                allow_external_workbook_links=allow_external_workbook_links,
+            )
             package._validate()
             validated = True
             return package
@@ -445,6 +451,19 @@ class SafePackage:
                     raise WorkbookError("INVALID_RELATIONSHIP", "XLSX 关系缺少或无效字段", location)
                 relation_type = relationship_type.lower()
                 if (element.get("TargetMode") or "").lower() == "external":
+                    # Lingxing exports stale lookup-workbook links. The Equator
+                    # adapter reads scalar data only, never follows these links,
+                    # and builds an output without them. Other external resource
+                    # kinds (images, hyperlinks, OLE, etc.) remain rejected.
+                    if (
+                        self.allow_external_workbook_links
+                        and canonical_part.startswith("xl/externallinks/_rels/")
+                        and relation_type in {
+                            "http://schemas.openxmlformats.org/officedocument/2006/relationships/externallinkpath",
+                            "http://schemas.microsoft.com/office/2006/relationships/xlexternallinkpath/xlpathmissing",
+                        }
+                    ):
+                        continue
                     raise WorkbookError(
                         "EXTERNAL_RESOURCE", "V1 不支持外部链接或外部资源", location
                     )

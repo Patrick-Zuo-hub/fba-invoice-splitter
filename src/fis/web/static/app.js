@@ -9,6 +9,8 @@
     delivery_date: "提货日期",
     sailing_date: "开船日期",
     delivery_warehouse: "交仓仓库",
+    arrival_time: "预计到仓时间",
+    customs: "是否报关",
   };
 
   function sections() {
@@ -161,11 +163,20 @@
     if (addressCell) {
       if (rowData.fields.warehouse_address) {
         addressCell.textContent = rowData.fields.warehouse_address;
+      } else if (row.closest("[data-equator]")) {
+        addressCell.textContent = "请补充仓库映射或更新赤道地址字典";
       } else if (!addressCell.querySelector("[data-inline-address]")) {
         makeInlineAddress(row, addressCell);
       }
       addressCell.classList.toggle("field-incomplete", Boolean(rowData.errors.warehouse_address));
     }
+    row.querySelectorAll("[data-value-field]").forEach(function (node) {
+      node.textContent = rowData.fields[node.dataset.valueField] || "待映射";
+    });
+    var channelCode = row.querySelector("[data-channel-code]");
+    if (channelCode) channelCode.textContent = rowData.fields.channel_code || "";
+    var errors = row.querySelector("[data-equator-errors]");
+    if (errors) errors.textContent = Object.values(rowData.errors).join("；");
     var status = row.querySelector(".row-status");
     if (status) {
       status.textContent = rowData.complete ? "完整" : "待补充";
@@ -270,6 +281,7 @@
     if (activeBulkField.indexOf("date") !== -1) {
       input.type = "date";
     }
+    if (activeBulkField === "arrival_time") input.type = "datetime-local";
     var rect = trigger.getBoundingClientRect();
     popover.style.left = Math.max(16, Math.min(window.innerWidth - 292, rect.left - 80)) + "px";
     popover.style.top = Math.min(window.innerHeight - 230, rect.bottom + 8) + "px";
@@ -287,7 +299,8 @@
     setSaveState("保存中…", false);
     var response = await fisSend("/workspace/" + encodeURIComponent(editor.dataset.batchId) + "/bulk", {
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ field: activeBulkField, value: input.value }),
+      body: JSON.stringify({ field: activeBulkField, value: input.value,
+        shipment_ids: editor.dataset.equator ? Array.from(editor.querySelectorAll("[data-equator-select]:checked")).map(function (c) { return c.closest("[data-shipment-row]").dataset.shipmentRow; }) : undefined }),
     });
     var body = await response.json();
     if (!response.ok) {
@@ -338,7 +351,9 @@
     var shown = 0;
     comboOptions(combo).forEach(function (option) {
       // Contains, not starts-with, and case-insensitive. An empty box shows all.
-      var match = needle === "" || option.textContent.toLowerCase().indexOf(needle) !== -1;
+      var match = needle === "" || needle.split(/\s+/).every(function (word) {
+        return option.textContent.toLowerCase().indexOf(word) !== -1;
+      });
       option.hidden = !match;
       if (match) {
         shown += 1;
@@ -423,8 +438,9 @@
     var wanted = value.trim().toLowerCase();
     var found = null;
     comboOptions(combo).forEach(function (option) {
-      if (option.textContent.toLowerCase() === wanted) {
-        found = option.textContent;
+      var value = option.dataset.comboValue || option.textContent;
+      if (value.toLowerCase() === wanted || option.textContent.toLowerCase() === wanted) {
+        found = value;
       }
     });
     return found;
@@ -456,7 +472,7 @@
     }
     // mousedown, not click: blur would close the list first.
     event.preventDefault();
-    commitCombo(option.closest("[data-combo]"), option.textContent.trim());
+    commitCombo(option.closest("[data-combo]"), option.dataset.comboValue || option.textContent.trim());
   });
 
   document.addEventListener("focusout", function (event) {
@@ -591,6 +607,25 @@
     }
   });
 
+  document.addEventListener("change", async function (event) {
+    var control = event.target.closest && event.target.closest("[data-equator-setting]");
+    if (!control) return;
+    var editor = control.closest("#shipment-editor");
+    var changes = {};
+    changes[control.dataset.equatorSetting] = control.value;
+    setSaveState("保存中…", false);
+    try {
+      var response = await fisSend("/workspace/" + encodeURIComponent(editor.dataset.batchId) + "/equator-settings", {
+        method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(changes)
+      });
+      if (!response.ok) { setSaveState(await response.text(), true); return; }
+      var body = await response.json();
+      body.rows.forEach(updateRow);
+      updateCompletion(body.complete_count, body.total_count);
+      setSaveState("已保存", false);
+    } catch (error) { setSaveState("保存失败，请重试", true); }
+  });
+
   document.addEventListener("submit", async function (event) {
     var form = event.target;
     if (!(form instanceof HTMLFormElement) || !form.dataset.fis) {
@@ -609,6 +644,17 @@
   document.addEventListener("click", async function (event) {
     var trigger = event.target.closest && event.target.closest("button, [data-fis-load]");
     if (!trigger) {
+      return;
+    }
+    if (trigger.matches("[data-equator-preview]")) {
+      var eqEditor = trigger.closest("#shipment-editor");
+      var preview = document.getElementById("equator-preview-content");
+      preview.textContent = "正在加载…";
+      try {
+        var previewResponse = await fetch("/workspace/" + encodeURIComponent(eqEditor.dataset.batchId) + "/equator-preview", { headers: { "X-FIS-Request": "1" } });
+        if (previewResponse.ok) preview.innerHTML = await previewResponse.text();
+        else preview.textContent = await previewResponse.text();
+      } catch (error) { preview.textContent = "预览加载失败，请重试"; }
       return;
     }
     if (trigger.matches("[data-product-toggle]")) {

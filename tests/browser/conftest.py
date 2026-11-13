@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import threading
 import time
@@ -87,7 +88,9 @@ def browser_app(tmp_path: Path) -> BrowserApp:
 @pytest.fixture
 def page(browser_app: BrowserApp) -> Page:
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+        browser = playwright.chromium.launch(
+            headless=True, channel=os.environ.get("FIS_TEST_BROWSER_CHANNEL")
+        )
         context = browser.new_context()
         page = context.new_page()
         page.goto(browser_app.url)

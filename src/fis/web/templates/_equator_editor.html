@@ -1,0 +1,46 @@
+<section id="shipment-editor" class="shipment-card equator-editor" data-equator="true" aria-live="polite" data-batch-id="{{ view.batch_id }}">
+  <header class="shipment-card-header">
+    <div><h2>赤道 2.0 · 货件信息</h2><span>{{ view.total_count }} 个货件 · {{ view.item_count }} 条明细 · 全部写入同一 Sheet</span></div>
+    <div class="workspace-state"><span id="completion-badge" class="status-badge" data-complete-count="{{ view.complete_count }}" data-total-count="{{ view.total_count }}">{{ view.complete_count }} / {{ view.total_count }} 完整</span><span id="save-status" class="save-status" role="status">已保存</span></div>
+  </header>
+  <div class="equator-settings">
+    <label>客户编码（必填）<input data-equator-setting="customer_code" value="{{ view.settings.customer_code }}" aria-label="客户编码"></label>
+    <label>运单备注<input data-equator-setting="remarks" value="{{ view.settings.remarks }}" aria-label="运单备注" placeholder="本批通用，选填"></label>
+    <label>货物材质<select data-equator-setting="goods_material" aria-label="货物材质">{% for material in ['不涉检','木','竹','蜡','化妆品','肥皂','沐浴盐','藤蔓','草制品','密度板'] %}<option {% if view.settings.goods_material == material %}selected{% endif %}>{{ material }}</option>{% endfor %}</select></label>
+  </div>
+  <p class="equator-note">预计到仓时间优先读取源文件；缺失时为下一个周四 00:00，可修改。渠道按 FBA 仓库记住最近一次选择。</p>
+  <div class="table-scroll" data-table-scroll>
+    <table id="shipment-table" class="shipment-table equator-table">
+      <thead><tr>
+        <th scope="col">货件 / 商品 / 箱数</th><th scope="col">FBA 仓库与收件地址</th>
+        <th scope="col">物流渠道<button type="button" class="batch-link" data-bulk-field="channel">批量</button></th>
+        <th scope="col">国内收货仓<button type="button" class="batch-link" data-bulk-field="delivery_warehouse">批量</button></th>
+        <th scope="col">预计到仓时间<button type="button" class="batch-link" data-bulk-field="arrival_time">批量</button></th>
+        <th scope="col">是否报关<button type="button" class="batch-link" data-bulk-field="customs">批量</button></th><th scope="col">完整性</th>
+      </tr></thead>
+      <tbody>{% for row in view.rows %}
+        <tr data-shipment-row="{{ row.shipment_id }}" class="{% if row.complete %}row-complete{% else %}row-incomplete{% endif %}">
+          <th scope="row"><label><input type="checkbox" data-equator-select aria-label="选择 {{ row.shipment_id }}"> {{ row.shipment_id }}</label><p>{{ row.product_summary }} · {{ row.carton_count }} 箱</p><details><summary>查看 {{ row.item_count }} 条明细</summary>{% for item in row['items'] %}<p>源第 {{ item.row }} 行：{{ item.name }} · {{ item.cartons or '共箱' }} 箱 · {{ item.quantity }} 件 · {{ item.amount }}</p>{% endfor %}</details></th>
+          <td class="{% if row.errors.warehouse_code or row.errors.warehouse_address %}field-incomplete{% endif %}"><strong data-value-field="warehouse_code">{{ row.fields.warehouse_code or '待映射' }}</strong><p class="address-cell">{{ row.fields.warehouse_address or '请在上方粘贴仓库代码与货件号的映射；地址由赤道字典自动匹配。' }}</p><details><summary>查看完整收件信息</summary><p>国家：{{ row.fields.address_K }}<br>省/州：{{ row.fields.address_L }}<br>城市：{{ row.fields.address_M }}<br>收件人：{{ row.fields.address_N }}<br>公司：{{ row.fields.address_O }}<br>电话：{{ row.fields.address_P }}<br>邮编：{{ row.fields.address_Q }}<br>地址：{{ row.fields.address_R }}</p></details></td>
+          <td class="editable-cell {% if row.errors.channel %}field-incomplete{% endif %}"><div class="combo" data-combo>
+            <input type="text" class="combo-input" data-combo-input data-cell-save data-field="channel" value="{{ row.fields.channel }}" placeholder="搜索渠道名称或代码" autocomplete="off" role="combobox" aria-expanded="false" aria-autocomplete="list" aria-label="{{ row.shipment_id }} 物流渠道">
+            <ul class="combo-list" data-combo-list role="listbox" hidden>{% for id, name in view.channel_choices %}<li role="option" data-combo-option data-combo-value="{{ name }}">{{ name }} · {{ view.channel_codes[name] }}</li>{% endfor %}</ul>
+          </div><span class="equator-code" data-channel-code>{{ row.fields.channel_code }}</span></td>
+          <td class="editable-cell {% if row.errors.delivery_warehouse %}field-incomplete{% endif %}"><select data-cell-save data-field="delivery_warehouse" aria-label="{{ row.shipment_id }} 国内收货仓"><option value="">请选择</option>{% for id, name in view.delivery_warehouse_choices %}<option {% if row.fields.delivery_warehouse == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></td>
+          <td class="editable-cell"><input type="datetime-local" data-cell-save data-field="arrival_time" value="{{ row.fields.arrival_time }}" aria-label="{{ row.shipment_id }} 预计到仓时间"></td>
+          <td class="editable-cell"><select data-cell-save data-field="customs" aria-label="{{ row.shipment_id }} 是否报关">{% for value in ['是','否','/'] %}<option {% if row.fields.customs == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></td>
+          <td class="completeness"><span class="row-status {% if row.complete %}complete{% else %}incomplete{% endif %}">{{ '完整' if row.complete else '待补充' }}</span><p class="equator-errors" data-equator-errors>{{ row.errors.values() | join('；') }}</p></td>
+        </tr>
+      {% endfor %}</tbody>
+    </table>
+  </div>
+  <div id="bulk-popover" class="bulk-popover" hidden><strong data-bulk-title>批量设置</strong><span>勾选时应用到所选货件，否则应用到全部货件</span><label data-bulk-label for="bulk-value">字段</label><div data-bulk-control></div><div class="popover-actions"><button type="button" class="text-button" data-bulk-clear>清空</button><button type="button" class="button secondary compact" data-bulk-cancel>取消</button><button type="button" class="button primary compact" data-bulk-confirm>确认</button></div></div>
+  <details class="equator-preview"><summary>预览单 Sheet 输出 · {{ view.item_count }} 行</summary><button type="button" class="button secondary compact" data-equator-preview>刷新输出预览</button><div id="equator-preview-content" class="table-scroll">点击刷新，查看当前设置写入每条明细的结果。</div></details>
+  <div class="action-bar" data-batch-id="{{ view.batch_id }}">
+    <div><span>货件完整度</span><strong data-completion-text>{{ view.complete_count }} / {{ view.total_count }}</strong></div>
+    <div id="output-folder" class="output-folder" data-folder-selected="{{ 'true' if view.output_directory else 'false' }}"><span>输出文件夹</span><strong>{{ view.output_directory or '首次使用，请选择保存位置' }}</strong></div>
+    <form data-fis="post" action="/workspace/{{ view.batch_id }}/output-folder" method="post"><button class="button secondary" type="submit">{{ '更改文件夹' if view.output_directory else '选择输出文件夹' }}</button></form>
+    <p id="workspace-status" class="action-message" role="alert"></p>
+    <div id="generation-action"><form data-fis="post" action="/workspace/{{ view.batch_id }}/generate" method="post"><button class="button primary generate" type="submit" {% if view.complete_count != view.total_count or not view.output_directory %}disabled{% endif %}>生成单 Sheet 工作簿</button></form><p id="generation-hint" class="generation-hint"></p></div>
+  </div>
+</section>

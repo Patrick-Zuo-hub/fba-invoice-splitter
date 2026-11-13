@@ -1,3 +1,4 @@
+{% if view.equator %}{% include '_equator_editor.html' %}{% else %}
 <section id="shipment-editor" class="shipment-card" aria-live="polite" data-batch-id="{{ view.batch_id }}">
   <header class="shipment-card-header">
     <div>
@@ -122,3 +123,4 @@
     </div>
   </div>
 </section>
+{% endif %}

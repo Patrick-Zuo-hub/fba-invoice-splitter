@@ -33,6 +33,7 @@ from fis.platform.folders import (
     NativeFolderPicker,
     PlatformError,
 )
+from fis.services.equator import EquatorState
 from fis.storage.batch_files import BatchFiles
 from fis.storage.database import Database
 from fis.storage.repositories import (
@@ -42,9 +43,10 @@ from fis.storage.repositories import (
     MasterDataRepository,
 )
 from fis.xlsx.combined import generate_combined_workbook
+from fis.xlsx.equator import generate_equator, parse_supported_invoice
 from fis.xlsx.errors import WorkbookError
 from fis.xlsx.generator import ShipmentOutput
-from fis.xlsx.parser import ParsedBundle, parse_invoice_bundle
+from fis.xlsx.parser import ParsedBundle
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 _SOURCE_FILENAME = "source.xlsx"
@@ -115,6 +117,7 @@ class Workspace:
     output_directory: Path | None = None
     # Scope key ``None`` is the common scope; a shipment id is an override scope.
     sailing_manual: dict[str | None, bool] = field(default_factory=dict)
+    equator: EquatorState | None = None
 
     @property
     def id(self) -> str:
@@ -235,6 +238,8 @@ class GenerationResult:
     output_directory: Path
     filename: str
     sheet_count: int
+    single_sheet: bool = False
+    item_count: int = 0
 
 
 class BatchService:
@@ -285,7 +290,7 @@ class BatchService:
         try:
             source = work / _SOURCE_FILENAME
             digest = _stream_to_file(source, chunks, MAX_UPLOAD_BYTES)
-            parsed = parse_invoice_bundle(source)
+            parsed = parse_supported_invoice(source)
             batch = WorkspaceBatch(
                 id=batch_id,
                 source_path=source,
@@ -297,6 +302,8 @@ class BatchService:
                 batch=batch,
                 output_directory=self._remembered_output_directory(),
             )
+            if parsed.template_type == "equator-v2":
+                workspace.equator = EquatorState(parsed, self._defaults, self._today())
             self._store.put(workspace)
             return workspace
         except Exception:
@@ -332,7 +339,6 @@ class BatchService:
         workspace = self.require(batch_id)
         errors: dict[str, dict[str, str]] = {}
         known = set(workspace.shipment_ids)
-
         common_errors: dict[str, str] = {}
         workspace.common = self._merge_scope(
             workspace.common, common_raw, None, workspace.sailing_manual, common_errors
@@ -419,6 +425,15 @@ class BatchService:
         known = set(workspace.shipment_ids)
         applied: dict[str, str] = {}
         unknown: list[str] = []
+        if workspace.equator is not None:
+            for shipment_id, code in mapping.items():
+                if shipment_id in known:
+                    workspace.equator.map_warehouse(shipment_id, code)
+                    applied[shipment_id] = code
+                else:
+                    unknown.append(shipment_id)
+            unmapped = [s for s in workspace.shipment_ids if not workspace.equator.fields(s)["warehouse_code"]]
+            return workspace, {"applied": applied, "unknown": unknown, "unmapped": unmapped}
         for shipment_id, code in mapping.items():
             if shipment_id in known:
                 current = workspace.overrides.get(shipment_id, ShipmentEdit())
@@ -434,6 +449,8 @@ class BatchService:
         return workspace, {"applied": applied, "unknown": unknown, "unmapped": unmapped}
 
     def effective_fields(self, workspace: Workspace, shipment_id: str) -> dict[str, object]:
+        if workspace.equator is not None:
+            return dict(workspace.equator.fields(shipment_id))
         common = workspace.common
         override = workspace.overrides.get(shipment_id)
 
@@ -511,6 +528,8 @@ class BatchService:
     def editor_view(
         self, workspace: Workspace, errors: Mapping[str, Mapping[str, str]] | None = None
     ) -> dict[str, object]:
+        if workspace.equator is not None:
+            return workspace.equator.view(workspace.id, str(workspace.output_directory) if workspace.output_directory else None)
         errors = errors or {}
         rows = [
             self._row_view(workspace, shipment.shipment_id, errors.get(shipment.shipment_id))
@@ -585,6 +604,10 @@ class BatchService:
     def save_shipment_field(
         self, batch_id: str, shipment_id: str, field_name: str, value: object
     ) -> tuple[dict[str, object], dict[str, str]]:
+        workspace = self.require(batch_id)
+        if workspace.equator is not None:
+            workspace.equator.save(shipment_id, field_name, value)
+            return workspace.equator.row_view(shipment_id), {}
         if field_name not in _EDITABLE_FIELDS or field_name == "warehouse_address":
             raise ValueError("该字段不支持逐货件编辑")
         workspace = self.require(batch_id)
@@ -598,8 +621,17 @@ class BatchService:
         return self._row_view(workspace, shipment_id, field_errors), field_errors
 
     def save_bulk_field(
-        self, batch_id: str, field_name: str, value: object
+        self, batch_id: str, field_name: str, value: object,
+        shipment_ids: list[str] | None = None,
     ) -> tuple[Workspace, dict[str, dict[str, str]]]:
+        workspace = self.require(batch_id)
+        if workspace.equator is not None:
+            targets = shipment_ids or list(workspace.shipment_ids)
+            if any(s not in workspace.shipment_ids for s in targets):
+                raise ValueError("批量设置包含未知货件")
+            for shipment_id in targets:
+                workspace.equator.save(shipment_id, field_name, value)
+            return workspace, {}
         if field_name not in _BULK_FIELDS:
             raise ValueError("该字段不支持批量设置")
         workspace = self.require(batch_id)
@@ -667,6 +699,33 @@ class BatchService:
             raise GenerationError("请先选择输出文件夹")
         if not destination.is_dir() or not os.access(destination, os.W_OK):
             raise GenerationError("输出文件夹不存在或不可写入")
+
+        if workspace.equator is not None:
+            state = workspace.equator
+            errors = {s: state.errors(s) for s in workspace.shipment_ids if state.errors(s)}
+            if errors:
+                raise GenerationError(_summarize_field_errors(errors), field_errors=errors)
+            try:
+                path = generate_equator(workspace.source_path, workspace.parsed,
+                    {s: state.fields(s) for s in workspace.shipment_ids}, destination,
+                    workspace.source_filename, state.catalog)
+            except WorkbookError as error:
+                raise GenerationError(str(error)) from error
+            except OSError as error:
+                raise GenerationError("保存输出失败，请检查目录权限、可用空间及文件系统是否支持安全发布") from error
+            if self._batches is not None:
+                self._batches.record_completed(
+                    batch_id=workspace.id, filename=workspace.source_filename,
+                    sha256=workspace.batch.source_sha256, source_path=str(workspace.source_path),
+                    output_path=str(path), shipment_count=workspace.shipment_count,
+                    item_count=len(workspace.parsed.product_rows),
+                    shipments=[(s, json.dumps(state.fields(s), ensure_ascii=False)) for s in workspace.shipment_ids],
+                    now=self._now(),
+                    template_type="equator", template_version="v2",
+                )
+            if self._defaults is not None:
+                self._defaults.set(_LAST_OUTPUT_DIRECTORY_KEY, str(destination))
+            return GenerationResult(batch_id, destination, path.name, 1, True, len(workspace.parsed.product_rows))
 
         outputs, field_errors = self.resolve_all(workspace)
         if field_errors:
