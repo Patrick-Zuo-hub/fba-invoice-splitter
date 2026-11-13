@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from fis.domain.rules import default_dates
+from fis.domain.rules import declaration_currency, default_dates
 from fis.storage.repositories import DefaultsRepository
 from fis.xlsx.equator import default_catalog
 from fis.xlsx.parser import ParsedBundle
@@ -78,6 +78,8 @@ class EquatorState:
         warehouse = self.warehouses.get(row["warehouse_code"], {})
         for target, source in ADDRESS_COLUMNS.items():
             result["address_" + target] = warehouse.get(source, "")
+        result["address_K"] = result["address_K"].strip().upper()
+        result["currency"] = declaration_currency(result["address_K"]) or ""
         result["address_S"] = ""
         result["warehouse_address"] = ", ".join(warehouse.get(c, "") for c in ("G", "I", "H", "J", "B") if warehouse.get(c))
         return result
@@ -91,6 +93,9 @@ class EquatorState:
         ) if not f[k]}
         if f["warehouse_code"] and not f["warehouse_address"]:
             errors["warehouse_address"] = "仓库未匹配到地址"
+        if f["warehouse_code"] and not f["currency"]:
+            country = f["address_K"] or "未维护国家"
+            errors["currency"] = f"{country} 的申报币种待配置，不能生成"
         if f["customs"] not in {"是", "否", "/"}:
             errors["customs"] = "请选择有效报关方式"
         if f["customs"] == "否" and not f["goods_material"]:

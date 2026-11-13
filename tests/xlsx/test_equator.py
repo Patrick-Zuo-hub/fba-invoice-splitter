@@ -161,3 +161,44 @@ def test_shared_cartons_do_not_double_count_and_keep_merge(tmp_path: Path) -> No
     with ZipFile(result) as z:
         sheet = etree.fromstring(z.read("xl/worksheets/sheet1.xml"))
         assert sheet.find(f'.//{{{MAIN_NS}}}mergeCell[@ref="X5:X6"]') is not None
+
+
+@pytest.mark.parametrize("country,currency", [("US", "USD"), ("GB", "GBP"), ("CA", "CAD"), ("DE", "EUR"), ("FR", "EUR")])
+def test_currency_uses_warehouse_country_and_does_not_convert_amounts(
+    tmp_path: Path, country: str, currency: str,
+) -> None:
+    source = tmp_path / "invoice.xlsx"
+    # AN may be blank or stale. Warehouse country is the new source of truth.
+    build_equator(source, currency="")
+    original = source.read_bytes()
+    state = setup_state(source)
+    code = next(w["A"] for w in state.catalog["warehouses"] if w.get("B") == country and w.get("C") == "FBA仓")
+    state.map_warehouse(IDS[0], code)
+    assert state.fields(IDS[0])["currency"] == currency
+    assert not state.errors(IDS[0])
+    result = generate_equator(source, state.bundle, {s: state.fields(s) for s in IDS}, tmp_path, source.name, state.catalog)
+    parsed = parse_supported_invoice(result)
+    assert {i.cells["AN"] for i in parsed.shipments[0].items} == {currency}
+    assert {i.cells["K"] for i in parsed.shipments[0].items} == {country}
+    assert [i.cells["AL"] for i in parsed.shipments[0].items] == ["15", "15"]
+    assert [i.cells["AM"] for i in parsed.shipments[0].items] == ["600", "2400"]
+    assert {i.cells["AN"] for i in parsed.shipments[1].items} == {"USD"}
+    state.map_warehouse(IDS[0], "SMF3")
+    assert state.fields(IDS[0])["currency"] == "USD"
+    assert source.read_bytes() == original
+
+
+@pytest.mark.parametrize("country", ["PL", "CZ", "SE", "JP", "AU", "MX", "CN", ""])
+def test_unconfigured_country_cannot_reuse_source_usd_or_publish(
+    tmp_path: Path, country: str,
+) -> None:
+    source = tmp_path / "invoice.xlsx"
+    build_equator(source, currency="USD")
+    state = setup_state(source)
+    code = next(w["A"] for w in state.catalog["warehouses"] if w.get("B", "") == country)
+    state.map_warehouse(IDS[0], code)
+    assert state.fields(IDS[0])["currency"] == ""
+    assert "待配置" in state.errors(IDS[0])["currency"]
+    with pytest.raises(WorkbookError, match="币种待配置"):
+        generate_equator(source, state.bundle, {s: state.fields(s) for s in IDS}, tmp_path, source.name, state.catalog)
+    assert not list(tmp_path.glob("已处理*.xlsx"))

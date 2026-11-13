@@ -2,6 +2,22 @@ from datetime import date, timedelta
 
 _AMAZON_WAREHOUSE_PREFIX = "AMAZON-"
 
+# User-confirmed declaration mapping; no exchange-rate conversion is performed.
+# Euro-area membership checked against ECB on 2026-11-13 (including BG).
+_EURO_AREA_COUNTRIES = frozenset({
+    "AT", "BE", "BG", "HR", "CY", "EE", "FI", "FR", "DE", "GR", "IE",
+    "IT", "LV", "LT", "LU", "MT", "NL", "PT", "SK", "SI", "ES",
+})
+
+
+def declaration_currency(country: str) -> str | None:
+    """Resolve only confirmed country rules, never silently fall back to USD."""
+
+    code = country.strip().upper()
+    if code in _EURO_AREA_COUNTRIES:
+        return "EUR"
+    return {"US": "USD", "GB": "GBP", "CA": "CAD"}.get(code)
+
 
 def canonical_amazon_warehouse_code(value: str) -> str:
     """Normalize short and prefixed warehouse codes to the master-data format."""

@@ -171,7 +171,7 @@
       addressCell.classList.toggle("field-incomplete", Boolean(rowData.errors.warehouse_address));
     }
     row.querySelectorAll("[data-value-field]").forEach(function (node) {
-      node.textContent = rowData.fields[node.dataset.valueField] || "待映射";
+      node.textContent = rowData.fields[node.dataset.valueField] || node.dataset.emptyValue || "待映射";
     });
     var channelCode = row.querySelector("[data-channel-code]");
     if (channelCode) channelCode.textContent = rowData.fields.channel_code || "";

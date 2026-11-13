@@ -18,6 +18,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from lxml import etree  # type: ignore[import-untyped]
 
+from fis.domain.rules import declaration_currency
 from fis.xlsx.combined import next_output_path
 from fis.xlsx.drawings import _validate_media
 from fis.xlsx.errors import WorkbookError
@@ -44,7 +45,7 @@ A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 CT = "http://schemas.openxmlformats.org/package/2006/content-types"
 REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
 NUMERIC = frozenset({"X", "Y", "Z", "AA", "AB", "AJ", "AK", "AL", "AM", "AU"})
-REBUILT = frozenset("ABCDEFGHIJKLMN OPQRS".replace(" ", "")) | {"W"}
+REBUILT = frozenset("ABCDEFGHIJKLMN OPQRS".replace(" ", "")) | {"W", "AN"}
 FORMATS = ("FBA货箱编号", "PONO码", "中文品名")
 
 
@@ -151,7 +152,7 @@ def parse_equator_package(package: SafePackage, sheet: etree._Element) -> Parsed
                 carry[column] = data[column]
             else:
                 data[column] = carry.get(column, "")
-        for column in ("AC", "AD", "AE", "AF", "AN", "AO", "AP", "AQ"):
+        for column in ("AC", "AD", "AE", "AF", "AO", "AP", "AQ"):
             if not data.get(column, "").strip():
                 raise _error("缺少必填商品字段", f"{column}{number}")
         numbers: dict[str, Decimal] = {}
@@ -247,6 +248,10 @@ def generate_equator(
         parts["xl/styles.xml"] = _xml(styles)
         for item in rows:
             current = fields[item.shipment_id]
+            country = current.get("address_K", "").strip().upper()
+            currency = declaration_currency(country)
+            if currency is None:
+                raise _error(f"{country or '未维护国家'} 的申报币种待配置", f"AN{row_map[item.source_row]}")
             values = dict(item.cells)
             arrival = datetime.fromisoformat(current["arrival_time"])
             excel_date = Decimal(str((arrival - datetime(1899, 12, 30, tzinfo=UTC).replace(tzinfo=None)).total_seconds())) / Decimal(86400)
@@ -256,6 +261,7 @@ def generate_equator(
                 "E": current["delivery_warehouse"], "F": str(excel_date),
                 "G": current["channel_code"], "H": current["channel"], "I": "FBA仓",
                 "J": current["warehouse_code"], "W": current["customs"],
+                "AN": currency,
             })
             for column in "KLMNOPQRS":
                 values[column] = current.get(f"address_{column}", "")

@@ -4,10 +4,24 @@ import pytest
 
 from fis.domain.rules import (
     canonical_amazon_warehouse_code,
+    declaration_currency,
     default_dates,
     parse_warehouse_mapping,
     sailing_after,
 )
+
+
+@pytest.mark.parametrize("country,currency", [
+    ("US", "USD"), ("GB", "GBP"), ("CA", "CAD"), ("DE", "EUR"),
+    ("FR", "EUR"), ("IT", "EUR"), ("ES", "EUR"), ("NL", "EUR"),
+    ("BG", "EUR"), ("HR", "EUR"), (" gb ", "GBP"),
+    ("PL", None), ("CZ", None), ("SE", None), ("JP", None),
+    ("AU", None), ("MX", None), ("CN", None), ("", None), ("ZZ", None),
+])
+def test_declaration_currency_only_uses_confirmed_country_rules(
+    country: str, currency: str | None,
+) -> None:
+    assert declaration_currency(country) == currency
 
 
 def test_pickup_is_the_thursday_strictly_after_today() -> None:

@@ -45,3 +45,13 @@ def test_equator_mapping_channel_code_bulk_override_and_single_sheet(
     page.get_by_role("button", name="生成单 Sheet 工作簿").click()
     expect(page.locator("#generation-result")).to_contain_text("全部 4 条明细")
     assert (browser_app.output / "已处理_equator.xlsx").is_file()
+    # Remap one shipment to the UK: country/currency and preview must follow.
+    page.locator("#mapping-panel summary").click()
+    apply_mapping(page, f"LBA4\t{IDS[0]}")
+    expect(rows.first.locator('[data-value-field="address_K"]')).to_have_text("GB")
+    expect(rows.first.locator('[data-value-field="currency"]')).to_have_text("GBP")
+    page.locator(".equator-preview summary").click()
+    page.locator("[data-equator-preview]").click()
+    expect(preview.nth(0).locator("td").nth(15)).to_have_text("GBP")
+    expect(preview.nth(1).locator("td").nth(15)).to_have_text("GBP")
+    expect(preview.nth(2).locator("td").nth(15)).to_have_text("USD")

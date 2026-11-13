@@ -12,7 +12,7 @@ from tests.fixtures.standard_v1_builder import _PNG_1X1, _styles
 IDS = ("FBA000000001", "FBA000000002")
 
 
-def build_equator(path: Path, *, external: bool = False) -> None:
+def build_equator(path: Path, *, external: bool = False, currency: str = "USD") -> None:
     sheet = etree.Element(f"{{{MAIN_NS}}}worksheet", nsmap={None: MAIN_NS, "r": OFFICE_REL_NS})
     data = etree.SubElement(sheet, f"{{{MAIN_NS}}}sheetData")
     head = etree.SubElement(data, f"{{{MAIN_NS}}}row", r="4")
@@ -23,6 +23,8 @@ def build_equator(path: Path, *, external: bool = False) -> None:
         number = index + 5
         row = etree.SubElement(data, f"{{{MAIN_NS}}}row", r=str(number), ht="60", customHeight="1")
         fields = {"U": IDS[index // 2], "V": "ABCDEFGH", "W": "否", "X": str(cartons), "Y": "12.01", "Z": "46.99", "AA": "54.01", "AB": "51.01", "AC": "organizer", "AD": "收纳盒", "AE": "Plastic", "AF": "塑料", "AJ": "20", "AK": str(cartons*20), "AL": "15", "AM": str(cartons*300), "AN": "USD", "AO": "7323991000", "AP": "否", "AQ": "否", "B": "ONE-SOURCE-ORDER"}
+        fields["AN"] = currency
+        fields["AT"] = "https://example.invalid/product"
         for col in default_catalog()["headers"]:
             _cell(row, col, fields.get(col, ""))
         anchor = etree.SubElement(drawing, f"{{{XDR}}}twoCellAnchor")

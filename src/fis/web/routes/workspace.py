@@ -329,6 +329,7 @@ async def equator_preview(request: Request, batch_id: str) -> Response:
     for n, item in enumerate(items, 5):
         fields = state.fields(item.shipment_id)
         rows.append([n, item.shipment_id, fields["customer_code"], item.shipment_id, fields["channel_code"], fields["channel"], fields["warehouse_code"], fields.get("address_R", ""), fields["delivery_warehouse"], fields["arrival_time"], item.cells.get("X", ""), item.cells.get("AD", ""), item.cells.get("AK", ""), item.cells.get("AM", "")])
+        rows[-1].extend([fields["address_K"], fields["currency"] or "待配置"])
     return _templates(request).TemplateResponse(request=request, name="_equator_preview.html", context={"rows": rows})
 
 
